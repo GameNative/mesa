@@ -131,7 +131,28 @@ static void unlink_vk_struct(VkBaseInStructure *create_info, const VkBaseInStruc
    *current = (*current)->pNext;
 }
 
-static void process_pnext_chain(VkBaseInStructure *create_info, struct wrapper_physical_device *pdevice) {
+static void patch_image_create_info(VkBaseInStructure *create_info, VkFormat *format) {
+   const VkBaseInStructure *current = (VkBaseInStructure *)create_info->pNext;
+   VkBaseInStructure *prev = NULL; 
+
+   while (current != NULL) {
+      switch(current->sType) {
+	     case VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO: {
+		    VkImageFormatListCreateInfo *formatCreateInfo = 
+				  (VkImageFormatListCreateInfo *)current;	  
+			formatCreateInfo->viewFormatCount = 1;
+			formatCreateInfo->pViewFormats = format;
+			break;
+         }
+         default:
+         	break;
+      }
+      prev = (VkBaseInStructure *)current;
+	  current = current->pNext;
+   }
+}
+
+static void process_device_pnext_chain(VkBaseInStructure *create_info, struct wrapper_physical_device *pdevice) {
    const uint32_t api_version = pdevice->properties2.properties.apiVersion;
    const VkBaseInStructure *current = (VkBaseInStructure *)create_info->pNext;
    VkBaseInStructure *prev = NULL;
@@ -304,7 +325,7 @@ if (pdf2 && pdf2->features.f) { \
 
 #undef DISABLE_FEATURE
 
-   process_pnext_chain((VkBaseInStructure *)&wrapper_create_info, device->physical);
+   process_device_pnext_chain((VkBaseInStructure *)&wrapper_create_info, device->physical);
 
    if (WRAPPER_LOG_LEVEL(info)) {
       for (int i = 0; i < wrapper_enable_extension_count; i++) {
@@ -504,6 +525,7 @@ wrapper_CreateImage(VkDevice _device,
       create_info.format = get_format_for_bcn(pCreateInfo->format);
       if (create_info.flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT)
          create_info.flags &= ~VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+      patch_image_create_info((VkBaseInStructure *)&create_info, &create_info.format);
    }
 
    res = device->dispatch_table.CreateImage(device->dispatch_handle,
@@ -549,6 +571,7 @@ wrapper_CreateImageView(VkDevice _device,
 
    if (is_emulated_bcn(device->physical, pCreateInfo->format)) {
       create_info.format = get_format_for_bcn(pCreateInfo->format);
+      patch_image_create_info((VkBaseInStructure *)&create_info, &create_info.format);
    }
 
    result = device->dispatch_table.CreateImageView(device->dispatch_handle,
