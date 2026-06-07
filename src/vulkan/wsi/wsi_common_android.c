@@ -21,7 +21,7 @@ wsi_get_ahardware_buffer_blit_type(const struct wsi_device *wsi,
       .format = AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM,
       .usage = AHARDWAREBUFFER_USAGE_GPU_FRAMEBUFFER |
                AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE |
-               AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN |
+               AHARDWAREBUFFER_USAGE_CPU_READ_RARELY |
                AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN },
                                 &ahardware_buffer) != 0) {
       WRAPPER_LOG(error, "Failed to allocate ahardware buffer, blitting");
@@ -346,7 +346,7 @@ wsi_configure_ahardware_buffer_image(const struct wsi_swapchain *chain,
          : to_ahardware_buffer_format(info->create.format),
       .usage = AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE |
                AHARDWAREBUFFER_USAGE_GPU_FRAMEBUFFER |
-               AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN |
+               AHARDWAREBUFFER_USAGE_CPU_READ_RARELY |
                AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN,
    };
 
