@@ -10,11 +10,13 @@ namespace Decoration {
 
    namespace Literals {
       static const uint32_t ClipDistance = 3;
+      static const uint32_t CullDistance = 4;
    }
 }
 
 namespace Capability {
    static const uint32_t ClipDistance = 32;
+   static const uint32_t CullDistance = 33;
 }
 
 namespace OpCode {
@@ -33,7 +35,7 @@ namespace OpType {
 }
 
 void
-remove_ClipDistance(uint32_t *pCode, size_t *codeSize)
+remove_ClipDistance_CullDistance(uint32_t *pCode, size_t *codeSize)
 {
    uint32_t offset = 5;
    std::vector<uint32_t> code(pCode, pCode + (*codeSize / sizeof(uint32_t)));
@@ -52,6 +54,9 @@ remove_ClipDistance(uint32_t *pCode, size_t *codeSize)
          if (capability == Capability::ClipDistance) {
             instructions.insert({offset, length});
          }
+         if (capability == Capability::CullDistance) {
+         	instructions.insert({offset, length});
+         }
       }
 
       if (opcode == OpCode::OpDecorate) {
@@ -60,6 +65,9 @@ remove_ClipDistance(uint32_t *pCode, size_t *codeSize)
             uint32_t literal = code[offset + 3];
             if (literal == Decoration::Literals::ClipDistance) {
                instructions.insert({offset, length});
+            }
+            if (literal == Decoration::Literals::CullDistance) {
+            	instructions.insert({offset, length});
             }
          }
       }
