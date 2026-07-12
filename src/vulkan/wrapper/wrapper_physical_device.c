@@ -290,11 +290,9 @@ VkResult enumerate_physical_device(struct vk_instance *_instance)
             supported_features->dualSrcBlend = true;
             supported_features->multiDrawIndirect = true;
          }
-         if (pdevice->base_supported_extensions.KHR_vertex_attribute_divisor) {
-            WRAPPER_LOG(info, "Aliasing VK_EXT_vertex_attribute_divisor -> KHR (Mali has KHR)");
-            pdevice->vk.supported_extensions.EXT_vertex_attribute_divisor = true;
-            pdevice->vk.supported_extensions.KHR_vertex_attribute_divisor = false;
-         }
+         WRAPPER_LOG(info, "Adding VK_EXT_vertex_attribute_divisor and KHR");
+         pdevice->vk.supported_extensions.EXT_vertex_attribute_divisor = true;
+         pdevice->vk.supported_extensions.KHR_vertex_attribute_divisor = true;
          WRAPPER_LOG(info, "Disabling VK_EXT_calibrated_timestamps");
          pdevice->vk.supported_extensions.EXT_calibrated_timestamps = false;
          if (!is_d3d) {
@@ -625,6 +623,14 @@ wrapper_GetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice,
             vk12_prop->shaderSignedZeroInfNanPreserveFloat32 = false;
          }
 
+         if (pdevice->driver_properties.driverID == VK_DRIVER_ID_ARM_PROPRIETARY) {
+            if (vk12_prop->maxPerStageDescriptorUpdateAfterBindStorageBuffers < 1000000) {
+               vk12_prop->maxPerStageDescriptorUpdateAfterBindStorageBuffers = 1000000;
+               vk12_prop->maxPerStageDescriptorUpdateAfterBindSampledImages = 1000000;
+               vk12_prop->maxPerStageDescriptorUpdateAfterBindStorageImages = 1000000;
+            }
+         }
+
          driver_id = getenv("WRAPPER_DRIVER_ID") ? atoi(getenv("WRAPPER_DRIVER_ID")) : 0;
 
          if (driver_id > 0)
@@ -949,4 +955,4 @@ wrapper_GetPhysicalDeviceMemoryProperties2(VkPhysicalDevice physicalDevice,
 
    if (wrapper_vmem_max_size > 0)
       pMemoryProperties->memoryProperties.memoryHeaps[0].size = (VkDeviceSize)wrapper_vmem_max_size * 1048576;
-}								
+}
