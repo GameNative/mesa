@@ -16,18 +16,53 @@
 #include "util/u_debug.h"
 
 static uint32_t
-parse_vk_version_from_env()
+parse_vk_version_from_env_named(const char *name)
 {
    uint32_t apiVersion = 0, major = 0, minor = 0, patch = 0;
 
-   const char *wrapper_vk_version = getenv("WRAPPER_VK_VERSION");
+   const char *value = getenv(name);
 
-   if (wrapper_vk_version) {
-      sscanf(wrapper_vk_version, "%d.%d.%d", &major, &minor, &patch);
+   if (value) {
+      sscanf(value, "%d.%d.%d", &major, &minor, &patch);
       apiVersion = VK_MAKE_VERSION(major, minor, patch);
    }
 
    return apiVersion;
+}
+
+static uint32_t
+parse_vk_version_from_env()
+{
+   return parse_vk_version_from_env_named("WRAPPER_VK_VERSION");
+}
+
+static uint32_t
+wrapper_effective_api_version(struct wrapper_physical_device *pdevice,
+                              uint32_t base_api_version)
+{
+   uint32_t requested = parse_vk_version_from_env();
+   const char *engine = pdevice->instance->vk.app_info.engine_name;
+
+   /* A wrapper may need to expose a raised API version to one compatibility
+    * layer while leaving another on the base driver's ABI. Select such an
+    * override by the exact VkApplicationInfo engine name rather than a vendor,
+    * device, or substring allowlist. Both variables are required, so the
+    * default remains the global WRAPPER_VK_VERSION behavior. */
+   const char *override_engine = getenv("WRAPPER_ENGINE_NAME");
+   if (engine && override_engine && !strcmp(engine, override_engine)) {
+      uint32_t engine_override =
+         parse_vk_version_from_env_named("WRAPPER_ENGINE_VK_VERSION");
+      if (engine_override) {
+         WRAPPER_LOG(info,
+            "Reporting Vulkan %u.%u to engine '%s' "
+            "(WRAPPER_ENGINE_VK_VERSION)",
+            VK_API_VERSION_MAJOR(engine_override),
+            VK_API_VERSION_MINOR(engine_override), engine);
+         return engine_override;
+      }
+   }
+
+   return requested ? requested : base_api_version;
 }
 
 static char *
@@ -502,11 +537,12 @@ wrapper_GetPhysicalDeviceProperties(VkPhysicalDevice physicalDevice,
    uint32_t device_id;
    uint32_t vendor_id;
    
-   uint32_t api_version = parse_vk_version_from_env();
-   
    VK_FROM_HANDLE(wrapper_physical_device, pdevice, physicalDevice);
    pdevice->dispatch_table.GetPhysicalDeviceProperties(
       pdevice->dispatch_handle, pProperties);
+
+   uint32_t api_version =
+      wrapper_effective_api_version(pdevice, pProperties->apiVersion);
 
    char *device_name_env = getenv("WRAPPER_DEVICE_NAME");
    asprintf(&device_name, "Wrapper(%s)", (device_name_env) ? device_name_env : pProperties->deviceName);
@@ -566,11 +602,12 @@ wrapper_GetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice,
    char *driver_info;
    uint32_t driver_id;
 
-   uint32_t api_version = parse_vk_version_from_env();
-
    VK_FROM_HANDLE(wrapper_physical_device, pdevice, physicalDevice);
    pdevice->dispatch_table.GetPhysicalDeviceProperties2(
       pdevice->dispatch_handle, pProperties);
+
+   uint32_t api_version = wrapper_effective_api_version(
+      pdevice, pProperties->properties.apiVersion);
 
    const char *eng = pdevice->instance->vk.app_info.engine_name;
    bool is_d3d = eng && (strstr(eng, "DXVK") || strstr(eng, "vkd3d"));
