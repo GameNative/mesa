@@ -39,6 +39,8 @@ struct wrapper_physical_device {
    int dma_heap_fd;
    int emulate_bcn;
    bool is_vkd3d;
+   bool emulate_imageless_framebuffer;
+   bool emulate_vulkan13;
    char *resource_type;
    VkPhysicalDevice dispatch_handle;
    VkPhysicalDeviceProperties2 properties2;
@@ -76,12 +78,16 @@ struct wrapper_device {
    struct list_head fence_list;
    struct hash_table_u64 *buffer_table;
    struct hash_table_u64 *image_table;
+   struct hash_table_u64 *image_view_table;
+   struct hash_table_u64 *imageless_fb_table;
+   struct hash_table_u64 *dynamic_pipeline_table;
    struct hash_table_u64 *fence_table;
    struct wrapper_physical_device *physical;
    struct vk_device_dispatch_table dispatch_table;
 
    bool emulate_null_descriptor;
    bool device_fault_enabled;
+   bool emulate_imageless_framebuffer;
 
    /* VK_KHR_push_descriptor emulation (for drivers lacking it, e.g. Mali r44).
     * Enabled when the app uses push descriptors and either the base driver
@@ -202,6 +208,8 @@ struct wrapper_command_buffer {
    struct wrapper_fence *fence;
    VkCommandBuffer dispatch_handle;
    struct wrapper_push_pool *push_pools;   /* emulated push-descriptor pools */
+   struct list_head dynamic_render_objects;
+   bool dynamic_rendering_active;
 };
 
 VK_DEFINE_HANDLE_CASTS(wrapper_command_buffer, vk.base, VkCommandBuffer,
@@ -236,6 +244,35 @@ struct wrapper_push_template {         /* per VkDescriptorUpdateTemplate */
    VkPipelineBindPoint bind_point;
    VkPipelineLayout pipeline_layout;
    uint32_t set;
+};
+
+struct wrapper_image_view {
+   VkImageView handle;
+   VkImage image;
+   VkFormat format;
+   VkSampleCountFlagBits samples;
+};
+
+struct wrapper_dynamic_pipeline {
+   VkPipeline pipeline;
+   VkRenderPass render_pass;
+};
+
+struct wrapper_dynamic_render_object {
+   struct list_head link;
+   VkRenderPass render_pass;
+   VkFramebuffer framebuffer;
+};
+
+/* An imageless VkFramebuffer the wrapper handed out itself, because the base
+ * driver has no VK_KHR_imageless_framebuffer.  It holds no driver object: the
+ * real framebuffer is built at vkCmdBeginRenderPass, once the image views
+ * arrive in VkRenderPassAttachmentBeginInfo. */
+struct wrapper_imageless_framebuffer {
+   uint32_t attachment_count;
+   uint32_t width;
+   uint32_t height;
+   uint32_t layers;
 };
 
 VkResult enumerate_physical_device(struct vk_instance *_instance);

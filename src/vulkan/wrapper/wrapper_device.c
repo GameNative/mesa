@@ -122,11 +122,11 @@ wrapper_filter_enabled_extensions(const struct wrapper_device *device,
 }
 
 static inline void
-wrapper_append_required_extensions(const struct vk_device *device,
+wrapper_append_required_extensions(const struct wrapper_device *device,
                                   uint32_t *count,
                                   const char **exts) {
 #define REQUIRED_EXTENSION(name) \
-   if (device->physical->supported_extensions.name) { \
+   if (device->physical->vk.supported_extensions.name) { \
       exts[(*count)++] = "VK_" #name; \
    }
    
@@ -143,11 +143,29 @@ wrapper_append_required_extensions(const struct vk_device *device,
    REQUIRED_EXTENSION(KHR_image_format_list)
    REQUIRED_EXTENSION(KHR_swapchain);
    REQUIRED_EXTENSION(KHR_timeline_semaphore);
+   /* Vulkan 1.3 promotes these extensions to core.  The wrapper advertises
+    * 1.3, but the 1.1 Tegra ICD still requires the EXT names to be enabled
+    * before its entry points may be queried. */
+   bool lower_core13 = device->physical->emulate_vulkan13;
+   if (lower_core13 &&
+       !device->vk.enabled_extensions.EXT_extended_dynamic_state &&
+       device->physical->base_supported_extensions.EXT_extended_dynamic_state)
+      exts[(*count)++] = "VK_EXT_extended_dynamic_state";
+   if (lower_core13 &&
+       !device->vk.enabled_extensions.EXT_extended_dynamic_state2 &&
+       device->physical->base_supported_extensions.EXT_extended_dynamic_state2)
+      exts[(*count)++] = "VK_EXT_extended_dynamic_state2";
    REQUIRED_EXTENSION(EXT_external_memory_host);
    REQUIRED_EXTENSION(EXT_external_memory_dma_buf);
    REQUIRED_EXTENSION(EXT_image_drm_format_modifier);
    REQUIRED_EXTENSION(ANDROID_external_memory_android_hardware_buffer);
 #undef REQUIRED_EXTENSION
+}
+
+static inline bool
+wrapper_lowers_core13(const struct wrapper_device *device)
+{
+   return device->physical->emulate_vulkan13;
 }
 
 static void unlink_vk_struct(VkBaseInStructure *create_info, const VkBaseInStructure **current, VkBaseInStructure **prev) {
@@ -182,6 +200,17 @@ static void process_pnext_chain(VkBaseInStructure *create_info, struct wrapper_p
              if (pdevice->base_supported_features.hostQueryReset)
                 break;
              WRAPPER_LOG(info, "Unlinking VkPhysicalDeviceHostQueryResetFeatures from pNext chain");
+             unlink_vk_struct(create_info, &current, &prev);
+             continue;
+          case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGELESS_FRAMEBUFFER_FEATURES:
+             /* Only when this wrapper advertised the feature itself.  Keying on
+              * the driver's extension list instead would strip a legitimate
+              * request on a Vulkan 1.2 driver that supports imagelessFramebuffer
+              * as core without separately listing VK_KHR_imageless_framebuffer. */
+             if (!pdevice->emulate_imageless_framebuffer)
+                break;
+             WRAPPER_LOG(info,
+                "Unlinking emulated VkPhysicalDeviceImagelessFramebufferFeatures from pNext chain");
              unlink_vk_struct(create_info, &current, &prev);
              continue;
           case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_FEATURES_EXT:
@@ -659,9 +688,200 @@ wrapper_CmdBindVertexBuffers2(VkCommandBuffer commandBuffer, uint32_t firstBindi
       for (uint32_t i = 0; i < bindingCount; i++)
          bufs[i] = pBuffers[i] ? pBuffers[i] : device->null_buffer;
    }
-   device->dispatch_table.CmdBindVertexBuffers2(wcb->dispatch_handle, firstBinding,
-      bindingCount, bufs ? bufs : pBuffers, pOffsets, pSizes, pStrides);
+   if (device->dispatch_table.CmdBindVertexBuffers2)
+      device->dispatch_table.CmdBindVertexBuffers2(wcb->dispatch_handle,
+         firstBinding, bindingCount, bufs ? bufs : pBuffers, pOffsets, pSizes,
+         pStrides);
+   else if (wrapper_lowers_core13(device) &&
+            device->dispatch_table.CmdBindVertexBuffers2EXT)
+      device->dispatch_table.CmdBindVertexBuffers2EXT(wcb->dispatch_handle,
+         firstBinding, bindingCount, bufs ? bufs : pBuffers, pOffsets, pSizes,
+         pStrides);
    free(bufs);
+}
+
+/* Core 1.3 dynamic state may be supplied by EXT_extended_dynamic_state{,2} on
+ * an older base driver. Define only the core names: Mesa aliases core and EXT in
+ * its public dispatch table, so defining both would register the same slot
+ * twice. */
+VKAPI_ATTR void VKAPI_CALL
+wrapper_CmdSetCullMode(VkCommandBuffer commandBuffer, VkCullModeFlags cullMode)
+{
+   VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   if (wcb->device->dispatch_table.CmdSetCullMode)
+      wcb->device->dispatch_table.CmdSetCullMode(wcb->dispatch_handle, cullMode);
+   else if (wrapper_lowers_core13(wcb->device) &&
+            wcb->device->dispatch_table.CmdSetCullModeEXT)
+      wcb->device->dispatch_table.CmdSetCullModeEXT(wcb->dispatch_handle, cullMode);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wrapper_CmdSetFrontFace(VkCommandBuffer commandBuffer, VkFrontFace frontFace)
+{
+   VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   if (wcb->device->dispatch_table.CmdSetFrontFace)
+      wcb->device->dispatch_table.CmdSetFrontFace(wcb->dispatch_handle, frontFace);
+   else if (wrapper_lowers_core13(wcb->device) &&
+            wcb->device->dispatch_table.CmdSetFrontFaceEXT)
+      wcb->device->dispatch_table.CmdSetFrontFaceEXT(wcb->dispatch_handle, frontFace);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wrapper_CmdSetPrimitiveTopology(VkCommandBuffer commandBuffer,
+                                VkPrimitiveTopology primitiveTopology)
+{
+   VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   if (wcb->device->dispatch_table.CmdSetPrimitiveTopology)
+      wcb->device->dispatch_table.CmdSetPrimitiveTopology(
+         wcb->dispatch_handle, primitiveTopology);
+   else if (wrapper_lowers_core13(wcb->device) &&
+            wcb->device->dispatch_table.CmdSetPrimitiveTopologyEXT)
+      wcb->device->dispatch_table.CmdSetPrimitiveTopologyEXT(
+         wcb->dispatch_handle, primitiveTopology);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wrapper_CmdSetViewportWithCount(VkCommandBuffer commandBuffer,
+                                uint32_t viewportCount,
+                                const VkViewport *pViewports)
+{
+   VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   if (wcb->device->dispatch_table.CmdSetViewportWithCount)
+      wcb->device->dispatch_table.CmdSetViewportWithCount(
+         wcb->dispatch_handle, viewportCount, pViewports);
+   else if (wrapper_lowers_core13(wcb->device) &&
+            wcb->device->dispatch_table.CmdSetViewportWithCountEXT)
+      wcb->device->dispatch_table.CmdSetViewportWithCountEXT(
+         wcb->dispatch_handle, viewportCount, pViewports);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wrapper_CmdSetScissorWithCount(VkCommandBuffer commandBuffer,
+                               uint32_t scissorCount,
+                               const VkRect2D *pScissors)
+{
+   VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   if (wcb->device->dispatch_table.CmdSetScissorWithCount)
+      wcb->device->dispatch_table.CmdSetScissorWithCount(
+         wcb->dispatch_handle, scissorCount, pScissors);
+   else if (wrapper_lowers_core13(wcb->device) &&
+            wcb->device->dispatch_table.CmdSetScissorWithCountEXT)
+      wcb->device->dispatch_table.CmdSetScissorWithCountEXT(
+         wcb->dispatch_handle, scissorCount, pScissors);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wrapper_CmdSetDepthTestEnable(VkCommandBuffer commandBuffer,
+                              VkBool32 depthTestEnable)
+{
+   VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   if (wcb->device->dispatch_table.CmdSetDepthTestEnable)
+      wcb->device->dispatch_table.CmdSetDepthTestEnable(
+         wcb->dispatch_handle, depthTestEnable);
+   else if (wrapper_lowers_core13(wcb->device) &&
+            wcb->device->dispatch_table.CmdSetDepthTestEnableEXT)
+      wcb->device->dispatch_table.CmdSetDepthTestEnableEXT(
+         wcb->dispatch_handle, depthTestEnable);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wrapper_CmdSetDepthWriteEnable(VkCommandBuffer commandBuffer,
+                               VkBool32 depthWriteEnable)
+{
+   VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   if (wcb->device->dispatch_table.CmdSetDepthWriteEnable)
+      wcb->device->dispatch_table.CmdSetDepthWriteEnable(
+         wcb->dispatch_handle, depthWriteEnable);
+   else if (wrapper_lowers_core13(wcb->device) &&
+            wcb->device->dispatch_table.CmdSetDepthWriteEnableEXT)
+      wcb->device->dispatch_table.CmdSetDepthWriteEnableEXT(
+         wcb->dispatch_handle, depthWriteEnable);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wrapper_CmdSetDepthCompareOp(VkCommandBuffer commandBuffer,
+                             VkCompareOp depthCompareOp)
+{
+   VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   if (wcb->device->dispatch_table.CmdSetDepthCompareOp)
+      wcb->device->dispatch_table.CmdSetDepthCompareOp(
+         wcb->dispatch_handle, depthCompareOp);
+   else if (wrapper_lowers_core13(wcb->device) &&
+            wcb->device->dispatch_table.CmdSetDepthCompareOpEXT)
+      wcb->device->dispatch_table.CmdSetDepthCompareOpEXT(
+         wcb->dispatch_handle, depthCompareOp);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wrapper_CmdSetStencilTestEnable(VkCommandBuffer commandBuffer,
+                                VkBool32 stencilTestEnable)
+{
+   VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   if (wcb->device->dispatch_table.CmdSetStencilTestEnable)
+      wcb->device->dispatch_table.CmdSetStencilTestEnable(
+         wcb->dispatch_handle, stencilTestEnable);
+   else if (wrapper_lowers_core13(wcb->device) &&
+            wcb->device->dispatch_table.CmdSetStencilTestEnableEXT)
+      wcb->device->dispatch_table.CmdSetStencilTestEnableEXT(
+         wcb->dispatch_handle, stencilTestEnable);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wrapper_CmdSetStencilOp(VkCommandBuffer commandBuffer,
+                        VkStencilFaceFlags faceMask, VkStencilOp failOp,
+                        VkStencilOp passOp, VkStencilOp depthFailOp,
+                        VkCompareOp compareOp)
+{
+   VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   if (wcb->device->dispatch_table.CmdSetStencilOp)
+      wcb->device->dispatch_table.CmdSetStencilOp(
+         wcb->dispatch_handle, faceMask, failOp, passOp, depthFailOp, compareOp);
+   else if (wrapper_lowers_core13(wcb->device) &&
+            wcb->device->dispatch_table.CmdSetStencilOpEXT)
+      wcb->device->dispatch_table.CmdSetStencilOpEXT(
+         wcb->dispatch_handle, faceMask, failOp, passOp, depthFailOp, compareOp);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wrapper_CmdSetRasterizerDiscardEnable(VkCommandBuffer commandBuffer,
+                                      VkBool32 rasterizerDiscardEnable)
+{
+   VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   if (wcb->device->dispatch_table.CmdSetRasterizerDiscardEnable)
+      wcb->device->dispatch_table.CmdSetRasterizerDiscardEnable(
+         wcb->dispatch_handle, rasterizerDiscardEnable);
+   else if (wrapper_lowers_core13(wcb->device) &&
+            wcb->device->dispatch_table.CmdSetRasterizerDiscardEnableEXT)
+      wcb->device->dispatch_table.CmdSetRasterizerDiscardEnableEXT(
+         wcb->dispatch_handle, rasterizerDiscardEnable);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wrapper_CmdSetDepthBiasEnable(VkCommandBuffer commandBuffer,
+                              VkBool32 depthBiasEnable)
+{
+   VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   if (wcb->device->dispatch_table.CmdSetDepthBiasEnable)
+      wcb->device->dispatch_table.CmdSetDepthBiasEnable(
+         wcb->dispatch_handle, depthBiasEnable);
+   else if (wrapper_lowers_core13(wcb->device) &&
+            wcb->device->dispatch_table.CmdSetDepthBiasEnableEXT)
+      wcb->device->dispatch_table.CmdSetDepthBiasEnableEXT(
+         wcb->dispatch_handle, depthBiasEnable);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wrapper_CmdSetPrimitiveRestartEnable(VkCommandBuffer commandBuffer,
+                                     VkBool32 primitiveRestartEnable)
+{
+   VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   if (wcb->device->dispatch_table.CmdSetPrimitiveRestartEnable)
+      wcb->device->dispatch_table.CmdSetPrimitiveRestartEnable(
+         wcb->dispatch_handle, primitiveRestartEnable);
+   else if (wrapper_lowers_core13(wcb->device) &&
+            wcb->device->dispatch_table.CmdSetPrimitiveRestartEnableEXT)
+      wcb->device->dispatch_table.CmdSetPrimitiveRestartEnableEXT(
+         wcb->dispatch_handle, primitiveRestartEnable);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -872,6 +1092,9 @@ wrapper_CreateDevice(VkPhysicalDevice physicalDevice,
    list_inithead(&device->buffer_list);
    list_inithead(&device->fence_list);
    device->image_table = _mesa_hash_table_u64_create(NULL);
+   device->image_view_table = _mesa_hash_table_u64_create(NULL);
+   device->imageless_fb_table = _mesa_hash_table_u64_create(NULL);
+   device->dynamic_pipeline_table = _mesa_hash_table_u64_create(NULL);
    device->buffer_table = _mesa_hash_table_u64_create(NULL);
    device->fence_table = _mesa_hash_table_u64_create(NULL);
    
@@ -900,7 +1123,7 @@ wrapper_CreateDevice(VkPhysicalDevice physicalDevice,
 
    wrapper_filter_enabled_extensions(device,
       &wrapper_enable_extension_count, wrapper_enable_extensions);
-   wrapper_append_required_extensions(&device->vk,
+   wrapper_append_required_extensions(device,
       &wrapper_enable_extension_count, wrapper_enable_extensions);
 
    /* VK_EXT_device_fault turns the generic VK_ERROR_DEVICE_LOST into an actual
@@ -1035,6 +1258,12 @@ if (pdf2 && pdf2->features.f) { \
       WRAPPER_LOG(info, "Emulating nullDescriptor with canonical zero resources");
       wrapper_create_null_resources(device);
    }
+
+   device->emulate_imageless_framebuffer =
+      physical_device->emulate_imageless_framebuffer &&
+      device->vk.enabled_extensions.KHR_imageless_framebuffer;
+   if (device->emulate_imageless_framebuffer)
+      WRAPPER_LOG(info, "Emulating imageless framebuffers for this device");
 
    /* Push-descriptor emulation: on when the app enabled VK_KHR_push_descriptor
     * and either the base driver lacks it or WRAPPER_EMULATE_PUSH_DESCRIPTOR
@@ -1403,9 +1632,266 @@ wrapper_CreateImageView(VkDevice _device,
      &create_info, pAllocator, pView);
 
    if (result != VK_SUCCESS)
-   	  WRAPPER_LOG(error, "Failed to create image view, res %d", result);   	  
+      WRAPPER_LOG(error, "Failed to create image view, res %d", result);
+   /* Only the lowering paths read this table, and populating it costs an
+    * allocation and a locked hash insert per view, so do not pay it on a
+    * driver that needs neither. */
+   else if (device->physical->emulate_vulkan13 ||
+            device->physical->emulate_imageless_framebuffer) {
+      struct wrapper_image_view *view = calloc(1, sizeof(*view));
+      if (view) {
+         struct wrapper_image *image =
+            get_wrapper_image_from_handle(device, pCreateInfo->image);
+         view->handle = *pView;
+         view->image = pCreateInfo->image;
+         view->format = create_info.format;
+         view->samples = image ? image->info.samples : VK_SAMPLE_COUNT_1_BIT;
+         simple_mtx_lock(&device->resource_mutex);
+         _mesa_hash_table_u64_insert(device->image_view_table,
+                                     (uint64_t)*pView, view);
+         simple_mtx_unlock(&device->resource_mutex);
+      }
+   }
 
    return result;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wrapper_DestroyImageView(VkDevice _device, VkImageView imageView,
+                         const VkAllocationCallbacks *pAllocator)
+{
+   VK_FROM_HANDLE(wrapper_device, device, _device);
+   struct wrapper_image_view *view = NULL;
+
+   simple_mtx_lock(&device->resource_mutex);
+   view = _mesa_hash_table_u64_search(device->image_view_table,
+                                      (uint64_t)imageView);
+   if (view)
+      _mesa_hash_table_u64_remove(device->image_view_table,
+                                  (uint64_t)imageView);
+   simple_mtx_unlock(&device->resource_mutex);
+
+   free(view);
+   device->dispatch_table.DestroyImageView(device->dispatch_handle, imageView,
+                                           pAllocator);
+}
+
+/* ---- VK_KHR_imageless_framebuffer emulation ---------------------------- *
+ *
+ * An imageless framebuffer names no image views at creation; they arrive at
+ * vkCmdBeginRenderPass in VkRenderPassAttachmentBeginInfo.  A driver without
+ * the extension can still be given a plain framebuffer at that moment, so the
+ * emulation is deferral and nothing else: hold the dimensions, build the real
+ * object when the views turn up, and drop it with the rest of the command
+ * buffer's transient render objects.
+ *
+ * The handle handed to the application is the address of the record.  Every
+ * lookup goes through imageless_fb_table, so a driver framebuffer is never
+ * mistaken for one of ours.
+ */
+static uint64_t
+wrapper_framebuffer_key(VkFramebuffer framebuffer)
+{
+   return (uint64_t)(uintptr_t)framebuffer;
+}
+
+static struct wrapper_imageless_framebuffer *
+wrapper_lookup_imageless_framebuffer(struct wrapper_device *device,
+                                     VkFramebuffer framebuffer)
+{
+   struct wrapper_imageless_framebuffer *fb;
+
+   if (!device->emulate_imageless_framebuffer ||
+       framebuffer == VK_NULL_HANDLE)
+      return NULL;
+
+   simple_mtx_lock(&device->resource_mutex);
+   fb = _mesa_hash_table_u64_search(device->imageless_fb_table,
+                                    wrapper_framebuffer_key(framebuffer));
+   simple_mtx_unlock(&device->resource_mutex);
+
+   return fb;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+wrapper_CreateFramebuffer(VkDevice _device,
+                          const VkFramebufferCreateInfo *pCreateInfo,
+                          const VkAllocationCallbacks *pAllocator,
+                          VkFramebuffer *pFramebuffer)
+{
+   VK_FROM_HANDLE(wrapper_device, device, _device);
+
+   if (!device->emulate_imageless_framebuffer ||
+       !(pCreateInfo->flags & VK_FRAMEBUFFER_CREATE_IMAGELESS_BIT))
+      return device->dispatch_table.CreateFramebuffer(device->dispatch_handle,
+                                                      pCreateInfo, pAllocator,
+                                                      pFramebuffer);
+
+   struct wrapper_imageless_framebuffer *fb = calloc(1, sizeof(*fb));
+   if (!fb)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+
+   fb->attachment_count = pCreateInfo->attachmentCount;
+   fb->width = pCreateInfo->width;
+   fb->height = pCreateInfo->height;
+   fb->layers = pCreateInfo->layers;
+
+   VkFramebuffer handle = (VkFramebuffer)(uintptr_t)fb;
+
+   simple_mtx_lock(&device->resource_mutex);
+   _mesa_hash_table_u64_insert(device->imageless_fb_table,
+                               wrapper_framebuffer_key(handle), fb);
+   simple_mtx_unlock(&device->resource_mutex);
+
+   WRAPPER_LOG(info,
+      "Imageless framebuffer %ux%u layers=%u attachments=%u",
+      fb->width, fb->height, fb->layers, fb->attachment_count);
+
+   *pFramebuffer = handle;
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wrapper_DestroyFramebuffer(VkDevice _device, VkFramebuffer framebuffer,
+                           const VkAllocationCallbacks *pAllocator)
+{
+   VK_FROM_HANDLE(wrapper_device, device, _device);
+   struct wrapper_imageless_framebuffer *fb = NULL;
+
+   if (framebuffer == VK_NULL_HANDLE)
+      return;
+
+   if (device->emulate_imageless_framebuffer) {
+      simple_mtx_lock(&device->resource_mutex);
+      fb = _mesa_hash_table_u64_search(device->imageless_fb_table,
+                                       wrapper_framebuffer_key(framebuffer));
+      if (fb)
+         _mesa_hash_table_u64_remove(device->imageless_fb_table,
+                                     wrapper_framebuffer_key(framebuffer));
+      simple_mtx_unlock(&device->resource_mutex);
+   }
+
+   if (fb) {
+      free(fb);
+      return;
+   }
+
+   device->dispatch_table.DestroyFramebuffer(device->dispatch_handle,
+                                             framebuffer, pAllocator);
+}
+
+/* Returns true when the begin info names a wrapper-owned imageless
+ * framebuffer, in which case *out holds the driver framebuffer to use --
+ * VK_NULL_HANDLE if one could not be built, and then the render pass is
+ * dropped rather than begun against a handle the driver never issued. */
+static bool
+wrapper_lower_imageless_framebuffer(struct wrapper_command_buffer *wcb,
+                                    const VkRenderPassBeginInfo *pBegin,
+                                    VkFramebuffer *out)
+{
+   struct wrapper_device *device = wcb->device;
+   const VkRenderPassAttachmentBeginInfo *attachments = NULL;
+   struct wrapper_imageless_framebuffer *fb;
+
+   fb = wrapper_lookup_imageless_framebuffer(device, pBegin->framebuffer);
+   if (!fb)
+      return false;
+
+   *out = VK_NULL_HANDLE;
+
+   vk_foreach_struct_const(s, pBegin->pNext) {
+      if (s->sType == VK_STRUCTURE_TYPE_RENDER_PASS_ATTACHMENT_BEGIN_INFO) {
+         attachments = (const VkRenderPassAttachmentBeginInfo *)s;
+         break;
+      }
+   }
+
+   if (!attachments) {
+      WRAPPER_LOG(error,
+         "Imageless framebuffer begun without VkRenderPassAttachmentBeginInfo");
+      return true;
+   }
+   if (attachments->attachmentCount != fb->attachment_count) {
+      WRAPPER_LOG(error,
+         "Imageless framebuffer attachment count %u, begin supplies %u",
+         fb->attachment_count, attachments->attachmentCount);
+      return true;
+   }
+
+   /* Built against the render pass of this begin, which the spec already
+    * requires to be compatible with the one the framebuffer was created
+    * with -- so the stricter of the two is the one actually in use. */
+   VkFramebufferCreateInfo info = {
+      .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+      .renderPass = pBegin->renderPass,
+      .attachmentCount = attachments->attachmentCount,
+      .pAttachments = attachments->pAttachments,
+      .width = fb->width,
+      .height = fb->height,
+      .layers = fb->layers,
+   };
+   VkFramebuffer real = VK_NULL_HANDLE;
+   VkResult result = device->dispatch_table.CreateFramebuffer(
+      device->dispatch_handle, &info, NULL, &real);
+   if (result != VK_SUCCESS) {
+      WRAPPER_LOG(error, "Failed to realise imageless framebuffer: %d", result);
+      return true;
+   }
+
+   struct wrapper_dynamic_render_object *object = calloc(1, sizeof(*object));
+   if (!object) {
+      device->dispatch_table.DestroyFramebuffer(device->dispatch_handle, real,
+                                                NULL);
+      return true;
+   }
+   object->framebuffer = real;
+   list_addtail(&object->link, &wcb->dynamic_render_objects);
+
+   *out = real;
+   return true;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wrapper_CmdBeginRenderPass(VkCommandBuffer commandBuffer,
+                           const VkRenderPassBeginInfo *pRenderPassBegin,
+                           VkSubpassContents contents)
+{
+   VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   VkRenderPassBeginInfo begin = *pRenderPassBegin;
+   VkFramebuffer real;
+
+   if (wrapper_lower_imageless_framebuffer(wcb, pRenderPassBegin, &real)) {
+      if (real == VK_NULL_HANDLE)
+         return;
+      begin.framebuffer = real;
+   }
+
+   wcb->device->dispatch_table.CmdBeginRenderPass(wcb->dispatch_handle, &begin,
+                                                  contents);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wrapper_CmdBeginRenderPass2(VkCommandBuffer commandBuffer,
+                            const VkRenderPassBeginInfo *pRenderPassBegin,
+                            const VkSubpassBeginInfo *pSubpassBeginInfo)
+{
+   VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   struct wrapper_device *device = wcb->device;
+   VkRenderPassBeginInfo begin = *pRenderPassBegin;
+   VkFramebuffer real;
+
+   if (wrapper_lower_imageless_framebuffer(wcb, pRenderPassBegin, &real)) {
+      if (real == VK_NULL_HANDLE)
+         return;
+      begin.framebuffer = real;
+   }
+
+   if (device->dispatch_table.CmdBeginRenderPass2)
+      device->dispatch_table.CmdBeginRenderPass2(wcb->dispatch_handle, &begin,
+                                                 pSubpassBeginInfo);
+   else
+      device->dispatch_table.CmdBeginRenderPass2KHR(wcb->dispatch_handle,
+                                                    &begin, pSubpassBeginInfo);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -1956,6 +2442,23 @@ wrapper_destroy_update_template(struct wrapper_device *device,
    destroy_fn(device->dispatch_handle, descriptorUpdateTemplate, pAllocator);
 }
 
+static void
+wrapper_dynamic_render_objects_reset(struct wrapper_command_buffer *wcb)
+{
+   struct wrapper_device *device = wcb->device;
+   list_for_each_entry_safe(struct wrapper_dynamic_render_object, object,
+                            &wcb->dynamic_render_objects, link) {
+      if (object->framebuffer)
+         device->dispatch_table.DestroyFramebuffer(device->dispatch_handle,
+                                                    object->framebuffer, NULL);
+      if (object->render_pass)
+         device->dispatch_table.DestroyRenderPass(device->dispatch_handle,
+                                                   object->render_pass, NULL);
+      list_del(&object->link);
+      free(object);
+   }
+}
+
 VKAPI_ATTR void VKAPI_CALL
 wrapper_DestroyDescriptorUpdateTemplate(VkDevice _device,
    VkDescriptorUpdateTemplate descriptorUpdateTemplate,
@@ -1970,10 +2473,647 @@ wrapper_BeginCommandBuffer(VkCommandBuffer commandBuffer,
                           const VkCommandBufferBeginInfo *pBeginInfo)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   wrapper_dynamic_render_objects_reset(wcb);
    if (wcb->device->emulate_push_descriptor)
       wrapper_push_pool_reset_all(wcb);
-   return wcb->device->dispatch_table.BeginCommandBuffer(wcb->dispatch_handle,
-                                                         pBeginInfo);
+   VkResult begin_result =
+      wcb->device->dispatch_table.BeginCommandBuffer(wcb->dispatch_handle,
+                                                     pBeginInfo);
+   return begin_result;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+wrapper_EndCommandBuffer(VkCommandBuffer commandBuffer)
+{
+   VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   VkResult result = wcb->device->dispatch_table.EndCommandBuffer(
+      wcb->dispatch_handle);
+   return result;
+}
+
+static VkPipelineStageFlags
+wrapper_stage_mask2_to_legacy(VkPipelineStageFlags2 stages, bool source)
+{
+   VkPipelineStageFlags legacy = (VkPipelineStageFlags)stages;
+
+   /* Synchronization2 added stage bits above the legacy 32-bit range.  The
+    * Tegra ICD cannot name those stages individually, so widen the dependency
+    * to all commands.  This is conservative, but preserves ordering. */
+   if (stages >> 32)
+      legacy |= VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+
+   if (!legacy)
+      legacy = source ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
+                      : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+
+   return legacy;
+}
+
+static VkAccessFlags
+wrapper_access_mask2_to_legacy(VkAccessFlags2 access)
+{
+   VkAccessFlags legacy = (VkAccessFlags)access;
+
+   /* Access2 also has bits with no legacy spelling.  MEMORY_READ/WRITE are
+    * valid conservative substitutes when paired with ALL_COMMANDS. */
+   if (access >> 32)
+      legacy |= VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+
+   return legacy;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wrapper_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
+                            const VkDependencyInfo *pDependencyInfo)
+{
+   VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   struct wrapper_device *device = wcb->device;
+
+   if (device->dispatch_table.CmdPipelineBarrier2) {
+      device->dispatch_table.CmdPipelineBarrier2(wcb->dispatch_handle,
+                                                  pDependencyInfo);
+      return;
+   }
+   if (!wrapper_lowers_core13(device))
+      return;
+
+   const uint32_t memory_count = pDependencyInfo->memoryBarrierCount;
+   const uint32_t buffer_count = pDependencyInfo->bufferMemoryBarrierCount;
+   const uint32_t image_count = pDependencyInfo->imageMemoryBarrierCount;
+   VkMemoryBarrier *memory = calloc(memory_count, sizeof(*memory));
+   VkBufferMemoryBarrier *buffers = calloc(buffer_count, sizeof(*buffers));
+   VkImageMemoryBarrier *images = calloc(image_count, sizeof(*images));
+   VkPipelineStageFlags src_stages = 0;
+   VkPipelineStageFlags dst_stages = 0;
+
+   if ((!memory && memory_count) || (!buffers && buffer_count) ||
+       (!images && image_count)) {
+      /* Command recording entry points cannot report allocation failures.
+       * Preserve safety by recording a full memory dependency instead. */
+      VkMemoryBarrier fallback = {
+         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+         .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+         .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT |
+                          VK_ACCESS_MEMORY_WRITE_BIT,
+      };
+      device->dispatch_table.CmdPipelineBarrier(
+         wcb->dispatch_handle, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+         VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, pDependencyInfo->dependencyFlags,
+         1, &fallback, 0, NULL, 0, NULL);
+      free(memory);
+      free(buffers);
+      free(images);
+      return;
+   }
+
+   for (uint32_t i = 0; i < memory_count; i++) {
+      const VkMemoryBarrier2 *src = &pDependencyInfo->pMemoryBarriers[i];
+      src_stages |= wrapper_stage_mask2_to_legacy(src->srcStageMask, true);
+      dst_stages |= wrapper_stage_mask2_to_legacy(src->dstStageMask, false);
+      memory[i] = (VkMemoryBarrier) {
+         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+         .pNext = src->pNext,
+         .srcAccessMask = wrapper_access_mask2_to_legacy(src->srcAccessMask),
+         .dstAccessMask = wrapper_access_mask2_to_legacy(src->dstAccessMask),
+      };
+   }
+
+   for (uint32_t i = 0; i < buffer_count; i++) {
+      const VkBufferMemoryBarrier2 *src =
+         &pDependencyInfo->pBufferMemoryBarriers[i];
+      src_stages |= wrapper_stage_mask2_to_legacy(src->srcStageMask, true);
+      dst_stages |= wrapper_stage_mask2_to_legacy(src->dstStageMask, false);
+      buffers[i] = (VkBufferMemoryBarrier) {
+         .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+         .pNext = src->pNext,
+         .srcAccessMask = wrapper_access_mask2_to_legacy(src->srcAccessMask),
+         .dstAccessMask = wrapper_access_mask2_to_legacy(src->dstAccessMask),
+         .srcQueueFamilyIndex = src->srcQueueFamilyIndex,
+         .dstQueueFamilyIndex = src->dstQueueFamilyIndex,
+         .buffer = src->buffer,
+         .offset = src->offset,
+         .size = src->size,
+      };
+   }
+
+   for (uint32_t i = 0; i < image_count; i++) {
+      const VkImageMemoryBarrier2 *src =
+         &pDependencyInfo->pImageMemoryBarriers[i];
+      src_stages |= wrapper_stage_mask2_to_legacy(src->srcStageMask, true);
+      dst_stages |= wrapper_stage_mask2_to_legacy(src->dstStageMask, false);
+      images[i] = (VkImageMemoryBarrier) {
+         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+         .pNext = src->pNext,
+         .srcAccessMask = wrapper_access_mask2_to_legacy(src->srcAccessMask),
+         .dstAccessMask = wrapper_access_mask2_to_legacy(src->dstAccessMask),
+         .oldLayout = src->oldLayout,
+         .newLayout = src->newLayout,
+         .srcQueueFamilyIndex = src->srcQueueFamilyIndex,
+         .dstQueueFamilyIndex = src->dstQueueFamilyIndex,
+         .image = src->image,
+         .subresourceRange = src->subresourceRange,
+      };
+   }
+
+   if (!src_stages)
+      src_stages = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+   if (!dst_stages)
+      dst_stages = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+
+   device->dispatch_table.CmdPipelineBarrier(
+      wcb->dispatch_handle, src_stages, dst_stages,
+      pDependencyInfo->dependencyFlags, memory_count, memory, buffer_count,
+      buffers, image_count, images);
+
+   free(memory);
+   free(buffers);
+   free(images);
+}
+
+#define WRAPPER_DYNAMIC_MAX_COLOR_ATTACHMENTS 8
+#define WRAPPER_DYNAMIC_MAX_ATTACHMENTS \
+   (WRAPPER_DYNAMIC_MAX_COLOR_ATTACHMENTS * 2 + 2)
+
+static const VkPipelineRenderingCreateInfo *
+wrapper_find_pipeline_rendering_info(const void *pNext)
+{
+   const VkBaseInStructure *current = pNext;
+   while (current) {
+      if (current->sType == VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO)
+         return (const VkPipelineRenderingCreateInfo *)current;
+      current = current->pNext;
+   }
+   return NULL;
+}
+
+static VkResult
+wrapper_create_legacy_render_pass_for_pipeline(
+   struct wrapper_device *device,
+   const VkPipelineRenderingCreateInfo *rendering,
+   VkSampleCountFlagBits samples,
+   VkRenderPass *render_pass)
+{
+   if (rendering->colorAttachmentCount >
+       WRAPPER_DYNAMIC_MAX_COLOR_ATTACHMENTS)
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+
+   VkAttachmentDescription attachments[WRAPPER_DYNAMIC_MAX_ATTACHMENTS] = {0};
+   VkAttachmentReference colors[WRAPPER_DYNAMIC_MAX_COLOR_ATTACHMENTS];
+   uint32_t attachment_count = 0;
+
+   for (uint32_t i = 0; i < rendering->colorAttachmentCount; i++) {
+      colors[i] = (VkAttachmentReference) {
+         .attachment = VK_ATTACHMENT_UNUSED,
+         .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+      };
+      if (rendering->pColorAttachmentFormats[i] == VK_FORMAT_UNDEFINED)
+         continue;
+      colors[i].attachment = attachment_count;
+      attachments[attachment_count++] = (VkAttachmentDescription) {
+         .format = rendering->pColorAttachmentFormats[i],
+         .samples = samples,
+         .loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+         .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+         .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+         .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+         .initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+         .finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+      };
+   }
+
+   VkAttachmentReference depth = {
+      .attachment = VK_ATTACHMENT_UNUSED,
+      .layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+   };
+   VkFormat depth_format = rendering->depthAttachmentFormat != VK_FORMAT_UNDEFINED
+      ? rendering->depthAttachmentFormat : rendering->stencilAttachmentFormat;
+   if (rendering->depthAttachmentFormat != VK_FORMAT_UNDEFINED &&
+       rendering->stencilAttachmentFormat != VK_FORMAT_UNDEFINED &&
+       rendering->depthAttachmentFormat != rendering->stencilAttachmentFormat) {
+      WRAPPER_LOG(error,
+         "Cannot lower dynamic rendering with different depth/stencil formats");
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+   }
+   if (depth_format != VK_FORMAT_UNDEFINED) {
+      depth.attachment = attachment_count;
+      attachments[attachment_count++] = (VkAttachmentDescription) {
+         .format = depth_format,
+         .samples = samples,
+         .loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+         .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+         .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+         .stencilStoreOp = VK_ATTACHMENT_STORE_OP_STORE,
+         .initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+         .finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+      };
+   }
+
+   VkSubpassDescription subpass = {
+      .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
+      .colorAttachmentCount = rendering->colorAttachmentCount,
+      .pColorAttachments = colors,
+      .pDepthStencilAttachment = depth.attachment != VK_ATTACHMENT_UNUSED
+         ? &depth : NULL,
+   };
+   VkRenderPassMultiviewCreateInfo multiview = {
+      .sType = VK_STRUCTURE_TYPE_RENDER_PASS_MULTIVIEW_CREATE_INFO,
+      .subpassCount = 1,
+      .pViewMasks = &rendering->viewMask,
+   };
+   VkRenderPassCreateInfo info = {
+      .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
+      .pNext = rendering->viewMask ? &multiview : NULL,
+      .attachmentCount = attachment_count,
+      .pAttachments = attachments,
+      .subpassCount = 1,
+      .pSubpasses = &subpass,
+   };
+   return device->dispatch_table.CreateRenderPass(device->dispatch_handle,
+                                                   &info, NULL, render_pass);
+}
+
+static bool
+wrapper_lookup_image_view(struct wrapper_device *device, VkImageView handle,
+                          struct wrapper_image_view *out)
+{
+   bool found = false;
+   simple_mtx_lock(&device->resource_mutex);
+   struct wrapper_image_view *view =
+      _mesa_hash_table_u64_search(device->image_view_table, (uint64_t)handle);
+   if (view) {
+      *out = *view;
+      found = true;
+   }
+   simple_mtx_unlock(&device->resource_mutex);
+   return found;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wrapper_CmdBeginRendering(VkCommandBuffer commandBuffer,
+                          const VkRenderingInfo *pRenderingInfo)
+{
+   VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   struct wrapper_device *device = wcb->device;
+
+
+   if (device->dispatch_table.CmdBeginRendering) {
+      device->dispatch_table.CmdBeginRendering(wcb->dispatch_handle,
+                                                pRenderingInfo);
+      wcb->dynamic_rendering_active = true;
+      return;
+   }
+   if (!wrapper_lowers_core13(device))
+      return;
+
+   if (pRenderingInfo->colorAttachmentCount >
+       WRAPPER_DYNAMIC_MAX_COLOR_ATTACHMENTS) {
+      WRAPPER_LOG(error, "Too many dynamic-rendering color attachments: %u",
+                  pRenderingInfo->colorAttachmentCount);
+      return;
+   }
+
+   VkAttachmentDescription attachments[WRAPPER_DYNAMIC_MAX_ATTACHMENTS] = {0};
+   VkAttachmentReference colors[WRAPPER_DYNAMIC_MAX_COLOR_ATTACHMENTS];
+   VkAttachmentReference resolves[WRAPPER_DYNAMIC_MAX_COLOR_ATTACHMENTS];
+   VkImageView views[WRAPPER_DYNAMIC_MAX_ATTACHMENTS] = {0};
+   VkClearValue clears[WRAPPER_DYNAMIC_MAX_ATTACHMENTS] = {0};
+   uint32_t attachment_count = 0;
+   bool has_resolve = false;
+
+   for (uint32_t i = 0; i < pRenderingInfo->colorAttachmentCount; i++) {
+      const VkRenderingAttachmentInfo *src =
+         &pRenderingInfo->pColorAttachments[i];
+      colors[i] = (VkAttachmentReference) {
+         .attachment = VK_ATTACHMENT_UNUSED,
+         .layout = src->imageLayout,
+      };
+      resolves[i] = (VkAttachmentReference) {
+         .attachment = VK_ATTACHMENT_UNUSED,
+         .layout = src->resolveImageLayout,
+      };
+      if (src->imageView == VK_NULL_HANDLE)
+         continue;
+
+      struct wrapper_image_view view;
+      if (!wrapper_lookup_image_view(device, src->imageView, &view)) {
+         WRAPPER_LOG(error, "Dynamic rendering references unknown image view %p",
+                     (void *)(uintptr_t)src->imageView);
+         return;
+      }
+      colors[i].attachment = attachment_count;
+      views[attachment_count] = src->imageView;
+      clears[attachment_count] = src->clearValue;
+      attachments[attachment_count++] = (VkAttachmentDescription) {
+         .format = view.format,
+         .samples = view.samples,
+         .loadOp = src->loadOp,
+         .storeOp = src->storeOp,
+         .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+         .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+         .initialLayout = src->imageLayout,
+         .finalLayout = src->imageLayout,
+      };
+
+      if (src->resolveMode != VK_RESOLVE_MODE_NONE &&
+          src->resolveImageView != VK_NULL_HANDLE) {
+         struct wrapper_image_view resolve_view;
+         if (!wrapper_lookup_image_view(device, src->resolveImageView,
+                                        &resolve_view)) {
+            WRAPPER_LOG(error, "Dynamic rendering references unknown resolve view");
+            return;
+         }
+         has_resolve = true;
+         resolves[i].attachment = attachment_count;
+         views[attachment_count] = src->resolveImageView;
+         attachments[attachment_count++] = (VkAttachmentDescription) {
+            .format = resolve_view.format,
+            .samples = resolve_view.samples,
+            .loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+            .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+            .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+            .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+            .initialLayout = src->resolveImageLayout,
+            .finalLayout = src->resolveImageLayout,
+         };
+      }
+   }
+
+   VkAttachmentReference depth_ref = {
+      .attachment = VK_ATTACHMENT_UNUSED,
+      .layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+   };
+   const VkRenderingAttachmentInfo *depth_src = pRenderingInfo->pDepthAttachment;
+   const VkRenderingAttachmentInfo *stencil_src = pRenderingInfo->pStencilAttachment;
+   if (depth_src && stencil_src && depth_src->imageView != VK_NULL_HANDLE &&
+       stencil_src->imageView != VK_NULL_HANDLE &&
+       depth_src->imageView != stencil_src->imageView) {
+      WRAPPER_LOG(error,
+         "Cannot lower dynamic rendering with separate depth/stencil views");
+      return;
+   }
+
+   const VkRenderingAttachmentInfo *ds_src =
+      depth_src && depth_src->imageView != VK_NULL_HANDLE ? depth_src :
+      stencil_src && stencil_src->imageView != VK_NULL_HANDLE ? stencil_src : NULL;
+   if (ds_src) {
+      struct wrapper_image_view view;
+      if (!wrapper_lookup_image_view(device, ds_src->imageView, &view)) {
+         WRAPPER_LOG(error, "Dynamic rendering references unknown depth view");
+         return;
+      }
+      depth_ref.attachment = attachment_count;
+      depth_ref.layout = ds_src->imageLayout;
+      views[attachment_count] = ds_src->imageView;
+      clears[attachment_count] = ds_src->clearValue;
+      if (depth_src)
+         clears[attachment_count].depthStencil.depth =
+            depth_src->clearValue.depthStencil.depth;
+      if (stencil_src)
+         clears[attachment_count].depthStencil.stencil =
+            stencil_src->clearValue.depthStencil.stencil;
+      attachments[attachment_count++] = (VkAttachmentDescription) {
+         .format = view.format,
+         .samples = view.samples,
+         .loadOp = depth_src ? depth_src->loadOp : VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+         .storeOp = depth_src ? depth_src->storeOp : VK_ATTACHMENT_STORE_OP_DONT_CARE,
+         .stencilLoadOp = stencil_src ? stencil_src->loadOp
+                                      : VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+         .stencilStoreOp = stencil_src ? stencil_src->storeOp
+                                       : VK_ATTACHMENT_STORE_OP_DONT_CARE,
+         .initialLayout = ds_src->imageLayout,
+         .finalLayout = ds_src->imageLayout,
+      };
+      if ((depth_src && depth_src->resolveMode != VK_RESOLVE_MODE_NONE) ||
+          (stencil_src && stencil_src->resolveMode != VK_RESOLVE_MODE_NONE))
+         WRAPPER_LOG(error,
+            "Depth/stencil dynamic-rendering resolve is not emulated");
+   }
+
+   VkSubpassDescription subpass = {
+      .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
+      .colorAttachmentCount = pRenderingInfo->colorAttachmentCount,
+      .pColorAttachments = colors,
+      .pResolveAttachments = has_resolve ? resolves : NULL,
+      .pDepthStencilAttachment = depth_ref.attachment != VK_ATTACHMENT_UNUSED
+         ? &depth_ref : NULL,
+   };
+   VkRenderPassMultiviewCreateInfo multiview = {
+      .sType = VK_STRUCTURE_TYPE_RENDER_PASS_MULTIVIEW_CREATE_INFO,
+      .subpassCount = 1,
+      .pViewMasks = &pRenderingInfo->viewMask,
+   };
+   VkRenderPassCreateInfo rp_info = {
+      .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
+      .pNext = pRenderingInfo->viewMask ? &multiview : NULL,
+      .attachmentCount = attachment_count,
+      .pAttachments = attachments,
+      .subpassCount = 1,
+      .pSubpasses = &subpass,
+   };
+   VkRenderPass render_pass = VK_NULL_HANDLE;
+   VkResult result = device->dispatch_table.CreateRenderPass(
+      device->dispatch_handle, &rp_info, NULL, &render_pass);
+   if (result != VK_SUCCESS) {
+      WRAPPER_LOG(error, "Failed to lower dynamic render pass: %d", result);
+      return;
+   }
+
+   VkFramebufferCreateInfo fb_info = {
+      .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+      .renderPass = render_pass,
+      .attachmentCount = attachment_count,
+      .pAttachments = views,
+      .width = pRenderingInfo->renderArea.offset.x +
+               pRenderingInfo->renderArea.extent.width,
+      .height = pRenderingInfo->renderArea.offset.y +
+                pRenderingInfo->renderArea.extent.height,
+      .layers = pRenderingInfo->viewMask ? 1 : MAX2(1, pRenderingInfo->layerCount),
+   };
+   VkFramebuffer framebuffer = VK_NULL_HANDLE;
+   result = device->dispatch_table.CreateFramebuffer(device->dispatch_handle,
+                                                       &fb_info, NULL,
+                                                       &framebuffer);
+   if (result != VK_SUCCESS) {
+      device->dispatch_table.DestroyRenderPass(device->dispatch_handle,
+                                                render_pass, NULL);
+      WRAPPER_LOG(error, "Failed to lower dynamic framebuffer: %d", result);
+      return;
+   }
+
+   struct wrapper_dynamic_render_object *object = calloc(1, sizeof(*object));
+   if (!object) {
+      device->dispatch_table.DestroyFramebuffer(device->dispatch_handle,
+                                                  framebuffer, NULL);
+      device->dispatch_table.DestroyRenderPass(device->dispatch_handle,
+                                                render_pass, NULL);
+      return;
+   }
+   object->render_pass = render_pass;
+   object->framebuffer = framebuffer;
+   list_addtail(&object->link, &wcb->dynamic_render_objects);
+
+   VkRenderPassBeginInfo begin = {
+      .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+      .renderPass = render_pass,
+      .framebuffer = framebuffer,
+      .renderArea = pRenderingInfo->renderArea,
+      .clearValueCount = attachment_count,
+      .pClearValues = clears,
+   };
+   device->dispatch_table.CmdBeginRenderPass(
+      wcb->dispatch_handle, &begin,
+      (pRenderingInfo->flags & VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT)
+         ? VK_SUBPASS_CONTENTS_SECONDARY_COMMAND_BUFFERS
+         : VK_SUBPASS_CONTENTS_INLINE);
+   wcb->dynamic_rendering_active = true;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wrapper_CmdEndRendering(VkCommandBuffer commandBuffer)
+{
+   VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   if (wcb->device->dispatch_table.CmdEndRendering)
+      wcb->device->dispatch_table.CmdEndRendering(wcb->dispatch_handle);
+   else if (wcb->dynamic_rendering_active)
+      wcb->device->dispatch_table.CmdEndRenderPass(wcb->dispatch_handle);
+   wcb->dynamic_rendering_active = false;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+wrapper_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
+                                uint32_t createInfoCount,
+                                const VkGraphicsPipelineCreateInfo *pCreateInfos,
+                                const VkAllocationCallbacks *pAllocator,
+                                VkPipeline *pPipelines)
+{
+   VK_FROM_HANDLE(wrapper_device, device, _device);
+   VkGraphicsPipelineCreateInfo *legacy = NULL;
+   VkRenderPass *render_passes = NULL;
+   const VkGraphicsPipelineCreateInfo *driver_infos = pCreateInfos;
+
+   if (wrapper_lowers_core13(device) &&
+       !device->dispatch_table.CmdBeginRendering && createInfoCount) {
+      legacy = calloc(createInfoCount, sizeof(*legacy));
+      render_passes = calloc(createInfoCount, sizeof(*render_passes));
+      if (!legacy || !render_passes) {
+         free(legacy);
+         free(render_passes);
+         return VK_ERROR_OUT_OF_HOST_MEMORY;
+      }
+      memcpy(legacy, pCreateInfos, createInfoCount * sizeof(*legacy));
+
+      for (uint32_t i = 0; i < createInfoCount; i++) {
+         const VkPipelineRenderingCreateInfo *rendering =
+            wrapper_find_pipeline_rendering_info(pCreateInfos[i].pNext);
+         if (!rendering || pCreateInfos[i].renderPass != VK_NULL_HANDLE)
+            continue;
+         VkSampleCountFlagBits samples = pCreateInfos[i].pMultisampleState
+            ? pCreateInfos[i].pMultisampleState->rasterizationSamples
+            : VK_SAMPLE_COUNT_1_BIT;
+         VkResult rp_result = wrapper_create_legacy_render_pass_for_pipeline(
+            device, rendering, samples, &render_passes[i]);
+         if (rp_result != VK_SUCCESS) {
+            for (uint32_t j = 0; j < i; j++)
+               if (render_passes[j])
+                  device->dispatch_table.DestroyRenderPass(
+                     device->dispatch_handle, render_passes[j], NULL);
+            free(legacy);
+            free(render_passes);
+            return rp_result;
+         }
+         legacy[i].renderPass = render_passes[i];
+         legacy[i].subpass = 0;
+         /* The base ICD does not support dynamic rendering.  Once a compatible
+          * legacy render pass is supplied, do not also pass its Vulkan 1.3
+          * VkPipelineRenderingCreateInfo to that Vulkan 1.1 driver.  D8VK puts
+          * this structure at the head of the chain (and currently it is the
+          * only entry), so unlink it from the driver-facing create info. */
+         if (pCreateInfos[i].pNext == rendering)
+            legacy[i].pNext = rendering->pNext;
+         WRAPPER_LOG(info,
+            "Lowering dynamic graphics pipeline %u to legacy render pass %p; strippedRenderingInfo=%u",
+            i, (void *)(uintptr_t)render_passes[i],
+            pCreateInfos[i].pNext == rendering);
+      }
+      driver_infos = legacy;
+   }
+
+   VkResult result = device->dispatch_table.CreateGraphicsPipelines(
+      device->dispatch_handle, pipelineCache, createInfoCount, driver_infos,
+      pAllocator, pPipelines);
+
+   if (render_passes) {
+      for (uint32_t i = 0; i < createInfoCount; i++) {
+         if (!render_passes[i])
+            continue;
+         if (pPipelines[i] == VK_NULL_HANDLE) {
+            device->dispatch_table.DestroyRenderPass(device->dispatch_handle,
+                                                      render_passes[i], NULL);
+            continue;
+         }
+         struct wrapper_dynamic_pipeline *pipeline = calloc(1, sizeof(*pipeline));
+         if (!pipeline) {
+            /* Keep the render pass alive until device teardown rather than
+             * invalidate a successfully created pipeline. */
+            continue;
+         }
+         pipeline->pipeline = pPipelines[i];
+         pipeline->render_pass = render_passes[i];
+         simple_mtx_lock(&device->resource_mutex);
+         _mesa_hash_table_u64_insert(device->dynamic_pipeline_table,
+                                     (uint64_t)pPipelines[i], pipeline);
+         simple_mtx_unlock(&device->resource_mutex);
+      }
+   }
+   free(legacy);
+   free(render_passes);
+   WRAPPER_LOG(info, "CreateGraphicsPipelines result %d", result);
+   return result;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wrapper_DestroyPipeline(VkDevice _device, VkPipeline pipeline,
+                        const VkAllocationCallbacks *pAllocator)
+{
+   VK_FROM_HANDLE(wrapper_device, device, _device);
+   struct wrapper_dynamic_pipeline *dynamic = NULL;
+
+   simple_mtx_lock(&device->resource_mutex);
+   dynamic = _mesa_hash_table_u64_search(device->dynamic_pipeline_table,
+                                         (uint64_t)pipeline);
+   if (dynamic)
+      _mesa_hash_table_u64_remove(device->dynamic_pipeline_table,
+                                  (uint64_t)pipeline);
+   simple_mtx_unlock(&device->resource_mutex);
+
+   device->dispatch_table.DestroyPipeline(device->dispatch_handle, pipeline,
+                                           pAllocator);
+   if (dynamic) {
+      device->dispatch_table.DestroyRenderPass(device->dispatch_handle,
+                                                dynamic->render_pass, NULL);
+      free(dynamic);
+   }
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wrapper_CmdDraw(VkCommandBuffer commandBuffer, uint32_t vertexCount,
+                uint32_t instanceCount, uint32_t firstVertex,
+                uint32_t firstInstance)
+{
+   VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   wcb->device->dispatch_table.CmdDraw(wcb->dispatch_handle, vertexCount,
+                                       instanceCount, firstVertex, firstInstance);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wrapper_CmdDrawIndexed(VkCommandBuffer commandBuffer, uint32_t indexCount,
+                       uint32_t instanceCount, uint32_t firstIndex,
+                       int32_t vertexOffset, uint32_t firstInstance)
+{
+   VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   wcb->device->dispatch_table.CmdDrawIndexed(
+      wcb->dispatch_handle, indexCount, instanceCount, firstIndex,
+      vertexOffset, firstInstance);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -1981,6 +3121,7 @@ wrapper_ResetCommandBuffer(VkCommandBuffer commandBuffer,
                           VkCommandBufferResetFlags flags)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   wrapper_dynamic_render_objects_reset(wcb);
    if (wcb->device->emulate_push_descriptor)
       wrapper_push_pool_reset_all(wcb);
    return wcb->device->dispatch_table.ResetCommandBuffer(wcb->dispatch_handle,
@@ -1992,12 +3133,20 @@ wrapper_ResetCommandPool(VkDevice _device, VkCommandPool commandPool,
                         VkCommandPoolResetFlags flags)
 {
    VK_FROM_HANDLE(wrapper_device, device, _device);
-   if (device->emulate_push_descriptor) {
+   /* Both of these walk the device's whole command-buffer list under its lock,
+    * so do it only when something can have put objects there. */
+   if (device->emulate_push_descriptor ||
+       device->physical->emulate_imageless_framebuffer ||
+       device->physical->emulate_vulkan13) {
       simple_mtx_lock(&device->resource_mutex);
       list_for_each_entry(struct wrapper_command_buffer, wcb,
-                          &device->command_buffer_list, link)
-         if (wcb->pool == commandPool)
-            wrapper_push_pool_reset_all(wcb);
+                          &device->command_buffer_list, link) {
+         if (wcb->pool == commandPool) {
+            wrapper_dynamic_render_objects_reset(wcb);
+            if (device->emulate_push_descriptor)
+               wrapper_push_pool_reset_all(wcb);
+         }
+      }
       simple_mtx_unlock(&device->resource_mutex);
    }
    return device->dispatch_table.ResetCommandPool(device->dispatch_handle,
@@ -2164,8 +3313,159 @@ wrapper_QueueSubmit2(VkQueue _queue, uint32_t submitCount,
 
    if (serialise)
       simple_mtx_lock(&queue->device->query_reset_mutex);
-   result = queue->device->dispatch_table.QueueSubmit2(
-      queue->dispatch_handle, submitCount, wrapper_submits, fence);
+   if (queue->device->dispatch_table.QueueSubmit2) {
+      result = queue->device->dispatch_table.QueueSubmit2(
+         queue->dispatch_handle, submitCount, wrapper_submits, fence);
+   } else if (!wrapper_lowers_core13(queue->device)) {
+      result = VK_ERROR_FEATURE_NOT_PRESENT;
+   } else {
+      /* GameNative may expose a newer Vulkan core version than the Android
+       * driver implements.  Newer D8VK consequently uses the Vulkan 1.3
+       * vkQueueSubmit2 entry point, but Tegra's 1.1-era ICD has no function
+       * pointer for it.  Calling that NULL pointer used to surface in 32-bit
+       * Wine as an assertion in loader_thunks.c rather than a useful Vulkan
+       * error.  Translate synchronization2 submits to the legacy operation.
+       *
+       * VkSemaphoreSubmitInfo carries timeline values inline whereas legacy
+       * submit uses VkTimelineSemaphoreSubmitInfo.  Stage masks added by sync2
+       * that cannot be represented in 32 bits are conservatively widened to
+       * ALL_COMMANDS; this is slower only for that submission and preserves
+       * ordering. */
+
+      VkSubmitInfo *legacy = calloc(submitCount, sizeof(*legacy));
+      VkSemaphore **waits = calloc(submitCount, sizeof(*waits));
+      VkPipelineStageFlags **wait_stages =
+         calloc(submitCount, sizeof(*wait_stages));
+      VkCommandBuffer **commands = calloc(submitCount, sizeof(*commands));
+      VkSemaphore **signals = calloc(submitCount, sizeof(*signals));
+      uint64_t **wait_values = calloc(submitCount, sizeof(*wait_values));
+      uint64_t **signal_values = calloc(submitCount, sizeof(*signal_values));
+      VkTimelineSemaphoreSubmitInfo *timeline =
+         calloc(submitCount, sizeof(*timeline));
+      VkProtectedSubmitInfo *protected =
+         calloc(submitCount, sizeof(*protected));
+
+      if ((!legacy || !waits || !wait_stages || !commands || !signals ||
+           !wait_values || !signal_values || !timeline || !protected) &&
+          submitCount) {
+         result = VK_ERROR_OUT_OF_HOST_MEMORY;
+         goto legacy_submit_cleanup;
+      }
+
+      bool timeline_supported =
+         queue->device->physical->base_supported_features.timelineSemaphore;
+
+      for (uint32_t i = 0; i < submitCount; i++) {
+         const VkSubmitInfo2 *src = &wrapper_submits[i];
+         bool has_timeline_value = false;
+
+         waits[i] = calloc(src->waitSemaphoreInfoCount, sizeof(**waits));
+         wait_stages[i] =
+            calloc(src->waitSemaphoreInfoCount, sizeof(**wait_stages));
+         wait_values[i] =
+            calloc(src->waitSemaphoreInfoCount, sizeof(**wait_values));
+         commands[i] =
+            calloc(src->commandBufferInfoCount, sizeof(**commands));
+         signals[i] =
+            calloc(src->signalSemaphoreInfoCount, sizeof(**signals));
+         signal_values[i] =
+            calloc(src->signalSemaphoreInfoCount, sizeof(**signal_values));
+
+         if ((!waits[i] || !wait_stages[i] || !wait_values[i]) &&
+             src->waitSemaphoreInfoCount) {
+            result = VK_ERROR_OUT_OF_HOST_MEMORY;
+            goto legacy_submit_cleanup;
+         }
+         if (!commands[i] && src->commandBufferInfoCount) {
+            result = VK_ERROR_OUT_OF_HOST_MEMORY;
+            goto legacy_submit_cleanup;
+         }
+         if ((!signals[i] || !signal_values[i]) &&
+             src->signalSemaphoreInfoCount) {
+            result = VK_ERROR_OUT_OF_HOST_MEMORY;
+            goto legacy_submit_cleanup;
+         }
+
+         for (uint32_t j = 0; j < src->waitSemaphoreInfoCount; j++) {
+            const VkSemaphoreSubmitInfo *sem = &src->pWaitSemaphoreInfos[j];
+            waits[i][j] = sem->semaphore;
+            wait_values[i][j] = sem->value;
+            has_timeline_value |= sem->value != 0;
+            wait_stages[i][j] = (VkPipelineStageFlags)sem->stageMask;
+            if (!wait_stages[i][j] || (sem->stageMask >> 32))
+               wait_stages[i][j] = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+         }
+         for (uint32_t j = 0; j < src->commandBufferInfoCount; j++)
+            commands[i][j] = src->pCommandBufferInfos[j].commandBuffer;
+         for (uint32_t j = 0; j < src->signalSemaphoreInfoCount; j++) {
+            const VkSemaphoreSubmitInfo *sem = &src->pSignalSemaphoreInfos[j];
+            signals[i][j] = sem->semaphore;
+            signal_values[i][j] = sem->value;
+            has_timeline_value |= sem->value != 0;
+         }
+
+         legacy[i] = (VkSubmitInfo) {
+            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .pNext = src->pNext,
+            .waitSemaphoreCount = src->waitSemaphoreInfoCount,
+            .pWaitSemaphores = waits[i],
+            .pWaitDstStageMask = wait_stages[i],
+            .commandBufferCount = src->commandBufferInfoCount,
+            .pCommandBuffers = commands[i],
+            .signalSemaphoreCount = src->signalSemaphoreInfoCount,
+            .pSignalSemaphores = signals[i],
+         };
+
+         if (has_timeline_value) {
+            if (!timeline_supported) {
+               WRAPPER_LOG(error,
+                  "Cannot translate timeline semaphore submit: base driver lacks support");
+               result = VK_ERROR_FEATURE_NOT_PRESENT;
+               goto legacy_submit_cleanup;
+            }
+            timeline[i] = (VkTimelineSemaphoreSubmitInfo) {
+               .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
+               .pNext = legacy[i].pNext,
+               .waitSemaphoreValueCount = src->waitSemaphoreInfoCount,
+               .pWaitSemaphoreValues = wait_values[i],
+               .signalSemaphoreValueCount = src->signalSemaphoreInfoCount,
+               .pSignalSemaphoreValues = signal_values[i],
+            };
+            legacy[i].pNext = &timeline[i];
+         }
+
+         if (src->flags & VK_SUBMIT_PROTECTED_BIT) {
+            protected[i] = (VkProtectedSubmitInfo) {
+               .sType = VK_STRUCTURE_TYPE_PROTECTED_SUBMIT_INFO,
+               .pNext = legacy[i].pNext,
+               .protectedSubmit = VK_TRUE,
+            };
+            legacy[i].pNext = &protected[i];
+         }
+      }
+
+      result = queue->device->dispatch_table.QueueSubmit(
+         queue->dispatch_handle, submitCount, legacy, fence);
+
+legacy_submit_cleanup:
+      for (uint32_t i = 0; i < submitCount; i++) {
+         free(waits ? waits[i] : NULL);
+         free(wait_stages ? wait_stages[i] : NULL);
+         free(commands ? commands[i] : NULL);
+         free(signals ? signals[i] : NULL);
+         free(wait_values ? wait_values[i] : NULL);
+         free(signal_values ? signal_values[i] : NULL);
+      }
+      free(legacy);
+      free(waits);
+      free(wait_stages);
+      free(commands);
+      free(signals);
+      free(wait_values);
+      free(signal_values);
+      free(timeline);
+      free(protected);
+   }
    if (serialise)
       simple_mtx_unlock(&queue->device->query_reset_mutex);
 
@@ -2356,6 +3656,7 @@ wrapper_command_buffer_create(struct wrapper_device *device,
    wcb->device = device;
    wcb->pool = pool;
    wcb->dispatch_handle = dispatch_handle;
+   list_inithead(&wcb->dynamic_render_objects);
    list_add(&wcb->link, &device->command_buffer_list);
 
    *pCommandBuffers = wrapper_command_buffer_to_handle(wcb);
@@ -2371,6 +3672,7 @@ wrapper_command_buffer_destroy(struct wrapper_device *device,
 
    if (device->emulate_push_descriptor)
       wrapper_push_pool_destroy_all(wcb);
+   wrapper_dynamic_render_objects_reset(wcb);
 
    device->dispatch_table.FreeCommandBuffers(
       device->dispatch_handle, wcb->pool, 1, &wcb->dispatch_handle);
@@ -2390,6 +3692,8 @@ wrapper_AllocateCommandBuffers(VkDevice _device,
    
    result = device->dispatch_table.AllocateCommandBuffers(
       device->dispatch_handle, pAllocateInfo, pCommandBuffers);
+   WRAPPER_LOG(info, "AllocateCommandBuffers driver result %d count=%u",
+               result, pAllocateInfo->commandBufferCount);
    if (result != VK_SUCCESS)
       return result;
 
@@ -3126,6 +4430,21 @@ wrapper_DestroyDevice(VkDevice _device, const VkAllocationCallbacks* pAllocator)
                             &device->fence_list, link) {
       wrapper_fence_destroy(device, wf, pAllocator);
    }
+
+   hash_table_u64_foreach(device->dynamic_pipeline_table, entry) {
+      struct wrapper_dynamic_pipeline *pipeline = entry.data;
+      if (pipeline->render_pass)
+         device->dispatch_table.DestroyRenderPass(device->dispatch_handle,
+                                                   pipeline->render_pass, NULL);
+      free(pipeline);
+   }
+   hash_table_u64_foreach(device->image_view_table, entry)
+      free(entry.data);
+   hash_table_u64_foreach(device->imageless_fb_table, entry)
+      free(entry.data);
+   _mesa_hash_table_u64_destroy(device->dynamic_pipeline_table);
+   _mesa_hash_table_u64_destroy(device->image_view_table);
+   _mesa_hash_table_u64_destroy(device->imageless_fb_table);
 
    list_for_each_entry_safe(struct vk_queue, queue, &device->vk.queues, link) {
       vk_queue_finish(queue);

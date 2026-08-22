@@ -237,6 +237,19 @@ VkResult enumerate_physical_device(struct vk_instance *_instance)
       supported_features->fillModeNonSolid = true;
       supported_features->shaderClipDistance = true;
       supported_features->shaderCullDistance = true;
+      /* Hidden capabilities cannot be inferred from a vendor ID, and exposing
+       * a new extension can change client feature selection. Keep this generic
+       * emulation opt-in and activate it only when the base driver lacks the
+       * native extension. */
+      pdevice->emulate_imageless_framebuffer =
+         getenv("WRAPPER_EMULATE_IMAGELESS_FRAMEBUFFER") &&
+         atoi(getenv("WRAPPER_EMULATE_IMAGELESS_FRAMEBUFFER")) &&
+         !pdevice->base_supported_extensions.KHR_imageless_framebuffer;
+      if (pdevice->emulate_imageless_framebuffer) {
+         WRAPPER_LOG(info, "Emulating VK_KHR_imageless_framebuffer");
+         pdevice->vk.supported_extensions.KHR_imageless_framebuffer = true;
+         supported_features->imagelessFramebuffer = true;
+      }
       if (wrapper_disable_present_wait) {
          WRAPPER_LOG(info, "Disabling present wait");
          supported_features->presentWait = false;
@@ -268,6 +281,19 @@ VkResult enumerate_physical_device(struct vk_instance *_instance)
       };
       pdevice->dispatch_table.GetPhysicalDeviceProperties2(
          pdevice->dispatch_handle, &pdevice->properties2);
+
+      /* Raising the reported core version above the base ICD requires
+       * substantial lowering. Keep it opt-in and select it from the actual API
+       * gap, not from a vendor ID. */
+      pdevice->emulate_vulkan13 =
+         getenv("WRAPPER_EMULATE_VULKAN_1_3") &&
+         atoi(getenv("WRAPPER_EMULATE_VULKAN_1_3")) &&
+         pdevice->properties2.properties.apiVersion < VK_API_VERSION_1_3;
+      if (pdevice->emulate_vulkan13)
+         WRAPPER_LOG(info, "Lowering Vulkan 1.3 core calls for a %u.%u base driver "
+                           "(WRAPPER_EMULATE_VULKAN_1_3)",
+                     VK_API_VERSION_MAJOR(pdevice->properties2.properties.apiVersion),
+                     VK_API_VERSION_MINOR(pdevice->properties2.properties.apiVersion));
          
       pdevice->dispatch_table.GetPhysicalDeviceMemoryProperties(
          pdevice->dispatch_handle, &pdevice->memory_properties);
