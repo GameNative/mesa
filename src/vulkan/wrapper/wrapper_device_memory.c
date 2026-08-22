@@ -561,6 +561,7 @@ wrapper_AllocateMemory(VkDevice _device,
       vk_error(device, result);
       goto out;
    }
+   mem->alloc_size = pAllocateInfo->allocationSize;
 
    VkExternalMemoryHandleTypeFlags valid_handle_types = 0;
    if (dedicated_allocate_info) {
