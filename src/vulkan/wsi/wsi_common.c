@@ -120,6 +120,11 @@ wsi_device_init(struct wsi_device *wsi,
    };
    GetPhysicalDeviceProperties2(pdevice, &wsi->properties2);
 
+   wsi->enable_ahb_ownership_release =
+      debug_get_bool_option("WRAPPER_AHB_OWNERSHIP_RELEASE",
+                            pddp.driverID ==
+                               VK_DRIVER_ID_NVIDIA_PROPRIETARY);
+
    const char *wine_preload_reserve = getenv("WINEPRELOADRESERVE"); // e.g. 000400000-0008b4000 or 140000000-1400a8000
    bool is_win32 = false;
    

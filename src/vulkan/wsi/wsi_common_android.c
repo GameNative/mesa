@@ -278,7 +278,7 @@ wsi_create_ahb_release_cmd_buffers(const struct wsi_swapchain *chain,
       }
    }
 
-   WRAPPER_LOG(info, "Recorded AHB ownership release barriers");
+   mesa_logd("Recorded AHB ownership release barriers");
    return VK_SUCCESS;
 }
 
@@ -512,8 +512,12 @@ wsi_configure_android_image(
       /* Legacy VkImageMemoryBarrier only permits FOREIGN_EXT ownership
        * transfers for exclusive images. Preserve the existing concurrent
        * path instead of recording an invalid barrier for it. */
-      if (info->create.sharingMode == VK_SHARING_MODE_EXCLUSIVE)
+      if (info->create.sharingMode == VK_SHARING_MODE_EXCLUSIVE &&
+          chain->wsi->enable_ahb_ownership_release) {
+         WRAPPER_LOG(info,
+                     "Enabling AHB ownership release for direct exclusive swapchain");
          info->finish_create = wsi_finish_create_ahardware_buffer_image;
+      }
    }
 
    return VK_SUCCESS;
