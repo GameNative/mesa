@@ -174,6 +174,10 @@ struct wsi_image {
    void *cpu_map;
 #ifdef __TERMUX__
    struct AHardwareBuffer *ahardware_buffer;
+   /* Command buffers, one per queue family, holding the queue-family ownership
+    * release into VK_QUEUE_FAMILY_FOREIGN_EXT. Submitted before the image is
+    * handed to an external consumer. See wsi_create_ahb_release_cmd_buffers. */
+   VkCommandBuffer *ahb_release_cmd_buffers;
 #endif
 };
 

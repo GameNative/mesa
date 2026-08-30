@@ -120,6 +120,11 @@ wsi_device_init(struct wsi_device *wsi,
    };
    GetPhysicalDeviceProperties2(pdevice, &wsi->properties2);
 
+   wsi->enable_ahb_ownership_release =
+      debug_get_bool_option("WRAPPER_AHB_OWNERSHIP_RELEASE",
+                            pddp.driverID ==
+                               VK_DRIVER_ID_NVIDIA_PROPRIETARY);
+
    const char *wine_preload_reserve = getenv("WINEPRELOADRESERVE"); // e.g. 000400000-0008b4000 or 140000000-1400a8000
    bool is_win32 = false;
    
@@ -888,6 +893,20 @@ wsi_destroy_image(const struct wsi_swapchain *chain,
       vk_free(&chain->alloc, image->blit.cmd_buffers);
    }
 
+#ifdef __TERMUX__
+   if (image->ahb_release_cmd_buffers) {
+      for (uint32_t i = 0; i < wsi->queue_family_count; i++) {
+         if (!chain->cmd_pools[i] ||
+             image->ahb_release_cmd_buffers[i] == VK_NULL_HANDLE)
+            continue;
+         wsi->FreeCommandBuffers(chain->device, chain->cmd_pools[i],
+                                 1, &image->ahb_release_cmd_buffers[i]);
+      }
+      vk_free(&chain->alloc, image->ahb_release_cmd_buffers);
+      image->ahb_release_cmd_buffers = NULL;
+   }
+#endif
+
    wsi->FreeMemory(chain->device, image->memory, &chain->alloc);
    wsi->DestroyImage(chain->device, image->image, &chain->alloc);
    wsi->DestroyImage(chain->device, image->blit.image, &chain->alloc);
@@ -1598,6 +1617,18 @@ wsi_common_queue_present(const struct wsi_device *wsi,
             submit_info.pWaitDstStageMask = stage_flags;
          }
       }
+#ifdef __TERMUX__
+      else if (image->ahb_release_cmd_buffers &&
+               image->ahb_release_cmd_buffers[queue_family_index] != VK_NULL_HANDLE) {
+         /* No blit: an external consumer reads this AHardwareBuffer directly,
+          * so hand the image over explicitly. The release transfer makes the
+          * contents available outside this device; see
+          * wsi_create_ahb_release_cmd_buffers. */
+         submit_info.commandBufferCount = 1;
+         submit_info.pCommandBuffers =
+            &image->ahb_release_cmd_buffers[queue_family_index];
+      }
+#endif
 
       VkFence fence = swapchain->fences[image_index];
 
