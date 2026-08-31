@@ -13,6 +13,7 @@
 #include "vk_util.h"
 #include "wsi_common.h"
 #include "util/os_misc.h"
+#include "util/u_debug.h"
 
 static uint32_t
 parse_vk_version_from_env()
@@ -364,7 +365,15 @@ VkResult enumerate_physical_device(struct vk_instance *_instance)
                0 : 1;
          } else if (pdevice->driver_properties.driverID == VK_DRIVER_ID_MESA_TURNIP) {
             wrapper_emulate_bcn = 0;
+         } else if (pdevice->base_supported_features.textureCompressionBC &&
+                    debug_get_bool_option("WRAPPER_NATIVE_BCN",
+                       pdevice->driver_properties.driverID ==
+                          VK_DRIVER_ID_NVIDIA_PROPRIETARY)) {
+            wrapper_emulate_bcn = 0;
          }
+
+         if (wrapper_emulate_bcn == 0)
+            WRAPPER_LOG(info, "Using native BCn support in automatic mode");
       }
 
       pdevice->emulate_bcn = wrapper_emulate_bcn;
