@@ -108,6 +108,16 @@ struct wrapper_device {
    VkPipelineLayout bcn_pipe_layout;
    VkPipeline bcn_pipeline;
    VkDeviceSize bcn_gpu_inflight;        /* transient GPU-transcode bytes not yet freed */
+
+   /* Private queue and synchronous command buffer for host query reset. */
+   simple_mtx_t query_reset_mutex;
+   VkCommandPool query_reset_pool;
+   VkCommandBuffer query_reset_cmd;
+   VkFence query_reset_fence;
+   VkQueue query_reset_queue;
+   uint32_t query_reset_queue_family;
+   uint32_t query_reset_queue_index;
+   bool query_reset_shared_queue;        /* no spare queue: shares the app's */
 };
 
 VK_DEFINE_HANDLE_CASTS(wrapper_device, vk.base, VkDevice,
