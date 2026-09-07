@@ -178,6 +178,12 @@ static void process_pnext_chain(VkBaseInStructure *create_info, struct wrapper_p
              WRAPPER_LOG(info, "Unlinking VkPhysicalDeviceRobustness2FeaturesEXT from pNext chain");
              unlink_vk_struct(create_info, &current, &prev);
              continue;
+          case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES:
+             if (pdevice->base_supported_features.hostQueryReset)
+                break;
+             WRAPPER_LOG(info, "Unlinking VkPhysicalDeviceHostQueryResetFeatures from pNext chain");
+             unlink_vk_struct(create_info, &current, &prev);
+             continue;
           case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_FEATURES_EXT:
              if (pdevice->base_supported_extensions.EXT_dynamic_rendering_unused_attachments)
                 break;
@@ -229,6 +235,226 @@ static void process_pnext_chain(VkBaseInStructure *create_info, struct wrapper_p
       prev = (VkBaseInStructure *)current;
       current = current->pNext;
    }
+}
+
+/* True when the emulation shares this queue with the application, so submits on
+ * it must be serialised against the internal one.  A private queue is invisible
+ * to the application, so no wrapper_queue ever carries its handle and this
+ * predicate stays false -- the shared-queue cost is paid only in the fallback. */
+static bool
+wrapper_query_reset_owns_queue(const struct wrapper_queue *queue)
+{
+   const struct wrapper_device *device = queue->device;
+   return device->query_reset_queue != VK_NULL_HANDLE &&
+          device->query_reset_shared_queue &&
+          device->query_reset_queue == queue->dispatch_handle;
+}
+
+/* Reserve a queue for the reset submits.  Preferred: one extra queue in a
+ * family the application already asked for, which the application never sees,
+ * so a reset cannot wait behind application work.  If the family is exhausted
+ * -- the application asked for every queue it has -- fall back to sharing the
+ * application's first queue, which is what this emulation did before and is
+ * measurably correct but latency-coupled.  Returning an error here instead
+ * would turn a slow device into no device at all. */
+static VkResult
+wrapper_query_reset_reserve_queue(struct wrapper_device *device,
+                                  VkDeviceCreateInfo *info,
+                                  VkDeviceQueueCreateInfo **queues_out,
+                                  float **priorities_out)
+{
+   struct wrapper_physical_device *physical = device->physical;
+   uint32_t count = 0;
+   physical->dispatch_table.GetPhysicalDeviceQueueFamilyProperties(
+      physical->dispatch_handle, &count, NULL);
+   VkQueueFamilyProperties *families = calloc(count, sizeof(*families));
+   if (!families)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   physical->dispatch_table.GetPhysicalDeviceQueueFamilyProperties(
+      physical->dispatch_handle, &count, families);
+
+   /* vkCmdResetQueryPool needs graphics or compute.  flags and pNext are
+    * excluded because wrapper_create_device_queue routes those through
+    * GetDeviceQueue2, and the shared-queue fallback compares raw handles. */
+   int shareable = -1;
+   for (uint32_t i = 0; i < info->queueCreateInfoCount; i++) {
+      const VkDeviceQueueCreateInfo *q = &info->pQueueCreateInfos[i];
+      uint32_t family = q->queueFamilyIndex;
+      if (q->flags || q->pNext || family >= count || !q->queueCount ||
+          !(families[family].queueFlags &
+            (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)))
+         continue;
+      if (shareable < 0)
+         shareable = i;
+
+      uint32_t requested = 0;
+      for (uint32_t j = 0; j < info->queueCreateInfoCount; j++)
+         if (info->pQueueCreateInfos[j].queueFamilyIndex == family)
+            requested += info->pQueueCreateInfos[j].queueCount;
+      if (requested >= families[family].queueCount)
+         continue;
+
+      VkDeviceQueueCreateInfo *queues =
+         malloc(info->queueCreateInfoCount * sizeof(*queues));
+      float *priorities = malloc((q->queueCount + 1) * sizeof(*priorities));
+      if (!queues || !priorities) {
+         free(queues);
+         free(priorities);
+         free(families);
+         return VK_ERROR_OUT_OF_HOST_MEMORY;
+      }
+      memcpy(queues, info->pQueueCreateInfos,
+             info->queueCreateInfoCount * sizeof(*queues));
+      memcpy(priorities, q->pQueuePriorities, q->queueCount * sizeof(*priorities));
+      priorities[q->queueCount] = 0.5f;
+      queues[i].queueCount++;
+      queues[i].pQueuePriorities = priorities;
+      device->query_reset_queue_family = family;
+      device->query_reset_queue_index = q->queueCount;
+      device->query_reset_shared_queue = false;
+      info->pQueueCreateInfos = queues;
+      *queues_out = queues;
+      *priorities_out = priorities;
+      free(families);
+      return VK_SUCCESS;
+   }
+
+   if (shareable >= 0) {
+      device->query_reset_queue_family =
+         info->pQueueCreateInfos[shareable].queueFamilyIndex;
+      device->query_reset_queue_index = 0;
+      device->query_reset_shared_queue = true;
+      free(families);
+      WRAPPER_LOG(info, "No spare queue for vkResetQueryPool emulation, "
+                        "sharing the application queue in family %u",
+                  device->query_reset_queue_family);
+      return VK_SUCCESS;
+   }
+
+   free(families);
+   WRAPPER_LOG(error, "vkResetQueryPool emulation requires a graphics or compute queue");
+   return VK_ERROR_INITIALIZATION_FAILED;
+}
+
+static VkResult
+wrapper_query_reset_init(struct wrapper_device *device)
+{
+   const struct vk_device_dispatch_table *dt = &device->dispatch_table;
+   VkDevice dev = device->dispatch_handle;
+   dt->GetDeviceQueue(dev, device->query_reset_queue_family,
+                      device->query_reset_queue_index, &device->query_reset_queue);
+
+   VkResult result = dt->CreateCommandPool(dev, &(VkCommandPoolCreateInfo) {
+      .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+      .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT |
+               VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
+      .queueFamilyIndex = device->query_reset_queue_family,
+   }, NULL, &device->query_reset_pool);
+   if (result != VK_SUCCESS)
+      return result;
+
+   result = dt->AllocateCommandBuffers(dev, &(VkCommandBufferAllocateInfo) {
+      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+      .commandPool = device->query_reset_pool,
+      .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+      .commandBufferCount = 1,
+   }, &device->query_reset_cmd);
+   if (result != VK_SUCCESS)
+      return result;
+
+   result = dt->CreateFence(dev, &(VkFenceCreateInfo) {
+      .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+   }, NULL, &device->query_reset_fence);
+   if (result == VK_SUCCESS)
+      WRAPPER_LOG(info, "Emulating vkResetQueryPool on %s queue (family=%u index=%u)",
+                  device->query_reset_shared_queue ? "the application's" : "a private",
+                  device->query_reset_queue_family, device->query_reset_queue_index);
+   return result;
+}
+
+static void
+wrapper_query_reset_finish(struct wrapper_device *device)
+{
+   if (device->query_reset_fence)
+      device->dispatch_table.DestroyFence(device->dispatch_handle,
+                                          device->query_reset_fence, NULL);
+   if (device->query_reset_pool)
+      device->dispatch_table.DestroyCommandPool(device->dispatch_handle,
+                                                device->query_reset_pool, NULL);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wrapper_ResetQueryPool(VkDevice _device, VkQueryPool queryPool,
+                       uint32_t firstQuery, uint32_t queryCount)
+{
+   VK_FROM_HANDLE(wrapper_device, device, _device);
+   const struct vk_device_dispatch_table *dt = &device->dispatch_table;
+   VkResult result;
+
+   if (device->physical->base_supported_features.hostQueryReset) {
+      dt->ResetQueryPool(device->dispatch_handle, queryPool, firstQuery, queryCount);
+      return;
+   }
+   /* Not emulating and the driver has no host reset: the application cannot have
+    * enabled the feature, because it was never advertised, so this is
+    * unreachable through valid usage.  There is no entry point to forward to
+    * either -- dispatch_table.ResetQueryPool is NULL on such a driver. */
+   if (!queryCount || !device->query_reset_queue)
+      return;
+
+   simple_mtx_lock(&device->query_reset_mutex);
+   if (vk_device_is_lost(&device->vk)) {
+      simple_mtx_unlock(&device->query_reset_mutex);
+      return;
+   }
+   result = dt->ResetCommandBuffer(device->query_reset_cmd, 0);
+   if (result != VK_SUCCESS)
+      goto fail;
+   result = dt->BeginCommandBuffer(device->query_reset_cmd,
+      &(VkCommandBufferBeginInfo) {
+         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+      });
+   if (result != VK_SUCCESS)
+      goto fail;
+   dt->CmdResetQueryPool(device->query_reset_cmd, queryPool, firstQuery, queryCount);
+   result = dt->EndCommandBuffer(device->query_reset_cmd);
+   if (result != VK_SUCCESS)
+      goto fail;
+   result = dt->ResetFences(device->dispatch_handle, 1, &device->query_reset_fence);
+   if (result != VK_SUCCESS)
+      goto fail;
+   result = dt->QueueSubmit(device->query_reset_queue, 1, &(VkSubmitInfo) {
+      .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+      .commandBufferCount = 1,
+      .pCommandBuffers = &device->query_reset_cmd,
+   }, device->query_reset_fence);
+   if (result != VK_SUCCESS)
+      goto fail;
+   result = dt->WaitForFences(device->dispatch_handle, 1,
+                              &device->query_reset_fence, VK_TRUE, UINT64_MAX);
+   if (result != VK_SUCCESS)
+      goto fail;
+   simple_mtx_unlock(&device->query_reset_mutex);
+   return;
+
+fail:
+   vk_device_set_lost(&device->vk, "Host query reset emulation failed: %d", result);
+   simple_mtx_unlock(&device->query_reset_mutex);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+wrapper_DeviceWaitIdle(VkDevice _device)
+{
+   VK_FROM_HANDLE(wrapper_device, device, _device);
+   if (!device->query_reset_queue)
+      return device->dispatch_table.DeviceWaitIdle(device->dispatch_handle);
+
+   simple_mtx_lock(&device->query_reset_mutex);
+   VkResult result = vk_device_is_lost(&device->vk) ? VK_ERROR_DEVICE_LOST :
+      device->dispatch_table.DeviceWaitIdle(device->dispatch_handle);
+   simple_mtx_unlock(&device->query_reset_mutex);
+   return result;
 }
 
 static VkResult
@@ -632,6 +858,8 @@ wrapper_CreateDevice(VkPhysicalDevice physicalDevice,
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT,
    };
    bool used_fallback_create = false;
+   VkDeviceQueueCreateInfo *query_reset_queues = NULL;
+   float *query_reset_priorities = NULL;
 
    device = vk_zalloc2(&physical_device->instance->vk.alloc, pAllocator,
                        sizeof(*device), 8, VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
@@ -649,6 +877,7 @@ wrapper_CreateDevice(VkPhysicalDevice physicalDevice,
    
    simple_mtx_init(&device->resource_mutex, mtx_plain);
    simple_mtx_init(&device->bcn_gpu_mutex, mtx_plain);
+   simple_mtx_init(&device->query_reset_mutex, mtx_plain);
    device->bcn_gpu_state = 0;
    device->physical = physical_device;
 
@@ -742,6 +971,18 @@ if (pdf2 && pdf2->features.f) { \
       wrapper_safe_create_device = getenv("WRAPPER_SAFE_CREATE_DEVICE") ? atoi(getenv("WRAPPER_SAFE_CREATE_DEVICE")) : 1;
    }
    
+   const bool emulate_query_reset = device->vk.enabled_features.hostQueryReset &&
+      !physical_device->base_supported_features.hostQueryReset;
+   if (emulate_query_reset) {
+      result = wrapper_query_reset_reserve_queue(device, &wrapper_create_info,
+                                                 &query_reset_queues,
+                                                 &query_reset_priorities);
+      if (result != VK_SUCCESS) {
+         wrapper_DestroyDevice(wrapper_device_to_handle(device), &device->vk.alloc);
+         return vk_error(physical_device, result);
+      }
+   }
+
    result = physical_device->dispatch_table.CreateDevice(
       physical_device->dispatch_handle, &wrapper_create_info,
          pAllocator, &device->dispatch_handle);
@@ -757,6 +998,8 @@ if (pdf2 && pdf2->features.f) { \
       }
       
       if (result != VK_SUCCESS) {
+         free(query_reset_queues);
+         free(query_reset_priorities);
          WRAPPER_LOG(error, "Failed driver createDevice, res %d", result);
          wrapper_emit_diag(physical_device, pCreateInfo, result);
          wrapper_DestroyDevice(wrapper_device_to_handle(device),
@@ -765,10 +1008,21 @@ if (pdf2 && pdf2->features.f) { \
       }
    }
 
+   free(query_reset_queues);
+   free(query_reset_priorities);
+
    void *gdpa = physical_device->instance->dispatch_table.GetInstanceProcAddr(
       physical_device->instance->dispatch_handle, "vkGetDeviceProcAddr");
    vk_device_dispatch_table_load(&device->dispatch_table, gdpa,
                                  device->dispatch_handle);
+
+   if (emulate_query_reset) {
+      result = wrapper_query_reset_init(device);
+      if (result != VK_SUCCESS) {
+         wrapper_DestroyDevice(wrapper_device_to_handle(device), &device->vk.alloc);
+         return vk_error(physical_device, result);
+      }
+   }
 
    /* The fallback create with a NULL pNext drops the deviceFault feature, so
     * only treat fault reporting as usable when the primary create succeeded. */
@@ -1839,6 +2093,9 @@ wrapper_QueueSubmit(VkQueue _queue, uint32_t submitCount,
                     const VkSubmitInfo* pSubmits, VkFence fence)
 {
    VK_FROM_HANDLE(wrapper_queue, queue, _queue);
+   if (queue->device->query_reset_queue && vk_device_is_lost(&queue->device->vk))
+      return VK_ERROR_DEVICE_LOST;
+   const bool serialise = wrapper_query_reset_owns_queue(queue);
    VkSubmitInfo wrapper_submits[submitCount];
    VkCommandBuffer *command_buffers;
    VkResult result;
@@ -1860,8 +2117,12 @@ wrapper_QueueSubmit(VkQueue _queue, uint32_t submitCount,
       wrapper_submits[i].pCommandBuffers = command_buffers;
    }
 
+   if (serialise)
+      simple_mtx_lock(&queue->device->query_reset_mutex);
    result = queue->device->dispatch_table.QueueSubmit(
       queue->dispatch_handle, submitCount, wrapper_submits, fence);
+   if (serialise)
+      simple_mtx_unlock(&queue->device->query_reset_mutex);
 
    if (result == VK_ERROR_DEVICE_LOST)
       wrapper_log_device_fault(queue->device);
@@ -1877,6 +2138,9 @@ wrapper_QueueSubmit2(VkQueue _queue, uint32_t submitCount,
                      const VkSubmitInfo2* pSubmits, VkFence fence)
 {
    VK_FROM_HANDLE(wrapper_queue, queue, _queue);
+   if (queue->device->query_reset_queue && vk_device_is_lost(&queue->device->vk))
+      return VK_ERROR_DEVICE_LOST;
+   const bool serialise = wrapper_query_reset_owns_queue(queue);
    VkSubmitInfo2 wrapper_submits[submitCount];
    VkCommandBufferSubmitInfo *command_buffers;
    VkResult result;
@@ -1898,8 +2162,12 @@ wrapper_QueueSubmit2(VkQueue _queue, uint32_t submitCount,
       wrapper_submits[i].pCommandBufferInfos = command_buffers;
    }
 
+   if (serialise)
+      simple_mtx_lock(&queue->device->query_reset_mutex);
    result = queue->device->dispatch_table.QueueSubmit2(
       queue->dispatch_handle, submitCount, wrapper_submits, fence);
+   if (serialise)
+      simple_mtx_unlock(&queue->device->query_reset_mutex);
 
    if (result == VK_ERROR_DEVICE_LOST)
       wrapper_log_device_fault(queue->device);
@@ -2831,6 +3099,8 @@ wrapper_DestroyDevice(VkDevice _device, const VkAllocationCallbacks* pAllocator)
 {
    VK_FROM_HANDLE(wrapper_device, device, _device);
 
+   wrapper_query_reset_finish(device);
+
    simple_mtx_lock(&device->resource_mutex);
 
    list_for_each_entry_safe(struct wrapper_command_buffer, wcb,
@@ -2881,6 +3151,7 @@ wrapper_DestroyDevice(VkDevice _device, const VkAllocationCallbacks* pAllocator)
       simple_mtx_destroy(&device->push_mutex);
    }
    simple_mtx_destroy(&device->resource_mutex);
+   simple_mtx_destroy(&device->query_reset_mutex);
    vk_device_finish(&device->vk);
    vk_free2(&device->vk.alloc, pAllocator, device);
 }

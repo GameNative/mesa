@@ -250,6 +250,25 @@ VkResult enumerate_physical_device(struct vk_instance *_instance)
       const uint32_t engine_version = instance->vk.app_info.engine_version;
       const uint32_t driver_version = pdevice->properties2.properties.driverVersion;
 
+      /* DXVK forces hostQueryReset on from D3D_FEATURE_LEVEL_9_1 up, so a driver
+       * without it gets no D3D11 device at any level.  Gated on the driver
+       * rather than on the engine name: the base-lacks guard already limits
+       * this to drivers that need it, and the default is on only for the driver
+       * it was validated against.  WRAPPER_EMULATE_HOST_QUERY_RESET is the
+       * tri-state override -- unset follows the driver default, true opts
+       * another driver in, false is the kill switch. */
+      const bool nvidia_proprietary =
+         pdevice->driver_properties.driverID == VK_DRIVER_ID_NVIDIA_PROPRIETARY;
+
+      if (!pdevice->base_supported_features.hostQueryReset &&
+          debug_get_bool_option("WRAPPER_EMULATE_HOST_QUERY_RESET",
+                                nvidia_proprietary)) {
+         WRAPPER_LOG(info, "Emulating VK_EXT_host_query_reset "
+                           "(base driver lacks it; resets go through a command buffer)");
+         pdevice->vk.supported_extensions.EXT_host_query_reset = true;
+         supported_features->hostQueryReset = true;
+      }
+
       /* HACK: Specific prop drivers workarounds for Adreno and Mali GPUs */
       
       if (pdevice->driver_properties.driverID == VK_DRIVER_ID_QUALCOMM_PROPRIETARY) {
