@@ -219,8 +219,8 @@ VkResult enumerate_physical_device(struct vk_instance *_instance)
          vk_free(&_instance->alloc, pdevice);
          return result;
       }
+      
       pdevice->vk.wsi_device = &pdevice->wsi_device;
-      pdevice->wsi_device.force_bgra8_unorm_first = true;
 
       pdevice->driver_properties = (VkPhysicalDeviceDriverProperties) {
          .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES,
@@ -320,6 +320,23 @@ VkResult enumerate_physical_device(struct vk_instance *_instance)
 
       pdevice->resource_type = wrapper_resource_type ? wrapper_resource_type : "auto";
 
+	  if (pdevice->driver_properties.driverID == VK_DRIVER_ID_ARM_PROPRIETARY)
+      	 pdevice->wsi_device.force_rgba8_unorm_first = true;
+      else
+         pdevice->wsi_device.force_bgra8_unorm_first = true;
+
+	  const char *wrapper_surface_format = getenv("WRAPPER_SURFACE_FORMAT");
+	  if (wrapper_surface_format) {
+	     if (!strcmp(wrapper_surface_format, "rgba8")) {
+	        pdevice->wsi_device.force_rgba8_unorm_first = true;
+	        pdevice->wsi_device.force_bgra8_unorm_first = false;	
+	     }
+	     else if (!strcmp(wrapper_surface_format, "bgra8")) {
+	        pdevice->wsi_device.force_rgba8_unorm_first = false;
+	        pdevice->wsi_device.force_bgra8_unorm_first = true;
+	     }
+	  }
+	  
       list_addtail(&pdevice->vk.link, &_instance->physical_devices.list);
    }
 

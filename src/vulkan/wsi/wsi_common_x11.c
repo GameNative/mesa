@@ -447,6 +447,8 @@ static const VkFormat formats[] = {
    VK_FORMAT_R5G6B5_UNORM_PACK16,
    VK_FORMAT_B8G8R8A8_SRGB,
    VK_FORMAT_B8G8R8A8_UNORM,
+   VK_FORMAT_R8G8B8A8_SRGB,
+   VK_FORMAT_R8G8B8A8_UNORM,
    VK_FORMAT_A2R10G10B10_UNORM_PACK32,
 };
 
@@ -876,12 +878,46 @@ get_sorted_vk_formats(VkIcdSurfaceBase *surface, struct wsi_device *wsi_device,
 next_format:;
    }
 
+   if (wsi_device->sw) {
+      wsi_device->force_rgba8_unorm_first = false;
+      wsi_device->force_bgra8_unorm_first = true;
+   }
+
+   if (wsi_device->needs_blit) {
+      wsi_device->force_rgba8_unorm_first = false;                                 
+      wsi_device->force_bgra8_unorm_first = true;
+   }
+
    if (wsi_device->force_bgra8_unorm_first) {
       for (unsigned i = 0; i < *count; i++) {
-         if (sorted_formats[i] == VK_FORMAT_B8G8R8A8_UNORM) {
-            sorted_formats[i] = sorted_formats[0];
+      	 if (sorted_formats[i] == VK_FORMAT_R8G8B8A8_UNORM) {
+      	    sorted_formats[i] = VK_FORMAT_B8G8R8A8_UNORM;
+      	    continue;
+      	 }
+      	 if (sorted_formats[i] == VK_FORMAT_R8G8B8A8_SRGB) {
+      	 	sorted_formats[i] = VK_FORMAT_B8G8R8A8_SRGB;
+      	 	continue;
+      	 }
+      	 if (sorted_formats[i] == VK_FORMAT_B8G8R8A8_UNORM) {
+      	    sorted_formats[i] = sorted_formats[0];
             sorted_formats[0] = VK_FORMAT_B8G8R8A8_UNORM;
-            break;
+         }
+      }
+   }
+
+   if (wsi_device->force_rgba8_unorm_first) {
+      for (unsigned i = 0; i < *count; i++) {
+         if (sorted_formats[i] == VK_FORMAT_B8G8R8A8_UNORM) {
+            sorted_formats[i] = VK_FORMAT_R8G8B8A8_UNORM;
+            continue;
+         }
+         if (sorted_formats[i] == VK_FORMAT_B8G8R8A8_SRGB) {
+            sorted_formats[i] = VK_FORMAT_R8G8B8A8_SRGB;
+            continue;
+         }
+         if (sorted_formats[i] == VK_FORMAT_R8G8B8A8_UNORM) {
+            sorted_formats[i] = sorted_formats[0];
+            sorted_formats[0] = VK_FORMAT_R8G8B8A8_UNORM;
          }
       }
    }

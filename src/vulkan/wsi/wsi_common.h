@@ -129,6 +129,7 @@ struct wsi_device {
    uint32_t optimalBufferCopyRowPitchAlignment;
    VkPresentModeKHR override_present_mode;
    bool force_bgra8_unorm_first;
+   bool force_rgba8_unorm_first;
 
    /* Whether to enable adaptive sync for a swapchain if implemented and
     * available. Not all window systems might support this. */
@@ -249,6 +250,7 @@ struct wsi_device {
    WSI_CB(BeginCommandBuffer);
    WSI_CB(CmdPipelineBarrier);
    WSI_CB(CmdCopyImage);
+   WSI_CB(CmdBlitImage);
    WSI_CB(CmdCopyImageToBuffer);
    WSI_CB(CreateBuffer);
    WSI_CB(CreateCommandPool);

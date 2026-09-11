@@ -96,7 +96,9 @@ wsi_device_init(struct wsi_device *wsi,
    wsi->wants_linear = (WSI_DEBUG & WSI_DEBUG_LINEAR) != 0;
    wsi->x11.extra_xwayland_image = device_options->extra_xwayland_image;
    wsi->wayland.disable_timestamps = (WSI_DEBUG & WSI_DEBUG_NOWLTS) != 0;
-   wsi->needs_blit = (WSI_DEBUG & WSI_DEBUG_BLIT) != 0;
+
+   int wrapper_blit = getenv("WRAPPER_BLIT") && atoi(getenv("WRAPPER_BLIT"));
+   wsi->needs_blit = ((WSI_DEBUG & WSI_DEBUG_BLIT) != 0) || wrapper_blit;
 #define WSI_GET_CB(func) \
    PFN_vk##func func = (PFN_vk##func)proc_addr(pdevice, "vk" #func)
    WSI_GET_CB(GetPhysicalDeviceExternalSemaphoreProperties);
@@ -119,9 +121,6 @@ wsi_device_init(struct wsi_device *wsi,
       .pNext = &pddp,
    };
    GetPhysicalDeviceProperties2(pdevice, &wsi->properties2);
-   
-   if (pddp.driverID == VK_DRIVER_ID_ARM_PROPRIETARY)
-      wsi->needs_blit = true;
 
    wsi->maxImageDimension2D = wsi->properties2.properties.limits.maxImageDimension2D;
    assert(wsi->properties2.properties.limits.optimalBufferCopyRowPitchAlignment <= UINT32_MAX);
@@ -194,6 +193,7 @@ wsi_device_init(struct wsi_device *wsi,
    WSI_GET_CB(BeginCommandBuffer);
    WSI_GET_CB(CmdPipelineBarrier);
    WSI_GET_CB(CmdCopyImage);
+   WSI_GET_CB(CmdBlitImage);
    WSI_GET_CB(CmdCopyImageToBuffer);
    WSI_GET_CB(CreateBuffer);
    WSI_GET_CB(CreateCommandPool);
@@ -2070,30 +2070,35 @@ wsi_finish_create_blit_context(const struct wsi_swapchain *chain,
                                    image->blit.buffer,
                                    1, &buffer_image_copy);
       } else {
-         struct VkImageCopy image_copy = {
+         struct VkImageBlit image_blit = {
             .srcSubresource = {
                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
                .mipLevel = 0,
                .baseArrayLayer = 0,
                .layerCount = 1,
             },
-            .srcOffset = { .x = 0, .y = 0, .z = 0 },
+            .srcOffsets = { 
+               { .x = 0, .y = 0, .z = 0 },
+               { .x = info->create.extent.width, .y = info->create.extent.height, .z = info->create.extent.depth }
+            },
             .dstSubresource = {
                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
                .mipLevel = 0,
                .baseArrayLayer = 0,
                .layerCount = 1,
             },
-            .dstOffset = { .x = 0, .y = 0, .z = 0 },
-            .extent = info->create.extent,
+            .dstOffsets = { 
+               { .x = 0, .y = 0, .z = 0 },
+               { .x = info->create.extent.width, .y = info->create.extent.height, .z = info->create.extent.depth }
+            }
          };
 
-         wsi->CmdCopyImage(image->blit.cmd_buffers[i],
+         wsi->CmdBlitImage(image->blit.cmd_buffers[i],
                            image->image,
                            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                            image->blit.image,
                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                           1, &image_copy);
+                           1, &image_blit, VK_FILTER_NEAREST);
       }
 
       img_mem_barriers[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;

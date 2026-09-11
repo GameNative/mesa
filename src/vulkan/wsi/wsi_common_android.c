@@ -6,20 +6,21 @@
 #include <android/hardware_buffer.h>
 
 #define AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM 5
-
+/*
 static enum wsi_swapchain_blit_type
 wsi_get_ahardware_buffer_blit_type(const struct wsi_device *wsi,
-                            VkDevice device)
+                            	   VkDevice device)
 {
    AHardwareBuffer *ahardware_buffer;
    VkResult result;
-   
+
    if (AHardwareBuffer_allocate(&(AHardwareBuffer_Desc){
       .width = 500,
       .height = 500,
       .layers = 1,
-      .format = AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM,
+      .format = wsi->force_rgba8_unorm_first ? AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM : AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM,
       .usage = AHARDWAREBUFFER_USAGE_GPU_FRAMEBUFFER |
+      		   AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY |
                AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE |
                AHARDWAREBUFFER_USAGE_CPU_READ_RARELY |
                AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN },
@@ -85,18 +86,16 @@ wsi_get_ahardware_buffer_blit_type(const struct wsi_device *wsi,
 
    return WSI_SWAPCHAIN_NO_BLIT;
 }
-
-
+*/
 enum wsi_swapchain_blit_type
 wsi_get_android_blit_type(const struct wsi_device *wsi,
-                      const struct wsi_base_image_params *params,
-                                   VkDevice device)
+                          const struct wsi_base_image_params *params,
+                          VkDevice device)
 {
-   int wrapper_blit = getenv("WRAPPER_BLIT") && atoi(getenv("WRAPPER_BLIT"));
-   if (wsi->needs_blit || wrapper_blit)
+   if (wsi->needs_blit)
       return WSI_SWAPCHAIN_IMAGE_BLIT;
 
-   return wsi_get_ahardware_buffer_blit_type(wsi, device);
+   return WSI_SWAPCHAIN_NO_BLIT;
 }
 
 static VkResult
@@ -130,20 +129,19 @@ wsi_create_ahardware_buffer_image_mem(const struct wsi_swapchain *chain,
 
    VkImageCreateInfo new_image_create_info = info->create;
    if (ahardware_buffer_format_props.externalFormat)
-      new_image_create_info.flags &=
-         ~VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
-   new_image_create_info.format = ahardware_buffer_format_props.format;
+      new_image_create_info.flags &= ~VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
 
    result = wsi->CreateImage(chain->device,
                              &new_image_create_info,
                              &chain->alloc, &image->image);
+   
    if (result != VK_SUCCESS) {
       WRAPPER_LOG(error, "Failed to create image, res %d", result);
       return result;
    }
 
    wsi->DestroyImage(chain->device, old_image, &chain->alloc);
-
+   
    const VkMemoryDedicatedAllocateInfo memory_dedicated_info = {
       .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
       .image = image->image,
@@ -211,6 +209,7 @@ wsi_create_ahardware_buffer_blit_context(const struct wsi_swapchain *chain,
       .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
       .handleTypes = handle_types,
    };
+   
    const VkImageCreateInfo image_info = {
       .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
       .pNext = &external_memory_info,
@@ -302,6 +301,9 @@ wsi_create_ahardware_buffer_blit_context(const struct wsi_swapchain *chain,
 inline static uint32_t
 to_ahardware_buffer_format(VkFormat format) {
    switch (format) {
+   case VK_FORMAT_R8G8B8A8_UNORM:
+   case VK_FORMAT_R8G8B8A8_SRGB:
+      return AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM;
    case VK_FORMAT_B8G8R8A8_SRGB:
    case VK_FORMAT_B8G8R8A8_UNORM:
       return AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM;
@@ -346,6 +348,7 @@ wsi_configure_ahardware_buffer_image(const struct wsi_swapchain *chain,
          : to_ahardware_buffer_format(info->create.format),
       .usage = AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE |
                AHARDWAREBUFFER_USAGE_GPU_FRAMEBUFFER |
+               AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY |
                AHARDWAREBUFFER_USAGE_CPU_READ_RARELY |
                AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN,
    };
