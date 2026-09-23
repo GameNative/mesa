@@ -264,6 +264,54 @@ astc_encode_rgba_4x4(const uint8_t texels[64], uint8_t out[16])
    }
 }
 
+/* RG dual-plane block (BC5 sources): CEM 12, 2-bit weights per plane, green on
+ * plane 1 so red and green keep independent weights instead of being projected
+ * onto one RGB line. Blue endpoints are 0 and alpha endpoints 255, so those two
+ * components stay constant whatever the weights are. */
+static inline void
+astc_encode_rg_4x4(const uint8_t texels[64], uint8_t out[16])
+{
+   memset(out, 0, 16);
+   astc_set_bits(out, 0, 11, 0x442);
+   astc_set_bits(out, 13, 4, 12);
+
+   int rmin = 255, rmax = 0, gmin = 255, gmax = 0;
+   for (int i = 0; i < 16; i++) {
+      int r = texels[i * 4], g = texels[i * 4 + 1];
+      if (r < rmin) rmin = r;
+      if (r > rmax) rmax = r;
+      if (g < gmin) gmin = g;
+      if (g > gmax) gmax = g;
+   }
+
+   int q[8] = {
+      astc_quantize_ce(rmin), astc_quantize_ce(rmax),
+      astc_quantize_ce(gmin), astc_quantize_ce(gmax),
+      astc_quantize_ce(0), astc_quantize_ce(0),
+      astc_quantize_ce(255), astc_quantize_ce(255),
+   };
+   astc_write_trit_endpoints(out, q);
+   astc_set_bits(out, 62, 2, 1);   /* CCS = green component */
+
+   int r0 = astc_ce_unq[q[0]], r1 = astc_ce_unq[q[1]];
+   int g0 = astc_ce_unq[q[2]], g1 = astc_ce_unq[q[3]];
+   int rrange = r1 - r0, grange = g1 - g0;
+
+   for (int px = 0; px < 16; px++) {
+      int q0 = 0, q1 = 0;
+      if (rrange > 0) {
+         int v = texels[px * 4] - r0;
+         q0 = (v <= 0) ? 0 : (v >= rrange ? 3 : (v * 3 + rrange / 2) / rrange);
+      }
+      if (grange > 0) {
+         int v = texels[px * 4 + 1] - g0;
+         q1 = (v <= 0) ? 0 : (v >= grange ? 3 : (v * 3 + grange / 2) / grange);
+      }
+      astc_set_bits(out, 128 - (2 * px + 1) * 2, 2, astc_reverse_bits((uint32_t)q0, 2));
+      astc_set_bits(out, 128 - (2 * px + 2) * 2, 2, astc_reverse_bits((uint32_t)q1, 2));
+   }
+}
+
 /* Encode a 4x4 RGBA8 block (16 texels, row-major) into a 16-byte ASTC block. */
 static inline void
 astc_encode_block_4x4(const uint8_t texels[64], int has_alpha, uint8_t out[16])
@@ -411,6 +459,61 @@ astc_encode_rgba_8x8(const uint8_t texels[256], uint8_t out[16])
          w1 = f * 3.0;
       }
       if (swap) { w0 = 3.0 - w0; w1 = 3.0 - w1; }
+      id0[t] = w0; id1[t] = w1;
+   }
+   for (int g = 0; g < 16; g++) {
+      double a0 = 0, a1 = 0;
+      for (int t = 0; t < 64; t++) { a0 += astc_pinv8[g][t] * id0[t]; a1 += astc_pinv8[g][t] * id1[t]; }
+      int q0 = astc_round(a0 / 256.0), q1 = astc_round(a1 / 256.0);
+      if (q0 < 0) q0 = 0; if (q0 > 3) q0 = 3;
+      if (q1 < 0) q1 = 0; if (q1 > 3) q1 = 3;
+      astc_set_bits(out, 128 - (2 * g + 1) * 2, 2, astc_reverse_bits((uint32_t)q0, 2));
+      astc_set_bits(out, 128 - (2 * g + 2) * 2, 2, astc_reverse_bits((uint32_t)q1, 2));
+   }
+}
+
+static inline void
+astc_encode_rg_8x8(const uint8_t texels[256], uint8_t out[16])
+{
+   memset(out, 0, 16);
+   astc_set_bits(out, 0, 11, 0x442);
+   astc_set_bits(out, 13, 4, 12);
+
+   int rmin = 255, rmax = 0, gmin = 255, gmax = 0;
+   for (int i = 0; i < 64; i++) {
+      int r = texels[i * 4], g = texels[i * 4 + 1];
+      if (r < rmin) rmin = r;
+      if (r > rmax) rmax = r;
+      if (g < gmin) gmin = g;
+      if (g > gmax) gmax = g;
+   }
+
+   int q[8] = {
+      astc_quantize_ce(rmin), astc_quantize_ce(rmax),
+      astc_quantize_ce(gmin), astc_quantize_ce(gmax),
+      astc_quantize_ce(0), astc_quantize_ce(0),
+      astc_quantize_ce(255), astc_quantize_ce(255),
+   };
+   astc_write_trit_endpoints(out, q);
+   astc_set_bits(out, 62, 2, 1);
+
+   int r0 = astc_ce_unq[q[0]], r1 = astc_ce_unq[q[1]];
+   int g0 = astc_ce_unq[q[2]], g1 = astc_ce_unq[q[3]];
+   int rrange = r1 - r0, grange = g1 - g0;
+
+   double id0[64], id1[64];
+   for (int t = 0; t < 64; t++) {
+      double w0 = 0, w1 = 0;
+      if (rrange > 0) {
+         double f = (double)(texels[t * 4] - r0) / (double)rrange;
+         if (f < 0) f = 0; if (f > 1) f = 1;
+         w0 = f * 3.0;
+      }
+      if (grange > 0) {
+         double f = (double)(texels[t * 4 + 1] - g0) / (double)grange;
+         if (f < 0) f = 0; if (f > 1) f = 1;
+         w1 = f * 3.0;
+      }
       id0[t] = w0; id1[t] = w1;
    }
    for (int g = 0; g < 16; g++) {
