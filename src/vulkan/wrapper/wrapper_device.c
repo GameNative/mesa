@@ -1605,6 +1605,99 @@ wrapper_image_destroy(struct wrapper_device *device,
    vk_object_free(&device->vk, &device->vk.alloc, wi);
 }
 
+struct bcn_view_format_list {
+   VkImageFormatListCreateInfo list;
+   VkFormat inline_formats[8];
+   VkFormat *formats;
+   union {
+      VkBaseInStructure base;
+      VkExternalMemoryImageCreateInfo external;
+      VkImageStencilUsageCreateInfo stencil;
+      VkImageSwapchainCreateInfoKHR swapchain;
+      VkImageDrmFormatModifierListCreateInfoEXT modifier_list;
+      VkImageDrmFormatModifierExplicitCreateInfoEXT modifier_explicit;
+      struct wsi_image_create_info wsi;
+   } nodes[4];
+};
+
+static size_t
+bcn_chain_node_size(VkStructureType type)
+{
+   switch ((int)type) {
+   case VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO:
+      return sizeof(VkExternalMemoryImageCreateInfo);
+   case VK_STRUCTURE_TYPE_IMAGE_STENCIL_USAGE_CREATE_INFO:
+      return sizeof(VkImageStencilUsageCreateInfo);
+   case VK_STRUCTURE_TYPE_IMAGE_SWAPCHAIN_CREATE_INFO_KHR:
+      return sizeof(VkImageSwapchainCreateInfoKHR);
+   case VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT:
+      return sizeof(VkImageDrmFormatModifierListCreateInfoEXT);
+   case VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT:
+      return sizeof(VkImageDrmFormatModifierExplicitCreateInfoEXT);
+   case VK_STRUCTURE_TYPE_WSI_IMAGE_CREATE_INFO_MESA:
+      return sizeof(struct wsi_image_create_info);
+   default:
+      return 0;
+   }
+}
+
+static const void *
+bcn_substitute_view_formats(struct wrapper_physical_device *pdev,
+                            const void *chain, struct bcn_view_format_list *out)
+{
+   const VkBaseInStructure *node = NULL;
+   unsigned depth = 0;
+
+   out->formats = NULL;
+   for (const VkBaseInStructure *s = chain; s; s = s->pNext) {
+      if (s->sType == VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO) {
+         node = s;
+         break;
+      }
+      depth++;
+   }
+   if (!node)
+      return chain;
+
+   const VkImageFormatListCreateInfo *fl = (const VkImageFormatListCreateInfo *)node;
+   out->formats = fl->viewFormatCount <= ARRAY_SIZE(out->inline_formats) ?
+      out->inline_formats : malloc(fl->viewFormatCount * sizeof(VkFormat));
+   if (!out->formats)
+      return chain;
+
+   for (uint32_t i = 0; i < fl->viewFormatCount; i++) {
+      out->formats[i] = is_emulated_bcn(pdev, fl->pViewFormats[i]) ?
+         get_format_for_bcn(fl->pViewFormats[i]) : fl->pViewFormats[i];
+      if (wrapper_diag_on() && out->formats[i] != fl->pViewFormats[i])
+         wrapper_diag_append("[FMT] CreateImage view format[%u] %d -> %d (copy)\n",
+            i, fl->pViewFormats[i], out->formats[i]);
+   }
+   out->list = *fl;
+   out->list.pViewFormats = out->formats;
+
+   const VkBaseInStructure *s = chain;
+   bool copied = depth <= ARRAY_SIZE(out->nodes);
+   for (unsigned i = 0; copied && i < depth; i++, s = s->pNext) {
+      size_t size = bcn_chain_node_size(s->sType);
+      if (!size)
+         copied = false;
+      else
+         memcpy(&out->nodes[i], s, size);
+   }
+
+   if (!copied) {
+      if (wrapper_diag_on())
+         wrapper_diag_append("[FMT] CreateImage view format list behind an unknown struct, prepending copy\n");
+      out->list.pNext = chain;
+      return &out->list;
+   }
+
+   for (unsigned i = 0; i < depth; i++)
+      out->nodes[i].base.pNext = i + 1 < depth ?
+         &out->nodes[i + 1].base : (const VkBaseInStructure *)&out->list;
+   return depth ? (const void *)&out->nodes[0] : (const void *)&out->list;
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 wrapper_CreateImage(VkDevice _device,
 					const VkImageCreateInfo *pCreateInfo,
@@ -1618,6 +1711,7 @@ wrapper_CreateImage(VkDevice _device,
    bool is_wsi_image = false;
    VkExternalMemoryHandleTypeFlags handle_types = 0;
    uint32_t mip_drop = 0;
+   struct bcn_view_format_list view_formats = { .formats = NULL };
 
    // Wrapper specific extension for B8G8R8A8 AHB img emulation for the swapchain
    VkBaseInStructure *prev = (VkBaseInStructure *) pCreateInfo;
@@ -1662,23 +1756,8 @@ wrapper_CreateImage(VkDevice _device,
             pCreateInfo->extent.height, pCreateInfo->mipLevels,
             pCreateInfo->arrayLayers);
 
-      for (const VkBaseInStructure *s = pCreateInfo->pNext; s; s = s->pNext) {
-         if (s->sType == VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO) {
-            const VkImageFormatListCreateInfo *fl =
-               (const VkImageFormatListCreateInfo *)s;
-            for (uint32_t i = 0; i < fl->viewFormatCount; i++) {
-               if (is_emulated_bcn(device->physical, fl->pViewFormats[i])) {
-                  VkFormat was = fl->pViewFormats[i];
-                  ((VkFormat *)fl->pViewFormats)[i] =
-                     get_format_for_bcn(fl->pViewFormats[i]);
-                  if (wrapper_diag_on())
-                     wrapper_diag_append(
-                        "[FMT] CreateImage REWROTE caller pViewFormats[%u] at %p: %d -> %d\n",
-                        i, (void *)&fl->pViewFormats[i], was, fl->pViewFormats[i]);
-               }
-            }
-         }
-      }
+      create_info.pNext = bcn_substitute_view_formats(device->physical,
+         create_info.pNext, &view_formats);
 
       if (!handle_types && !is_wsi_image)
          mip_drop = bcn_cap_mip_drop(pCreateInfo);
@@ -1691,6 +1770,9 @@ wrapper_CreateImage(VkDevice _device,
 
    res = device->dispatch_table.CreateImage(device->dispatch_handle,
       &create_info, pAllocator, pImage);
+
+   if (view_formats.formats != view_formats.inline_formats)
+      free(view_formats.formats);
 
    if (res != VK_SUCCESS) {
       WRAPPER_LOG(error, "Failed to create image, res %d", res);
