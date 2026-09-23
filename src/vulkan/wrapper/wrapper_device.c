@@ -4265,8 +4265,87 @@ wrapper_bcn_note_dropped(struct wrapper_device *device, struct wrapper_buffer *w
    simple_mtx_unlock(&device->resource_mutex);
 }
 
+/* Mapped host-visible staging buffer for one upload; NULL on failure. */
+static struct wrapper_buffer *
+wrapper_bcn_staging_create(struct wrapper_device *device, VkDeviceSize upload_size)
+{
+   VkResult res;
+   struct wrapper_buffer *staging_wb = vk_object_zalloc(&device->vk,
+      &device->vk.alloc, sizeof(struct wrapper_buffer), VK_OBJECT_TYPE_BUFFER);
+
+   VkBufferCreateInfo buffer_create_info = {
+      .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+      .size = upload_size,
+      .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+      .flags = 0,
+      .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+   };
+
+   res = device->dispatch_table.CreateBuffer(device->dispatch_handle,
+      &buffer_create_info, NULL, &staging_wb->dispatch_handle);
+
+   if (res != VK_SUCCESS) {
+      WRAPPER_LOG(error, "Failed to create staging buffer, res %d", res);
+      return NULL;
+   }
+
+   VkMemoryAllocateInfo allocate_info = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      .allocationSize = upload_size,
+      .memoryTypeIndex = wrapper_select_device_memory_type(device,
+         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT),
+   };
+
+   res = device->dispatch_table.AllocateMemory(device->dispatch_handle,
+      &allocate_info, NULL, &staging_wb->memory);
+
+   if (res != VK_SUCCESS) {
+      WRAPPER_LOG(error, "Failed to allocate staging buffer memory, res %d", res);
+      return NULL;
+   }
+
+   res = device->dispatch_table.BindBufferMemory(device->dispatch_handle,
+      staging_wb->dispatch_handle, staging_wb->memory, 0);
+
+   if (res != VK_SUCCESS) {
+      WRAPPER_LOG(error, "Failed to bind staging buffer memory, res %d", res);
+      return NULL;
+   }
+
+   res = device->dispatch_table.MapMemory(device->dispatch_handle,
+      staging_wb->memory, 0, upload_size, 0, &staging_wb->mapped_address);
+
+   if (res != VK_SUCCESS) {
+      WRAPPER_LOG(error, "Failed to map staging buffer memory, res %d", res);
+      return NULL;
+   }
+
+   return staging_wb;
+}
+
+/* Copy a tightly packed staging upload into the image; freed with the fence. */
 static void
-wrapper_bcn_do_copy_regions(struct wrapper_command_buffer *wcb,
+wrapper_bcn_staging_submit(struct wrapper_command_buffer *wcb,
+                           struct wrapper_device *device,
+                           struct wrapper_buffer *staging_wb, VkImage dstImage,
+                           VkImageLayout dstLayout, VkBufferImageCopy copy_region)
+{
+   copy_region.bufferOffset = 0;
+   copy_region.bufferRowLength = 0;
+   copy_region.bufferImageHeight = 0;
+
+   device->dispatch_table.CmdCopyBufferToImage(wcb->dispatch_handle,
+      staging_wb->dispatch_handle, dstImage, dstLayout, 1, &copy_region);
+
+   staging_wb->wcb = wcb;
+   staging_wb->device = device;
+
+   if (wcb->fence)
+      list_add(&staging_wb->link, &wcb->fence->staging_buffers_list);
+}
+
+static void
+wrapper_bcn_cpu_copy_regions(struct wrapper_command_buffer *wcb,
                     struct wrapper_device *device,
                     struct wrapper_buffer *wb,
                     VkImage dstImage,
@@ -4275,13 +4354,6 @@ wrapper_bcn_do_copy_regions(struct wrapper_command_buffer *wcb,
                     uint32_t regionCount,
                     const VkBufferImageCopy *pRegions)
 {
-   int fmt_id = wrapper_bcn_gpu_format_id(format);
-   if (fmt_id >= 0 && wrapper_bcn_gpu_ready(device)) {
-      if (wrapper_bcn_gpu_copy(wcb, device, wb, dstImage, dstLayout, format,
-            fmt_id, regionCount, pRegions))
-         return;
-      /* else fall through to CPU transcode */
-   }
    VkResult res;
 
    simple_mtx_lock(&device->resource_mutex);
@@ -4306,56 +4378,8 @@ wrapper_bcn_do_copy_regions(struct wrapper_command_buffer *wcb,
       int offset = copy_region.bufferOffset;
       VkDeviceSize upload_size = bcn_upload_size(format, w, h);
 
-      struct wrapper_buffer *staging_wb = vk_object_zalloc(&device->vk,
-         &device->vk.alloc, sizeof(struct wrapper_buffer), VK_OBJECT_TYPE_BUFFER);
-
-      VkBufferCreateInfo buffer_create_info = {
-         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-         .size = upload_size,
-         .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-         .flags = 0,
-         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-      };
-
-      res = device->dispatch_table.CreateBuffer(device->dispatch_handle,
-         &buffer_create_info, NULL, &staging_wb->dispatch_handle);
-
-      if (res != VK_SUCCESS) {
-         WRAPPER_LOG(error, "Failed to create staging buffer, res %d", res);
-         simple_mtx_unlock(&device->resource_mutex);
-         return;
-      }
-
-      VkMemoryAllocateInfo allocate_info = {
-         .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-         .allocationSize = upload_size,
-         .memoryTypeIndex = wrapper_select_device_memory_type(device,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT),
-      };
-
-      res = device->dispatch_table.AllocateMemory(device->dispatch_handle,
-         &allocate_info, NULL, &staging_wb->memory);
-
-      if (res != VK_SUCCESS) {
-         WRAPPER_LOG(error, "Failed to allocate staging buffer memory, res %d", res);
-         simple_mtx_unlock(&device->resource_mutex);
-         return;
-      }
-
-      res = device->dispatch_table.BindBufferMemory(device->dispatch_handle,
-         staging_wb->dispatch_handle, staging_wb->memory, 0);
-
-      if (res != VK_SUCCESS) {
-         WRAPPER_LOG(error, "Failed to bind staging buffer memory, res %d", res);
-         simple_mtx_unlock(&device->resource_mutex);
-         return;
-      }
-
-      res = device->dispatch_table.MapMemory(device->dispatch_handle,
-         staging_wb->memory, 0, upload_size, 0, &staging_wb->mapped_address);
-
-      if (res != VK_SUCCESS) {
-         WRAPPER_LOG(error, "Failed to map staging buffer memory, res %d", res);
+      struct wrapper_buffer *staging_wb = wrapper_bcn_staging_create(device, upload_size);
+      if (!staging_wb) {
          simple_mtx_unlock(&device->resource_mutex);
          return;
       }
@@ -4404,18 +4428,8 @@ wrapper_bcn_do_copy_regions(struct wrapper_command_buffer *wcb,
          }
       }
 
-      copy_region.bufferOffset = 0;
-      copy_region.bufferRowLength = 0;
-      copy_region.bufferImageHeight = 0;
-
-      device->dispatch_table.CmdCopyBufferToImage(wcb->dispatch_handle,
-         staging_wb->dispatch_handle, dstImage, dstLayout, 1, &copy_region);
-
-      staging_wb->wcb = wcb;
-      staging_wb->device = device;
-
-      if (wcb->fence)
-         list_add(&staging_wb->link, &wcb->fence->staging_buffers_list);
+      wrapper_bcn_staging_submit(wcb, device, staging_wb, dstImage, dstLayout,
+                                 copy_region);
    }
 
    if (wb->is_mapped) {
@@ -4426,6 +4440,91 @@ wrapper_bcn_do_copy_regions(struct wrapper_command_buffer *wcb,
    }
 
    simple_mtx_unlock(&device->resource_mutex);
+}
+
+/* GPU path, per region: a cache entry (server or earlier CPU encode) is staged
+ * like a CPU upload and the transcode is skipped; a miss leaves its .src and
+ * goes to the GPU, then to the CPU if the GPU cannot take it. */
+static void
+wrapper_bcn_gpu_copy_regions(struct wrapper_command_buffer *wcb,
+                             struct wrapper_device *device,
+                             struct wrapper_buffer *wb, VkImage dstImage,
+                             VkImageLayout dstLayout, VkFormat format, int fmt_id,
+                             uint32_t regionCount, const VkBufferImageCopy *pRegions)
+{
+   bool *miss = calloc(regionCount, sizeof(bool));
+   if (!miss)
+      return;
+
+   if (bcn_cache_enabled()) {
+      simple_mtx_lock(&device->resource_mutex);
+      bool was_mapped = wb->is_mapped;
+      if (!was_mapped &&
+          device->dispatch_table.MapMemory(device->dispatch_handle, wb->memory,
+             wb->offset, wb->size, 0, &wb->mapped_address) != VK_SUCCESS) {
+         simple_mtx_unlock(&device->resource_mutex);
+         for (uint32_t i = 0; i < regionCount; i++)
+            miss[i] = true;
+      } else {
+         wb->is_mapped = 1;
+         for (uint32_t i = 0; i < regionCount; i++) {
+            const VkBufferImageCopy *r = &pRegions[i];
+            int w = r->imageExtent.width;
+            size_t size = 0;
+            void *entry = bcn_cache_gpu_lookup(wb->mapped_address, w,
+               r->imageExtent.height, r->bufferRowLength ? (int)r->bufferRowLength : w,
+               format, (int)r->bufferOffset, &size);
+            struct wrapper_buffer *staging_wb =
+               entry ? wrapper_bcn_staging_create(device, size) : NULL;
+            if (staging_wb) {
+               memcpy(staging_wb->mapped_address, entry, size);
+               wrapper_bcn_staging_submit(wcb, device, staging_wb, dstImage,
+                                          dstLayout, *r);
+            } else {
+               miss[i] = true;
+            }
+            free(entry);
+         }
+         if (!was_mapped) {
+            device->dispatch_table.UnmapMemory(device->dispatch_handle, wb->memory);
+            wb->is_mapped = 0;
+         }
+         simple_mtx_unlock(&device->resource_mutex);
+      }
+   } else {
+      for (uint32_t i = 0; i < regionCount; i++)
+         miss[i] = true;
+   }
+
+   for (uint32_t i = 0; i < regionCount; i++) {
+      if (!miss[i] ||
+          wrapper_bcn_gpu_copy(wcb, device, wb, dstImage, dstLayout, format,
+                               fmt_id, 1, &pRegions[i]))
+         continue;
+      wrapper_bcn_cpu_copy_regions(wcb, device, wb, dstImage, dstLayout, format,
+                                   1, &pRegions[i]);
+   }
+   free(miss);
+}
+
+static void
+wrapper_bcn_do_copy_regions(struct wrapper_command_buffer *wcb,
+                    struct wrapper_device *device,
+                    struct wrapper_buffer *wb,
+                    VkImage dstImage,
+                    VkImageLayout dstLayout,
+                    VkFormat format,
+                    uint32_t regionCount,
+                    const VkBufferImageCopy *pRegions)
+{
+   int fmt_id = wrapper_bcn_gpu_format_id(format);
+   if (fmt_id >= 0 && wrapper_bcn_gpu_ready(device)) {
+      wrapper_bcn_gpu_copy_regions(wcb, device, wb, dstImage, dstLayout, format,
+                                   fmt_id, regionCount, pRegions);
+      return;
+   }
+   wrapper_bcn_cpu_copy_regions(wcb, device, wb, dstImage, dstLayout, format,
+                                regionCount, pRegions);
 }
 
 /* Capped images: dropped mips leave only their .src, the rest move down,
