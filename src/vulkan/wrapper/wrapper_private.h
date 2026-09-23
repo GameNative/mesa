@@ -171,6 +171,7 @@ struct wrapper_image {
    bool is_emulated_bgra8;
    bool is_wsi_image;
    VkExternalMemoryHandleTypeFlags handle_types;
+   uint32_t mip_drop;
 };
 
 struct wrapper_image *
@@ -292,5 +293,8 @@ wrapper_device_memory_create(struct wrapper_device *device,
 
 void
 wrapper_device_memory_destroy(struct wrapper_device_memory *mem);
+
+int wrapper_diag_on(void);
+void wrapper_diag_append(const char *fmt, ...);
 
 #endif

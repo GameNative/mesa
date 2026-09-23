@@ -797,6 +797,19 @@ wrapper_GetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice,
    }
 }
 
+static void
+wrapper_diag_bcn_answer(int slot, const char *what, VkFormat format)
+{
+   static uint32_t seen[4];
+   unsigned bit = (unsigned)format - VK_FORMAT_BC1_RGB_UNORM_BLOCK;
+   if (!wrapper_diag_on() || bit >= 16)
+      return;
+   uint32_t m = 1u << bit;
+   if (__atomic_fetch_or(&seen[slot], m, __ATOMIC_RELAXED) & m)
+      return;
+   wrapper_diag_append("[FMT] %s fmt=%d answered by BCn emulation\n", what, format);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 wrapper_GetPhysicalDeviceImageFormatProperties(VkPhysicalDevice physicalDevice,
 	                                           VkFormat format,
@@ -870,6 +883,7 @@ wrapper_GetPhysicalDeviceImageFormatProperties(VkPhysicalDevice physicalDevice,
       // We do not handle any case here for now
       pImageFormatProperties->sampleCounts = VK_SAMPLE_COUNT_1_BIT;      
       pImageFormatProperties->maxResourceSize = 562949953421312;
+      wrapper_diag_bcn_answer(0, "ImageFormatProperties", format);
       return VK_SUCCESS;
    default:
       break;
@@ -950,6 +964,7 @@ wrapper_GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice physicalDevice,
       // We do not handle any case here for now
       pImageFormatProperties->imageFormatProperties.sampleCounts = VK_SAMPLE_COUNT_1_BIT;      
       pImageFormatProperties->imageFormatProperties.maxResourceSize = 562949953421312;
+      wrapper_diag_bcn_answer(1, "ImageFormatProperties2", pImageFormatInfo->format);
       return VK_SUCCESS;
    default:
       break;
@@ -989,6 +1004,7 @@ wrapper_GetPhysicalDeviceFormatProperties(VkPhysicalDevice physicalDevice,
          
       if (pdevice->emulate_bcn > 0) {
          pFormatProperties->optimalTilingFeatures |= VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+         wrapper_diag_bcn_answer(2, "FormatProperties", format);
          return;
       }
       break;
@@ -1037,6 +1053,7 @@ wrapper_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice,
             VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
             VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
          pFormatProperties->formatProperties.optimalTilingFeatures |= bc;
+         wrapper_diag_bcn_answer(3, "FormatProperties2", format);
 
          VkBaseOutStructure *s = (VkBaseOutStructure *)pFormatProperties->pNext;
          while (s) {
