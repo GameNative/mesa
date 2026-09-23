@@ -42,11 +42,137 @@ astc_block8(void)
    return b;
 }
 
+/* WRAPPER_BCN_POLICY=bc1=6x6,bc2=4x4,...,bc6h=4x4,maxdim=1024
+ * Per-format ASTC block (4x4, 6x6, 8x8) and a base-level cap. A key left out
+ * keeps the stock behaviour (WRAPPER_ASTC_BLOCK, no cap). 6x6 has an encoder
+ * for bc1 only; bc6h takes 4x4 only (ASTC HDR, when the device has it). */
+enum {
+   BCN_POL_BC1, BCN_POL_BC2, BCN_POL_BC3, BCN_POL_BC4, BCN_POL_BC5,
+   BCN_POL_BC7, BCN_POL_BC6H, BCN_POL_COUNT
+};
+
+static const char *const bcn_pol_keys[BCN_POL_COUNT] = {
+   "bc1", "bc2", "bc3", "bc4", "bc5", "bc7", "bc6h"
+};
+
+static struct {
+   int block[BCN_POL_COUNT]; /* 0 = stock, else 4/6/8 */
+   uint32_t maxdim;          /* 0 = no cap */
+   char desc[160];
+} bcn_pol;
+
+static pthread_once_t bcn_pol_once = PTHREAD_ONCE_INIT;
+static int bcn_astc_hdr;
+
+static void
+bcn_policy_parse(void)
+{
+   const char *e = getenv("WRAPPER_BCN_POLICY");
+   if (!e) {
+      snprintf(bcn_pol.desc, sizeof(bcn_pol.desc), "unset");
+      return;
+   }
+   char *copy = strdup(e), *save = NULL;
+   for (char *it = copy ? strtok_r(copy, ",", &save) : NULL; it;
+        it = strtok_r(NULL, ",", &save)) {
+      while (*it == ' ')
+         it++;
+      char *eq = strchr(it, '=');
+      if (!eq) {
+         WRAPPER_LOG(info, "BCn policy: ignoring '%s'", it);
+         continue;
+      }
+      *eq = 0;
+      char *val = eq + 1;
+      while (*val == ' ')
+         val++;
+      for (char *t = val + strlen(val); t > val && t[-1] == ' '; t--)
+         t[-1] = 0;
+      for (char *t = eq; t > it && t[-1] == ' '; t--)
+         t[-1] = 0;
+      if (!strcmp(it, "maxdim")) {
+         char *end = NULL;
+         unsigned long v = strtoul(val, &end, 10);
+         if (end == val || *end || v > 65536)
+            WRAPPER_LOG(info, "BCn policy: ignoring maxdim=%s", val);
+         else
+            bcn_pol.maxdim = (uint32_t)v;
+         continue;
+      }
+      int idx = -1;
+      for (int i = 0; i < BCN_POL_COUNT; i++)
+         if (!strcmp(it, bcn_pol_keys[i]))
+            idx = i;
+      int b = !strcmp(val, "4x4") ? 4 : !strcmp(val, "6x6") ? 6 :
+              !strcmp(val, "8x8") ? 8 : 0;
+      if (idx < 0 || !b) {
+         WRAPPER_LOG(info, "BCn policy: ignoring %s=%s", it, val);
+         continue;
+      }
+      if ((b == 6 && idx != BCN_POL_BC1) || (idx == BCN_POL_BC6H && b != 4)) {
+         WRAPPER_LOG(info, "BCn policy: no %dx%d encoder for %s, stock", b, b, it);
+         continue;
+      }
+      bcn_pol.block[idx] = b;
+   }
+   free(copy);
+   int n = 0;
+   for (int i = 0; i < BCN_POL_COUNT; i++) {
+      int b = bcn_pol.block[i];
+      n += snprintf(bcn_pol.desc + n, sizeof(bcn_pol.desc) - n,
+                    b ? "%s=%dx%d " : "%s=stock ", bcn_pol_keys[i], b, b);
+   }
+   snprintf(bcn_pol.desc + n, sizeof(bcn_pol.desc) - n, "maxdim=%u", bcn_pol.maxdim);
+   WRAPPER_LOG(info, "BCn policy: %s", bcn_pol.desc);
+}
+
+const char *
+bcn_policy_desc(void)
+{
+   pthread_once(&bcn_pol_once, bcn_policy_parse);
+   return bcn_pol.desc;
+}
+
+static int
+bcn_policy_block(int idx)
+{
+   pthread_once(&bcn_pol_once, bcn_policy_parse);
+   return bcn_pol.block[idx];
+}
+
+int
+bcn_policy_bc6h_hdr(void)
+{
+   return astc_enabled() && bcn_policy_block(BCN_POL_BC6H) == 4;
+}
+
+/* Set per device: BC6H goes to ASTC 4x4 HDR only when the device enabled it. */
+void
+bcn_set_astc_hdr(int on)
+{
+   __atomic_store_n(&bcn_astc_hdr, on, __ATOMIC_RELAXED);
+}
+
+/* ASTC block edge for a BCn format: the policy entry, else WRAPPER_ASTC_BLOCK. */
+static int
+bcn_astc_edge(int idx)
+{
+   int b = bcn_policy_block(idx);
+   return b ? b : (astc_block8() ? 8 : 4);
+}
+
 int
 is_astc_4x4(VkFormat format)
 {
    return format == VK_FORMAT_ASTC_4x4_UNORM_BLOCK ||
           format == VK_FORMAT_ASTC_4x4_SRGB_BLOCK;
+}
+
+int
+is_astc_6x6(VkFormat format)
+{
+   return format == VK_FORMAT_ASTC_6x6_UNORM_BLOCK ||
+          format == VK_FORMAT_ASTC_6x6_SRGB_BLOCK;
 }
 
 int
@@ -59,7 +185,13 @@ is_astc_8x8(VkFormat format)
 int
 is_astc(VkFormat format)
 {
-   return is_astc_4x4(format) || is_astc_8x8(format);
+   return is_astc_4x4(format) || is_astc_6x6(format) || is_astc_8x8(format);
+}
+
+int
+is_astc_hdr_4x4(VkFormat format)
+{
+   return format == VK_FORMAT_ASTC_4x4_SFLOAT_BLOCK;
 }
 
 static int
@@ -92,6 +224,10 @@ struct decompression_params {
    int astc8;
    int bc_bx;      /* BC grid width in blocks (astc8 bounds) */
    int bc_by;      /* BC grid height in blocks (astc8 bounds) */
+   int astc6;
+   int astc_by;    /* ASTC 6x6 grid height (astc6 bounds) */
+   int w;
+   int h;
    int has_alpha;
    VkFormat format;
    char *src;
@@ -152,6 +288,61 @@ decompression_routine(void *args)
 
    char *dst_base = params->dst;
    int block_size = get_block_size(params->format);
+
+   /* 6x6 ASTC (BC1 only): a 3x3 group of BC blocks (12x12 texels) covers 2x2
+    * ASTC blocks. BC blocks past the grid are clamped to the last one and texels
+    * past the mip edge replicate the edge texel. block_y_start/count are group
+    * rows. */
+   if (params->astc6) {
+      int gx_count = (params->block_x + 1) / 2;
+      for (int gy = params->block_y_start;
+           gy < params->block_y_start + params->block_y_count; gy++) {
+         for (int gx = 0; gx < gx_count; gx++) {
+            unsigned char scratch[12 * 48];
+            for (int dy = 0; dy < 3; dy++) {
+               int bcy = 3 * gy + dy;
+               if (bcy >= params->bc_by)
+                  bcy = params->bc_by - 1;
+               for (int dx = 0; dx < 3; dx++) {
+                  int bcx = 3 * gx + dx;
+                  if (bcx >= params->bc_bx)
+                     bcx = params->bc_bx - 1;
+                  char *sblk = params->src +
+                     ((size_t)bcy * params->block_x_src + bcx) * block_size;
+                  bcdec_bc1(sblk, scratch + (dy * 4) * 48 + (dx * 4) * 4, 48);
+               }
+            }
+            for (int sy = 0; sy < 2; sy++) {
+               int BY = 2 * gy + sy;
+               if (BY >= params->astc_by)
+                  continue;
+               for (int sx = 0; sx < 2; sx++) {
+                  int BX = 2 * gx + sx;
+                  if (BX >= params->block_x)
+                     continue;
+                  uint8_t texels[144];
+                  for (int y = 0; y < 6; y++) {
+                     int py = BY * 6 + y;
+                     if (py >= params->h)
+                        py = params->h - 1;
+                     py -= gy * 12;
+                     for (int x = 0; x < 6; x++) {
+                        int px = BX * 6 + x;
+                        if (px >= params->w)
+                           px = params->w - 1;
+                        px -= gx * 12;
+                        memcpy(texels + (y * 6 + x) * 4, scratch + py * 48 + px * 4, 4);
+                     }
+                  }
+                  unsigned char *blk = (unsigned char *)dst_base +
+                     ((size_t)BY * params->block_x + BX) * 16;
+                  astc_encode_block_6x6(texels, params->has_alpha, blk);
+               }
+            }
+         }
+      }
+      return NULL;
+   }
 
    /* 8x8 ASTC: one block per 2x2 group of BC blocks. Decode the 4 BC blocks into
     * an 8x8 RGBA scratch (row stride 32 bytes), then encode one ASTC 8x8 block. */
@@ -326,24 +517,42 @@ VkFormat
 get_format_for_bcn(VkFormat bcn_format)
 {
    if (astc_enabled()) {
-      int b8 = astc_block8();
+      int idx = -1;
       switch (bcn_format) {
       case VK_FORMAT_BC1_RGB_SRGB_BLOCK:
       case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
-      case VK_FORMAT_BC2_SRGB_BLOCK:
-      case VK_FORMAT_BC3_SRGB_BLOCK:
-      case VK_FORMAT_BC7_SRGB_BLOCK:
-         return b8 ? VK_FORMAT_ASTC_8x8_SRGB_BLOCK : VK_FORMAT_ASTC_4x4_SRGB_BLOCK;
       case VK_FORMAT_BC1_RGB_UNORM_BLOCK:
       case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
+         idx = BCN_POL_BC1; break;
+      case VK_FORMAT_BC2_SRGB_BLOCK:
       case VK_FORMAT_BC2_UNORM_BLOCK:
+         idx = BCN_POL_BC2; break;
+      case VK_FORMAT_BC3_SRGB_BLOCK:
       case VK_FORMAT_BC3_UNORM_BLOCK:
-      case VK_FORMAT_BC4_UNORM_BLOCK:
-      case VK_FORMAT_BC5_UNORM_BLOCK:
+         idx = BCN_POL_BC3; break;
+      case VK_FORMAT_BC7_SRGB_BLOCK:
       case VK_FORMAT_BC7_UNORM_BLOCK:
-         return b8 ? VK_FORMAT_ASTC_8x8_UNORM_BLOCK : VK_FORMAT_ASTC_4x4_UNORM_BLOCK;
+         idx = BCN_POL_BC7; break;
+      case VK_FORMAT_BC4_UNORM_BLOCK:
+         idx = BCN_POL_BC4; break;
+      case VK_FORMAT_BC5_UNORM_BLOCK:
+         idx = BCN_POL_BC5; break;
+      case VK_FORMAT_BC6H_UFLOAT_BLOCK:
+      case VK_FORMAT_BC6H_SFLOAT_BLOCK:
+         if (__atomic_load_n(&bcn_astc_hdr, __ATOMIC_RELAXED) && bcn_policy_bc6h_hdr())
+            return VK_FORMAT_ASTC_4x4_SFLOAT_BLOCK;
+         break;
       default:
          break;
+      }
+      if (idx >= 0) {
+         int srgb = get_decode_format_for_bcn(bcn_format) == VK_FORMAT_R8G8B8A8_SRGB;
+         int b = bcn_astc_edge(idx);
+         if (b == 6)
+            return srgb ? VK_FORMAT_ASTC_6x6_SRGB_BLOCK : VK_FORMAT_ASTC_6x6_UNORM_BLOCK;
+         if (b == 8)
+            return srgb ? VK_FORMAT_ASTC_8x8_SRGB_BLOCK : VK_FORMAT_ASTC_8x8_UNORM_BLOCK;
+         return srgb ? VK_FORMAT_ASTC_4x4_SRGB_BLOCK : VK_FORMAT_ASTC_4x4_UNORM_BLOCK;
       }
    }
    return get_decode_format_for_bcn(bcn_format);
@@ -355,9 +564,11 @@ size_t
 bcn_upload_size(VkFormat bcn_format, int w, int h)
 {
    VkFormat img = get_format_for_bcn(bcn_format);
+   if (is_astc_6x6(img))
+      return (size_t)((w + 5) / 6) * ((h + 5) / 6) * 16;
    if (is_astc_8x8(img))
       return (size_t)((w + 7) / 8) * ((h + 7) / 8) * 16;
-   if (is_astc_4x4(img))
+   if (is_astc_4x4(img) || is_astc_hdr_4x4(img))
       return (size_t)((w + 3) / 4) * ((h + 3) / 4) * 16;
    return (size_t)w * h *
       get_texel_size_for_format(get_decode_format_for_bcn(bcn_format));
@@ -425,7 +636,8 @@ is_emulated_bcn(struct wrapper_physical_device *pdev, VkFormat format)
  * device (or by a server) matches on every other one:
  *   <src>_<w>x<h>_<xxh64 of the logical block rows>.<out>
  * <src> folds sRGB/UNORM (the transcode output is identical), <out> is the
- * storage format the wrapper picked (a4 = ASTC 4x4, a8 = ASTC 8x8, rgba8 ...).
+ * storage format the wrapper picked (a4 = ASTC 4x4, a6 = ASTC 6x6, a8 = ASTC 8x8,
+ * h4 = ASTC 4x4 HDR, rgba8 ...).
  * The hash walks the logical rows only, so a padded bufferRowLength yields the
  * same key as a tightly packed upload of the same mip. */
 #define BCN_CACHE_HASH_SEED 1
@@ -470,8 +682,12 @@ bcn_cache_out_tag(VkFormat image_format)
 {
    if (is_astc_4x4(image_format))
       return "a4";
+   if (is_astc_6x6(image_format))
+      return "a6";
    if (is_astc_8x8(image_format))
       return "a8";
+   if (is_astc_hdr_4x4(image_format))
+      return "h4";
    switch (image_format) {
    case VK_FORMAT_R8G8B8A8_UNORM:
    case VK_FORMAT_R8G8B8A8_SRGB:
@@ -642,7 +858,8 @@ bcn_cache_write_source(const char *entry_path, const char *src, int block_x,
                        int block_y, int block_x_src, int block_size)
 {
    const char *dot = strrchr(entry_path, '.');
-   if (!dot || strcmp(dot + 1, "a4") != 0)
+   if (!dot || (strcmp(dot + 1, "a4") != 0 && strcmp(dot + 1, "a6") != 0 &&
+                strcmp(dot + 1, "a8") != 0 && strcmp(dot + 1, "h4") != 0))
       return;
    size_t stem = (size_t)(dot - entry_path);
    char *path = malloc(stem + 5);
@@ -683,6 +900,55 @@ bcn_cache_source_exists(const char *entry_path)
    return exists;
 }
 
+/* BC6H -> ASTC 4x4 HDR fallback when no server entry exists: each block
+ * becomes a void-extent block holding the mean of its in-bounds texels.
+ * Khronos Data Format Spec, ASTC "Void-Extent Blocks" (2D):
+ *   bits [8:0]     0x1FC  void-extent block mode
+ *   bit  9         1      HDR, the colour is FP16 (0 = UNORM16)
+ *   bits [11:10]   0b11   reserved
+ *   bits [63:12]   all 1  min/max S and T (13 bits each), no extent
+ *   bits [127:64]  R, G, B, A as 16-bit values, R lowest
+ * ASTC HDR has no negative values, so SFLOAT texels clamp at 0. */
+static void
+bcn_encode_bc6h_void(const char *src, uint8_t *dst, int w, int h,
+                     int block_x, int block_y, int block_x_src, int is_signed)
+{
+   static const uint8_t head[8] = { 0xFC, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+   for (int by = 0; by < block_y; by++) {
+      for (int bx = 0; bx < block_x; bx++) {
+         unsigned short half[48];
+         bcdec_bc6h_half(src + ((size_t)by * block_x_src + bx) * 16, half, 12,
+                         is_signed);
+         float sum[3] = { 0, 0, 0 };
+         int n = 0;
+         for (int y = 0; y < 4 && by * 4 + y < h; y++) {
+            for (int x = 0; x < 4 && bx * 4 + x < w; x++) {
+               for (int c = 0; c < 3; c++) {
+                  _Float16 v;
+                  memcpy(&v, &half[(y * 4 + x) * 3 + c], 2);
+                  sum[c] += (float)v;
+               }
+               n++;
+            }
+         }
+         uint8_t *blk = dst + ((size_t)by * block_x + bx) * 16;
+         memcpy(blk, head, 8);
+         for (int c = 0; c < 4; c++) {
+            float f = c == 3 ? 1.0f : (n ? sum[c] / n : 0.0f);
+            if (!(f > 0.0f))
+               f = 0.0f;
+            if (f > 65504.0f)
+               f = 65504.0f;
+            _Float16 hv = (_Float16)f;
+            uint16_t bits;
+            memcpy(&bits, &hv, 2);
+            blk[8 + 2 * c] = bits & 0xFF;
+            blk[9 + 2 * c] = bits >> 8;
+         }
+      }
+   }
+}
+
 void
 decompress_bcn_format(void *srcBuffer,
 					  void *dstBuffer,
@@ -711,6 +977,8 @@ decompress_bcn_format(void *srcBuffer,
 
    int astc = is_astc_4x4(get_format_for_bcn(format));
    int astc8 = is_astc_8x8(get_format_for_bcn(format));
+   int astc6 = is_astc_6x6(get_format_for_bcn(format));
+   int hdr = is_astc_hdr_4x4(get_format_for_bcn(format));
    int has_alpha = bcn_has_alpha(format);
    int texel_size = get_texel_size_for_format(get_decode_format_for_bcn(format));
    int block_size = get_block_size(format);
@@ -720,13 +988,19 @@ decompress_bcn_format(void *srcBuffer,
    int block_y = (h + 3) / 4;
    int block_x8 = (w + 7) / 8;
    int block_y8 = (h + 7) / 8;
+   int block_x6 = (w + 5) / 6;
+   int block_y6 = (h + 5) / 6;
    int stride = w * texel_size;
    int uncompressed_size = astc8 ? (block_x8 * block_y8 * 16)
                                  : (astc ? (block_x * block_y * 16) : (w * h * texel_size));
+   if (astc6)
+      uncompressed_size = block_x6 * block_y6 * 16;
+   if (hdr)
+      uncompressed_size = block_x * block_y * 16;
    char *src = srcBuffer + offset;
    char *dst = dstBuffer;
 
-   if (wrapper_mark_bcn && !astc) {
+   if (wrapper_mark_bcn && !astc && !astc6 && !hdr) {
       WRAPPER_LOG(bcn, "Filling %dx%d BCn %d texture with custom color", w, h, format);
 
       for (int i = 0; i < h; i++) {
@@ -818,7 +1092,43 @@ decompress_bcn_format(void *srcBuffer,
    }
 
 
-   if (astc8) {
+   if (hdr) {
+      bcn_encode_bc6h_void(src, (uint8_t *)dst, w, h, block_x, block_y,
+                           block_x_src, format == VK_FORMAT_BC6H_SFLOAT_BLOCK);
+   } else if (astc6) {
+      /* 6x6 ASTC: threaded over rows of 12x12-texel groups (2 ASTC block rows). */
+      int group_y = (block_y6 + 1) / 2;
+      int core_count = sysconf(_SC_NPROCESSORS_CONF);
+      int num_threads = (group_y >= core_count) ? core_count : (group_y >= 4 ? 4 : 1);
+      int rows_per = group_y / num_threads, rem = group_y % num_threads;
+      int bc1_alpha = format == VK_FORMAT_BC1_RGBA_UNORM_BLOCK ||
+                      format == VK_FORMAT_BC1_RGBA_SRGB_BLOCK;
+      pthread_t *threads = malloc(sizeof(pthread_t) * num_threads);
+      struct decompression_params *args = calloc(num_threads, sizeof(struct decompression_params));
+      int cur = 0;
+      for (int i = 0; i < num_threads; i++) {
+         int rows = rows_per + ((i < rem) ? 1 : 0);
+         args[i].src = src;
+         args[i].dst = dst;
+         args[i].block_x = block_x6;
+         args[i].block_x_src = block_x_src;
+         args[i].format = format;
+         args[i].block_y_count = rows;
+         args[i].block_y_start = cur;
+         args[i].astc_by = block_y6;
+         args[i].bc_bx = block_x;
+         args[i].bc_by = block_y;
+         args[i].w = w;
+         args[i].h = h;
+         args[i].astc6 = 1;
+         args[i].has_alpha = bc1_alpha;
+         pthread_create(&threads[i], NULL, decompression_routine, &args[i]);
+         cur += rows;
+      }
+      for (int i = 0; i < num_threads; i++) pthread_join(threads[i], NULL);
+      free(threads);
+      free(args);
+   } else if (astc8) {
       /* 8x8 ASTC: each block covers a 2x2 group of BC blocks (8 = 2*4, aligned).
        * Decode the 4 BC blocks into an 8x8 RGBA scratch, then encode one ASTC
        * 8x8 block. Threaded over 8x8-block rows. */
@@ -842,6 +1152,7 @@ decompress_bcn_format(void *srcBuffer,
          args[i].bc_by = block_y;
          args[i].astc = 0;
          args[i].astc8 = 1;
+         args[i].astc6 = 0;
          args[i].has_alpha = has_alpha;
          pthread_create(&threads[i], NULL, decompression_routine, &args[i]);
          cur += rows;
@@ -865,6 +1176,7 @@ decompress_bcn_format(void *srcBuffer,
       args[0].texel_size = texel_size;
       args[0].astc = astc;
       args[0].astc8 = 0;
+      args[0].astc6 = 0;
       args[0].has_alpha = has_alpha;
       decompression_routine(&args[0]);
    } else {
@@ -900,6 +1212,7 @@ decompress_bcn_format(void *srcBuffer,
          args[i].texel_size = texel_size;
          args[i].astc = astc;
          args[i].astc8 = 0;
+         args[i].astc6 = 0;
          args[i].has_alpha = has_alpha;
          pthread_create(&threads[i], NULL, decompression_routine, &args[i]);
          current_row += rows;
@@ -921,4 +1234,213 @@ decompress_bcn_format(void *srcBuffer,
 
    free(cache_filename);
    
+}
+
+/* Policy maxdim: emulated BCn images whose base level exceeds it drop their
+ * top mips so the stored base is <= maxdim. 0 = off. */
+int
+bcn_max_dim(void)
+{
+   pthread_once(&bcn_pol_once, bcn_policy_parse);
+   return (int)bcn_pol.maxdim;
+}
+
+/* Levels to drop from an emulated BCn image (caller checks the format): 2D,
+ * sampled with at most transfer src/dst besides, not sparse/aliased, and with
+ * a full chain or more than mip_drop + 1 levels. */
+uint32_t
+bcn_cap_mip_drop(const VkImageCreateInfo *ci)
+{
+   uint32_t cap = (uint32_t)bcn_max_dim();
+   if (!cap || ci->imageType != VK_IMAGE_TYPE_2D)
+      return 0;
+   if (!(ci->usage & VK_IMAGE_USAGE_SAMPLED_BIT) ||
+       (ci->usage & ~(VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                      VK_IMAGE_USAGE_TRANSFER_SRC_BIT)))
+      return 0;
+   if (ci->flags & (VK_IMAGE_CREATE_SPARSE_BINDING_BIT |
+                    VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT |
+                    VK_IMAGE_CREATE_SPARSE_ALIASED_BIT |
+                    VK_IMAGE_CREATE_ALIAS_BIT))
+      return 0;
+   uint32_t w = ci->extent.width, h = ci->extent.height, k = 0;
+   while ((w >> k) > cap || (h >> k) > cap)
+      k++;
+   if (!k)
+      return 0;
+   uint32_t full = 1;
+   while (((w > h ? w : h) >> full) > 0)
+      full++;
+   if (ci->mipLevels < full && ci->mipLevels <= k + 1)
+      return 0;
+   return k;
+}
+
+/* Remap a mip range onto the capped image; false when it only covers dropped
+ * levels. VK_REMAINING_MIP_LEVELS stays. */
+bool
+bcn_cap_range(uint32_t mip_drop, VkImageSubresourceRange *range)
+{
+   if (!mip_drop)
+      return true;
+   uint32_t base = range->baseMipLevel;
+   uint32_t new_base = base > mip_drop ? base - mip_drop : 0;
+   if (range->levelCount != VK_REMAINING_MIP_LEVELS) {
+      uint32_t end = base + range->levelCount;
+      if (end <= mip_drop)
+         return false;
+      range->levelCount = end - mip_drop - new_base;
+   }
+   range->baseMipLevel = new_base;
+   return true;
+}
+
+/* Copies into dropped levels are removed, the rest move down by mip_drop.
+ * Returns the number of regions kept in kept[]. */
+uint32_t
+bcn_cap_copy_regions(uint32_t mip_drop, const VkBufferImageCopy *regions,
+                     uint32_t count, VkBufferImageCopy *kept)
+{
+   uint32_t n = 0;
+   for (uint32_t i = 0; i < count; i++) {
+      if (regions[i].imageSubresource.mipLevel < mip_drop)
+         continue;
+      kept[n] = regions[i];
+      kept[n].imageSubresource.mipLevel -= mip_drop;
+      n++;
+   }
+   return n;
+}
+
+int
+bcn_cache_enabled(void)
+{
+   static int on = -1;
+   if (on == -1)
+      on = getenv("WRAPPER_USE_BCN_CACHE") ? atoi(getenv("WRAPPER_USE_BCN_CACHE")) : 1;
+   return on;
+}
+
+/* A dropped (capped) mip is never transcoded, but its .src still goes beside
+ * its cache key so the server pack stays complete for uncapped devices. */
+void
+bcn_cache_note_source(void *srcBuffer, int w, int h, int src_w,
+                      VkFormat format, int offset)
+{
+   if (!bcn_cache_enabled() || w < 8 || h < 8)
+      return;
+   const char *dir = getenv("WRAPPER_CACHE_PATH") ? getenv("WRAPPER_CACHE_PATH")
+                                                   : WRAPPER_CACHE_DIR;
+   char *src = (char *)srcBuffer + offset;
+   int block_size = get_block_size(format);
+   int block_x = (w + 3) / 4;
+   int block_y = (h + 3) / 4;
+   int block_x_src = ((src_w > 0 ? src_w : w) + 3) / 4;
+   CREATE_FOLDER(dir, 0700);
+   char *name = bcn_cache_filename(dir, format, get_format_for_bcn(format), w, h,
+                                   src, block_x, block_y, block_x_src, block_size);
+   if (name && !bcn_cache_source_exists(name))
+      bcn_cache_write_source(name, src, block_x, block_y, block_x_src, block_size);
+   free(name);
+}
+
+/* SPIR-V scan, independent of the Mali passes: a shader that takes the size or
+ * level count of a 2D sampled image (Dim 2D, MS 0, Sampled 1) or fetches its
+ * texels sees capped extents. The first one leaves <cache>/needs_full_res.
+ * Returns 1 once such a shader has been seen. */
+#define SPV_OP_UNDEF                  1
+#define SPV_OP_TYPE_IMAGE             25
+#define SPV_OP_TYPE_SAMPLED_IMAGE     27
+#define SPV_OP_FUNCTION_PARAMETER     55
+#define SPV_OP_LOAD                   61
+#define SPV_OP_COPY_OBJECT            83
+#define SPV_OP_SAMPLED_IMAGE          86
+#define SPV_OP_IMAGE_FETCH            95
+#define SPV_OP_IMAGE                  100
+#define SPV_OP_IMAGE_QUERY_SIZE_LOD   103
+#define SPV_OP_IMAGE_QUERY_SIZE       104
+#define SPV_OP_IMAGE_QUERY_LEVELS     106
+#define SPV_OP_SELECT                 169
+#define SPV_OP_PHI                    245
+
+static int bcn_full_res_seen;
+
+static int
+bcn_spirv_needs_full_res(const uint32_t *code, size_t words)
+{
+   if (words < 5 || code[0] != 0x07230203)
+      return 0;
+   uint32_t bound = code[3];
+   if (!bound || bound > (1u << 22))
+      return 0;
+   uint8_t *kind = calloc(bound, 1);      /* type id: 1 = 2D sampled image */
+   uint32_t *vtype = calloc(bound, 4);    /* value id -> type id */
+   int hit = 0;
+   if (!kind || !vtype)
+      goto out;
+   for (size_t i = 5; i < words && !hit;) {
+      uint32_t op = code[i] & 0xFFFF, n = code[i] >> 16;
+      if (!n || i + n > words)
+         break;
+      const uint32_t *in = code + i;
+      switch (op) {
+      case SPV_OP_TYPE_IMAGE:
+         if (n >= 8 && in[1] < bound)
+            kind[in[1]] = (in[3] == 1 && in[6] == 0 && in[7] == 1) ? 1 : 2;
+         break;
+      case SPV_OP_TYPE_SAMPLED_IMAGE:
+         if (n >= 3 && in[1] < bound && in[2] < bound)
+            kind[in[1]] = kind[in[2]];
+         break;
+      case SPV_OP_UNDEF:
+      case SPV_OP_FUNCTION_PARAMETER:
+      case SPV_OP_LOAD:
+      case SPV_OP_COPY_OBJECT:
+      case SPV_OP_SAMPLED_IMAGE:
+      case SPV_OP_IMAGE:
+      case SPV_OP_SELECT:
+      case SPV_OP_PHI:
+         if (n >= 3 && in[2] < bound)
+            vtype[in[2]] = in[1];
+         break;
+      case SPV_OP_IMAGE_FETCH:
+      case SPV_OP_IMAGE_QUERY_SIZE_LOD:
+      case SPV_OP_IMAGE_QUERY_SIZE:
+      case SPV_OP_IMAGE_QUERY_LEVELS:
+         if (n >= 4 && in[3] < bound && vtype[in[3]] < bound &&
+             kind[vtype[in[3]]] == 1)
+            hit = 1;
+         break;
+      default:
+         break;
+      }
+      i += n;
+   }
+out:
+   free(kind);
+   free(vtype);
+   return hit;
+}
+
+int
+bcn_scan_shader(const uint32_t *code, size_t size)
+{
+   if (__atomic_load_n(&bcn_full_res_seen, __ATOMIC_RELAXED))
+      return 1;
+   if (!code || !bcn_spirv_needs_full_res(code, size / 4))
+      return 0;
+   if (__atomic_exchange_n(&bcn_full_res_seen, 1, __ATOMIC_RELAXED))
+      return 1;
+   const char *dir = getenv("WRAPPER_CACHE_PATH") ? getenv("WRAPPER_CACHE_PATH")
+                                                   : WRAPPER_CACHE_DIR;
+   char *path = NULL;
+   if (asprintf(&path, "%s/needs_full_res", dir) >= 0) {
+      FILE *fp = fopen(path, "wb");
+      if (fp)
+         fclose(fp);
+      WRAPPER_LOG(info, "Shader reads 2D sampled image size/texels, %s %s",
+                  fp ? "marked" : "could not mark", path);
+      free(path);
+   }
+   return 1;
 }

@@ -171,6 +171,7 @@ struct wrapper_image {
    bool is_emulated_bgra8;
    bool is_wsi_image;
    VkExternalMemoryHandleTypeFlags handle_types;
+   uint32_t mip_drop;
 };
 
 struct wrapper_image *

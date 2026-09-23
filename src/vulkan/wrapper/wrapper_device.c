@@ -902,6 +902,76 @@ wrapper_CmdBindVertexBuffers(VkCommandBuffer commandBuffer, uint32_t firstBindin
    free(bufs);
 }
 
+static void wrapper_diag_append(const char *fmt, ...);
+
+/* Images with dropped top mips (policy maxdim); zero keeps every
+ * remap hook off the lookup path. */
+static int wrapper_capped_images;
+
+static uint32_t
+wrapper_image_mip_drop(struct wrapper_device *device, VkImage image)
+{
+   if (!__atomic_load_n(&wrapper_capped_images, __ATOMIC_RELAXED))
+      return 0;
+   struct wrapper_image *wi = get_wrapper_image_from_handle(device, image);
+   return wi ? wi->mip_drop : 0;
+}
+
+#define WRAPPER_CAP_STACK_ENTRIES 16
+
+static void *
+wrapper_cap_alloc(void *stack, size_t size, uint32_t count)
+{
+   return count <= WRAPPER_CAP_STACK_ENTRIES ? stack : malloc(size * count);
+}
+
+static void
+wrapper_cap_free(void *array, void *stack)
+{
+   if (array != stack)
+      free(array);
+}
+
+static bool
+wrapper_cap_level(uint32_t mip_drop, uint32_t *level)
+{
+   if (*level < mip_drop)
+      return false;
+   *level -= mip_drop;
+   return true;
+}
+
+/* Barriers on dropped levels are removed; returns the kept count. */
+static uint32_t
+wrapper_cap_image_barriers(struct wrapper_device *device,
+                           const VkImageMemoryBarrier *in, uint32_t count,
+                           VkImageMemoryBarrier *out)
+{
+   uint32_t n = 0;
+   for (uint32_t i = 0; i < count; i++) {
+      out[n] = in[i];
+      if (bcn_cap_range(wrapper_image_mip_drop(device, in[i].image),
+                        &out[n].subresourceRange))
+         n++;
+   }
+   return n;
+}
+
+static uint32_t
+wrapper_cap_image_barriers2(struct wrapper_device *device,
+                            const VkImageMemoryBarrier2 *in, uint32_t count,
+                            VkImageMemoryBarrier2 *out)
+{
+   uint32_t n = 0;
+   for (uint32_t i = 0; i < count; i++) {
+      out[n] = in[i];
+      if (bcn_cap_range(wrapper_image_mip_drop(device, in[i].image),
+                        &out[n].subresourceRange))
+         n++;
+   }
+   return n;
+}
+
 static const char *
 wrapper_driver_id_str(VkDriverId id)
 {
@@ -1027,11 +1097,16 @@ wrapper_emit_diag(struct wrapper_physical_device *pdev,
      (pdev->vk.supported_extensions.EXT_robustness2 && !pdev->base_supported_extensions.EXT_robustness2) ? "YES" : "no");
    D("  vertex_attr_divisor EXT alias : %s\n",
      (pdev->vk.supported_extensions.EXT_vertex_attribute_divisor && !pdev->base_supported_extensions.EXT_vertex_attribute_divisor) ? "YES (aliased from KHR)" : "no");
-   D("  BCn: emulate=%d  ASTC=%s  transcode=%s  cache=%s\n",
+   D("  BCn: emulate=%d  ASTC=%s  BC1=%s  transcode=%s  cache=%s\n",
      pdev->emulate_bcn,
      getenv("WRAPPER_ASTC_BLOCK") ? getenv("WRAPPER_ASTC_BLOCK") : "4x4",
+     is_astc_6x6(get_format_for_bcn(VK_FORMAT_BC1_RGB_UNORM_BLOCK)) ? "6x6" :
+     is_astc_8x8(get_format_for_bcn(VK_FORMAT_BC1_RGB_UNORM_BLOCK)) ? "8x8" :
+     is_astc_4x4(get_format_for_bcn(VK_FORMAT_BC1_RGB_UNORM_BLOCK)) ? "4x4" : "decode",
      (getenv("WRAPPER_BCN_GPU") && atoi(getenv("WRAPPER_BCN_GPU"))) ? "GPU" : "CPU",
      (!getenv("WRAPPER_USE_BCN_CACHE") || atoi(getenv("WRAPPER_USE_BCN_CACHE"))) ? "on" : "off");
+   D("  BCn policy (WRAPPER_BCN_POLICY): %s  BC6H=%s\n", bcn_policy_desc(),
+     is_astc_hdr_4x4(get_format_for_bcn(VK_FORMAT_BC6H_UFLOAT_BLOCK)) ? "ASTC 4x4 HDR" : "decode");
    D("  VK_EXT_device_fault report    : %s\n",
      !pdev->base_supported_extensions.EXT_device_fault ? "unsupported by base driver" :
      (!getenv("WRAPPER_DEVICE_FAULT") || atoi(getenv("WRAPPER_DEVICE_FAULT")))
@@ -1141,6 +1216,23 @@ wrapper_CreateDevice(VkPhysicalDevice physicalDevice,
    if (enable_device_fault)
       wrapper_enable_extensions[wrapper_enable_extension_count++] = "VK_EXT_device_fault";
 
+   /* Policy bc6h=4x4: BC6H is stored as ASTC 4x4 HDR when the base driver has
+    * textureCompressionASTC_HDR (core 1.3 or the EXT). */
+   const bool base13 = physical_device->properties2.properties.apiVersion >= VK_API_VERSION_1_3;
+   const bool bc6h_hdr = bcn_policy_bc6h_hdr() && physical_device->emulate_bcn > 1 &&
+      physical_device->base_supported_features.textureCompressionASTC_HDR &&
+      (base13 || physical_device->base_supported_extensions.EXT_texture_compression_astc_hdr);
+   if (bcn_policy_bc6h_hdr() && !bc6h_hdr)
+      WRAPPER_LOG(info, "BCn policy: bc6h=4x4 ignored, no ASTC HDR on this device");
+   if (bc6h_hdr && !base13) {
+      bool listed = false;
+      for (uint32_t i = 0; i < wrapper_enable_extension_count; i++)
+         listed |= !strcmp(wrapper_enable_extensions[i], "VK_EXT_texture_compression_astc_hdr");
+      if (!listed)
+         wrapper_enable_extensions[wrapper_enable_extension_count++] =
+            "VK_EXT_texture_compression_astc_hdr";
+   }
+
    wrapper_create_info.enabledExtensionCount = wrapper_enable_extension_count;
    wrapper_create_info.ppEnabledExtensionNames = wrapper_enable_extensions;
    
@@ -1170,6 +1262,25 @@ if (pdf2 && pdf2->features.f) { \
 #undef DISABLE_FEATURE
 
    process_pnext_chain((VkBaseInStructure *)&wrapper_create_info, device->physical);
+
+   VkPhysicalDeviceTextureCompressionASTCHDRFeatures astc_hdr_features = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXTURE_COMPRESSION_ASTC_HDR_FEATURES,
+      .textureCompressionASTC_HDR = VK_TRUE,
+   };
+   if (bc6h_hdr) {
+      VkPhysicalDeviceVulkan13Features *v13 = (void *)vk_find_struct_const(
+         wrapper_create_info.pNext, PHYSICAL_DEVICE_VULKAN_1_3_FEATURES);
+      VkPhysicalDeviceTextureCompressionASTCHDRFeatures *hf = (void *)vk_find_struct_const(
+         wrapper_create_info.pNext, PHYSICAL_DEVICE_TEXTURE_COMPRESSION_ASTC_HDR_FEATURES);
+      if (v13)
+         v13->textureCompressionASTC_HDR = VK_TRUE;
+      else if (hf)
+         hf->textureCompressionASTC_HDR = VK_TRUE;
+      else {
+         astc_hdr_features.pNext = (void *)wrapper_create_info.pNext;
+         wrapper_create_info.pNext = &astc_hdr_features;
+      }
+   }
 
    /* Request the deviceFault feature. Only inject our struct if the client
     * didn't already provide one (it manages its own if so). */
@@ -1307,6 +1418,9 @@ if (pdf2 && pdf2->features.f) { \
          wrapper_device_trampolines.FreeMemory;
    }
 
+   bcn_set_astc_hdr(bc6h_hdr && !used_fallback_create);
+   if (bc6h_hdr && !used_fallback_create)
+      WRAPPER_LOG(info, "BCn policy: BC6H stored as ASTC 4x4 HDR");
    wrapper_emit_diag(physical_device, pCreateInfo, VK_SUCCESS);
 
    *pDevice = wrapper_device_to_handle(device);
@@ -1483,6 +1597,8 @@ wrapper_image_destroy(struct wrapper_device *device,
 
    _mesa_hash_table_u64_remove(device->image_table, (uint64_t)wi->dispatch_handle);
    list_del(&wi->link);
+   if (wi->mip_drop)
+      __atomic_sub_fetch(&wrapper_capped_images, 1, __ATOMIC_RELAXED);
 
    simple_mtx_unlock(&device->resource_mutex);
    
@@ -1501,6 +1617,7 @@ wrapper_CreateImage(VkDevice _device,
    bool is_emulated_bgra8 = false;
    bool is_wsi_image = false;
    VkExternalMemoryHandleTypeFlags handle_types = 0;
+   uint32_t mip_drop = 0;
 
    // Wrapper specific extension for B8G8R8A8 AHB img emulation for the swapchain
    VkBaseInStructure *prev = (VkBaseInStructure *) pCreateInfo;
@@ -1548,6 +1665,14 @@ wrapper_CreateImage(VkDevice _device,
             }
          }
       }
+
+      if (!handle_types && !is_wsi_image)
+         mip_drop = bcn_cap_mip_drop(pCreateInfo);
+      if (mip_drop) {
+         create_info.extent.width = MAX2(1, pCreateInfo->extent.width >> mip_drop);
+         create_info.extent.height = MAX2(1, pCreateInfo->extent.height >> mip_drop);
+         create_info.mipLevels = pCreateInfo->mipLevels - mip_drop;
+      }
    }
 
    res = device->dispatch_table.CreateImage(device->dispatch_handle,
@@ -1575,11 +1700,22 @@ wrapper_CreateImage(VkDevice _device,
    wi->is_emulated_bgra8 = is_emulated_bgra8;
    wi->is_wsi_image = is_wsi_image;
    wi->handle_types = handle_types;
+   wi->mip_drop = mip_drop;
 
    list_add(&wi->link, &device->image_list);
    _mesa_hash_table_u64_insert(device->image_table, (uint64_t)wi->dispatch_handle, wi);
+   if (mip_drop)
+      __atomic_add_fetch(&wrapper_capped_images, 1, __ATOMIC_RELAXED);
 
    simple_mtx_unlock(&device->resource_mutex);
+
+   if (mip_drop)
+      wrapper_diag_append(
+         "[CAP] img=%04x fmt=%d %ux%u mips=%u -> %ux%u mips=%u (dropped %u)\n",
+         (unsigned)((uintptr_t)*pImage & 0xffff), pCreateInfo->format,
+         pCreateInfo->extent.width, pCreateInfo->extent.height,
+         pCreateInfo->mipLevels, create_info.extent.width,
+         create_info.extent.height, create_info.mipLevels, mip_drop);
 
    return VK_SUCCESS;
 }
@@ -1598,6 +1734,13 @@ wrapper_device_image_memory_requirements(struct wrapper_device *device,
       ci.format = get_format_for_bcn(pInfo->pCreateInfo->format);
       ci.flags &= ~VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
       ci.pNext = NULL;
+      uint32_t mip_drop = vk_find_struct_const(pInfo->pCreateInfo->pNext,
+         EXTERNAL_MEMORY_IMAGE_CREATE_INFO) ? 0 : bcn_cap_mip_drop(pInfo->pCreateInfo);
+      if (mip_drop) {
+         ci.extent.width = MAX2(1, ci.extent.width >> mip_drop);
+         ci.extent.height = MAX2(1, ci.extent.height >> mip_drop);
+         ci.mipLevels -= mip_drop;
+      }
       info.pCreateInfo = &ci;
    }
 
@@ -1626,6 +1769,12 @@ wrapper_CreateImageView(VkDevice _device,
 
    if (is_emulated_bcn(device->physical, pCreateInfo->format)) {
       create_info.format = get_format_for_bcn(pCreateInfo->format);
+   }
+
+   uint32_t mip_drop = wrapper_image_mip_drop(device, pCreateInfo->image);
+   if (mip_drop && !bcn_cap_range(mip_drop, &create_info.subresourceRange)) {
+      create_info.subresourceRange.baseMipLevel = 0;
+      create_info.subresourceRange.levelCount = 1;
    }
 
    result = device->dispatch_table.CreateImageView(device->dispatch_handle,
@@ -1971,6 +2120,15 @@ wrapper_GetImageSubresourceLayout2KHR(VkDevice _device, VkImage image,
                                       const VkImageSubresource2 *pSubresource,
                                       VkSubresourceLayout2 *pLayout) {
    VK_FROM_HANDLE(wrapper_device, device, _device);
+   VkImageSubresource2 capped_sub;
+   uint32_t mip_drop = wrapper_image_mip_drop(device, image);
+
+   if (mip_drop) {
+      capped_sub = *pSubresource;
+      if (!wrapper_cap_level(mip_drop, &capped_sub.imageSubresource.mipLevel))
+         capped_sub.imageSubresource.mipLevel = 0;
+      pSubresource = &capped_sub;
+   }
 
    if (device->dispatch_table.GetImageSubresourceLayout2)
       device->dispatch_table.GetImageSubresourceLayout2(device->dispatch_handle, image, pSubresource, pLayout);
@@ -2522,11 +2680,10 @@ wrapper_access_mask2_to_legacy(VkAccessFlags2 access)
    return legacy;
 }
 
-VKAPI_ATTR void VKAPI_CALL
-wrapper_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
-                            const VkDependencyInfo *pDependencyInfo)
+static void
+wrapper_pipeline_barrier2(struct wrapper_command_buffer *wcb,
+                          const VkDependencyInfo *pDependencyInfo)
 {
-   VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
    struct wrapper_device *device = wcb->device;
 
    if (device->dispatch_table.CmdPipelineBarrier2) {
@@ -2628,6 +2785,29 @@ wrapper_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
    free(memory);
    free(buffers);
    free(images);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wrapper_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
+                            const VkDependencyInfo *pDependencyInfo)
+{
+   VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   uint32_t count = pDependencyInfo->imageMemoryBarrierCount;
+   VkImageMemoryBarrier2 stack[WRAPPER_CAP_STACK_ENTRIES];
+   VkImageMemoryBarrier2 *capped = NULL;
+   VkDependencyInfo capped_dep;
+
+   if (count && __atomic_load_n(&wrapper_capped_images, __ATOMIC_RELAXED) &&
+       (capped = wrapper_cap_alloc(stack, sizeof(*capped), count))) {
+      capped_dep = *pDependencyInfo;
+      capped_dep.imageMemoryBarrierCount = wrapper_cap_image_barriers2(wcb->device,
+         pDependencyInfo->pImageMemoryBarriers, count, capped);
+      capped_dep.pImageMemoryBarriers = capped;
+      pDependencyInfo = &capped_dep;
+   }
+
+   wrapper_pipeline_barrier2(wcb, pDependencyInfo);
+   wrapper_cap_free(capped, stack);
 }
 
 #define WRAPPER_DYNAMIC_MAX_COLOR_ATTACHMENTS 8
@@ -3614,6 +3794,8 @@ wrapper_CreateShaderModule(VkDevice _device,
    static int wrapper_no_remove_clip_distance = -1;
    static int wrapper_no_patch_OpConstComp = -1;
 
+   bcn_scan_shader(pCreateInfo->pCode, pCreateInfo->codeSize);
+
    if (wrapper_no_remove_clip_distance == -1)
       wrapper_no_remove_clip_distance = getenv("WRAPPER_NO_REMOVE_CLIP_DISTANCE") && atoi(getenv("WRAPPER_NO_REMOVE_CLIP_DISTANCE"));
 
@@ -3743,6 +3925,8 @@ wrapper_bcn_gpu_format_id(VkFormat format)
    case VK_FORMAT_BC1_RGB_SRGB_BLOCK:
    case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
    case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
+      if (is_astc_6x6(get_format_for_bcn(format)))
+         return -1; /* BC1 as ASTC 6x6: CPU only */
       return 0; /* BC1: opaque, single-plane RGB */
    case VK_FORMAT_BC7_UNORM_BLOCK:
    case VK_FORMAT_BC7_SRGB_BLOCK:
@@ -4044,8 +4228,45 @@ wrapper_bcn_gpu_copy(struct wrapper_command_buffer *wcb,
    return true;
 }
 
+/* Dropped (capped) mips skip the transcode but still leave their .src. */
 static void
-wrapper_bcn_do_copy(struct wrapper_command_buffer *wcb,
+wrapper_bcn_note_dropped(struct wrapper_device *device, struct wrapper_buffer *wb,
+                         VkFormat format, uint32_t mip_drop, uint32_t regionCount,
+                         const VkBufferImageCopy *pRegions)
+{
+   if (!bcn_cache_enabled())
+      return;
+
+   simple_mtx_lock(&device->resource_mutex);
+   bool was_mapped = wb->is_mapped;
+   if (!was_mapped) {
+      if (device->dispatch_table.MapMemory(device->dispatch_handle, wb->memory,
+            wb->offset, wb->size, 0, &wb->mapped_address) != VK_SUCCESS) {
+         simple_mtx_unlock(&device->resource_mutex);
+         return;
+      }
+      wb->is_mapped = 1;
+   }
+
+   for (uint32_t i = 0; i < regionCount; i++) {
+      const VkBufferImageCopy *r = &pRegions[i];
+      if (r->imageSubresource.mipLevel >= mip_drop)
+         continue;
+      int w = r->imageExtent.width;
+      bcn_cache_note_source(wb->mapped_address, w, r->imageExtent.height,
+         r->bufferRowLength ? (int)r->bufferRowLength : w, format,
+         (int)r->bufferOffset);
+   }
+
+   if (!was_mapped) {
+      device->dispatch_table.UnmapMemory(device->dispatch_handle, wb->memory);
+      wb->is_mapped = 0;
+   }
+   simple_mtx_unlock(&device->resource_mutex);
+}
+
+static void
+wrapper_bcn_do_copy_regions(struct wrapper_command_buffer *wcb,
                     struct wrapper_device *device,
                     struct wrapper_buffer *wb,
                     VkImage dstImage,
@@ -4207,6 +4428,39 @@ wrapper_bcn_do_copy(struct wrapper_command_buffer *wcb,
    simple_mtx_unlock(&device->resource_mutex);
 }
 
+/* Capped images: dropped mips leave only their .src, the rest move down,
+ * transcoded in stack-sized chunks. */
+static void
+wrapper_bcn_do_copy(struct wrapper_command_buffer *wcb,
+                    struct wrapper_device *device,
+                    struct wrapper_buffer *wb,
+                    VkImage dstImage,
+                    VkImageLayout dstLayout,
+                    VkFormat format,
+                    uint32_t mip_drop,
+                    uint32_t regionCount,
+                    const VkBufferImageCopy *pRegions)
+{
+   if (!mip_drop) {
+      wrapper_bcn_do_copy_regions(wcb, device, wb, dstImage, dstLayout, format,
+         regionCount, pRegions);
+      return;
+   }
+
+   VkBufferImageCopy capped[WRAPPER_CAP_STACK_ENTRIES];
+   bool dropped = false;
+   for (uint32_t i = 0; i < regionCount; i += WRAPPER_CAP_STACK_ENTRIES) {
+      uint32_t chunk = MIN2(regionCount - i, WRAPPER_CAP_STACK_ENTRIES);
+      uint32_t kept = bcn_cap_copy_regions(mip_drop, pRegions + i, chunk, capped);
+      dropped |= kept != chunk;
+      if (kept)
+         wrapper_bcn_do_copy_regions(wcb, device, wb, dstImage, dstLayout, format,
+            kept, capped);
+   }
+   if (dropped)
+      wrapper_bcn_note_dropped(device, wb, format, mip_drop, regionCount, pRegions);
+}
+
 /* Append a line to the per-game diag file and mirror to logcat, when
  * WRAPPER_DIAG is set. Used for the copy-level texture log below. */
 static void
@@ -4276,7 +4530,7 @@ wrapper_CmdCopyBufferToImage(VkCommandBuffer commandBuffer,
    }
 
    wrapper_bcn_do_copy(wcb, device, wb, dstImage, dstLayout, format,
-      regionCount, pRegions);
+      wi->mip_drop, regionCount, pRegions);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -4314,7 +4568,7 @@ wrapper_CmdCopyBufferToImage2(VkCommandBuffer commandBuffer,
    }
 
    wrapper_bcn_do_copy(wcb, device, wb, pInfo->dstImage, pInfo->dstImageLayout,
-      format, pInfo->regionCount, regions);
+      format, wi->mip_drop, pInfo->regionCount, regions);
 }
 
 VKAPI_ATTR void VKAPI_CALL 
@@ -4334,11 +4588,33 @@ wrapper_CmdBlitImage(
       WRAPPER_LOG(error, "vkCmdBlitImage with is_emulated_bgra8 image");
    }
 
+   uint32_t src_drop = wrapper_image_mip_drop(device, srcImage);
+   uint32_t dst_drop = dst_img ? dst_img->mip_drop : 0;
+   VkImageBlit stack[WRAPPER_CAP_STACK_ENTRIES];
+   VkImageBlit *capped = NULL;
+   if ((src_drop || dst_drop) &&
+       (capped = wrapper_cap_alloc(stack, sizeof(*capped), regionCount))) {
+      uint32_t n = 0;
+      for (uint32_t i = 0; i < regionCount; i++) {
+         capped[n] = pRegions[i];
+         if (wrapper_cap_level(src_drop, &capped[n].srcSubresource.mipLevel) &&
+             wrapper_cap_level(dst_drop, &capped[n].dstSubresource.mipLevel))
+            n++;
+      }
+      if (!n) {
+         wrapper_cap_free(capped, stack);
+         return;
+      }
+      regionCount = n;
+      regions = capped;
+   }
+
    device->dispatch_table.CmdBlitImage(
       wcb->dispatch_handle,
       srcImage, srcImageLayout,
       dstImage, dstImageLayout,
       regionCount, regions, filter);
+   wrapper_cap_free(capped, stack);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -4354,9 +4630,330 @@ wrapper_CmdBlitImage2(
       WRAPPER_LOG(error, "vkCmdBlitImage2 with is_emulated_bgra8 image");
    }
 
+   uint32_t src_drop = wrapper_image_mip_drop(device, pBlitImageInfo->srcImage);
+   uint32_t dst_drop = dst_img ? dst_img->mip_drop : 0;
+   VkBlitImageInfo2 capped_info;
+   VkImageBlit2 stack[WRAPPER_CAP_STACK_ENTRIES];
+   VkImageBlit2 *capped = NULL;
+   if ((src_drop || dst_drop) &&
+       (capped = wrapper_cap_alloc(stack, sizeof(*capped), pBlitImageInfo->regionCount))) {
+      uint32_t n = 0;
+      for (uint32_t i = 0; i < pBlitImageInfo->regionCount; i++) {
+         capped[n] = pBlitImageInfo->pRegions[i];
+         if (wrapper_cap_level(src_drop, &capped[n].srcSubresource.mipLevel) &&
+             wrapper_cap_level(dst_drop, &capped[n].dstSubresource.mipLevel))
+            n++;
+      }
+      if (!n) {
+         wrapper_cap_free(capped, stack);
+         return;
+      }
+      capped_info = *pBlitImageInfo;
+      capped_info.regionCount = n;
+      capped_info.pRegions = capped;
+      pBlitImageInfo = &capped_info;
+   }
+
    if (device->dispatch_table.CmdBlitImage2) {
       device->dispatch_table.CmdBlitImage2(wcb->dispatch_handle, pBlitImageInfo);
    }
+   wrapper_cap_free(capped, stack);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wrapper_CmdPipelineBarrier(VkCommandBuffer commandBuffer,
+                           VkPipelineStageFlags srcStageMask,
+                           VkPipelineStageFlags dstStageMask,
+                           VkDependencyFlags dependencyFlags,
+                           uint32_t memoryBarrierCount,
+                           const VkMemoryBarrier *pMemoryBarriers,
+                           uint32_t bufferMemoryBarrierCount,
+                           const VkBufferMemoryBarrier *pBufferMemoryBarriers,
+                           uint32_t imageMemoryBarrierCount,
+                           const VkImageMemoryBarrier *pImageMemoryBarriers)
+{
+   VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   struct wrapper_device *device = wcb->device;
+   VkImageMemoryBarrier stack[WRAPPER_CAP_STACK_ENTRIES];
+   VkImageMemoryBarrier *capped = NULL;
+
+   if (imageMemoryBarrierCount &&
+       __atomic_load_n(&wrapper_capped_images, __ATOMIC_RELAXED) &&
+       (capped = wrapper_cap_alloc(stack, sizeof(*capped), imageMemoryBarrierCount))) {
+      imageMemoryBarrierCount = wrapper_cap_image_barriers(device,
+         pImageMemoryBarriers, imageMemoryBarrierCount, capped);
+      pImageMemoryBarriers = capped;
+   }
+
+   device->dispatch_table.CmdPipelineBarrier(wcb->dispatch_handle, srcStageMask,
+      dstStageMask, dependencyFlags, memoryBarrierCount, pMemoryBarriers,
+      bufferMemoryBarrierCount, pBufferMemoryBarriers, imageMemoryBarrierCount,
+      pImageMemoryBarriers);
+   wrapper_cap_free(capped, stack);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wrapper_CmdWaitEvents(VkCommandBuffer commandBuffer, uint32_t eventCount,
+                      const VkEvent *pEvents, VkPipelineStageFlags srcStageMask,
+                      VkPipelineStageFlags dstStageMask,
+                      uint32_t memoryBarrierCount,
+                      const VkMemoryBarrier *pMemoryBarriers,
+                      uint32_t bufferMemoryBarrierCount,
+                      const VkBufferMemoryBarrier *pBufferMemoryBarriers,
+                      uint32_t imageMemoryBarrierCount,
+                      const VkImageMemoryBarrier *pImageMemoryBarriers)
+{
+   VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   struct wrapper_device *device = wcb->device;
+   VkImageMemoryBarrier stack[WRAPPER_CAP_STACK_ENTRIES];
+   VkImageMemoryBarrier *capped = NULL;
+
+   if (imageMemoryBarrierCount &&
+       __atomic_load_n(&wrapper_capped_images, __ATOMIC_RELAXED) &&
+       (capped = wrapper_cap_alloc(stack, sizeof(*capped), imageMemoryBarrierCount))) {
+      imageMemoryBarrierCount = wrapper_cap_image_barriers(device,
+         pImageMemoryBarriers, imageMemoryBarrierCount, capped);
+      pImageMemoryBarriers = capped;
+   }
+
+   device->dispatch_table.CmdWaitEvents(wcb->dispatch_handle, eventCount,
+      pEvents, srcStageMask, dstStageMask, memoryBarrierCount, pMemoryBarriers,
+      bufferMemoryBarrierCount, pBufferMemoryBarriers, imageMemoryBarrierCount,
+      pImageMemoryBarriers);
+   wrapper_cap_free(capped, stack);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wrapper_CmdWaitEvents2(VkCommandBuffer commandBuffer, uint32_t eventCount,
+                       const VkEvent *pEvents,
+                       const VkDependencyInfo *pDependencyInfos)
+{
+   VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   struct wrapper_device *device = wcb->device;
+   VkDependencyInfo *deps = NULL;
+   VkImageMemoryBarrier2 *capped = NULL;
+
+   if (eventCount && __atomic_load_n(&wrapper_capped_images, __ATOMIC_RELAXED)) {
+      uint32_t total = 0;
+      for (uint32_t i = 0; i < eventCount; i++)
+         total += pDependencyInfos[i].imageMemoryBarrierCount;
+      deps = malloc(sizeof(*deps) * eventCount);
+      capped = malloc(sizeof(*capped) * (total ? total : 1));
+      if (deps && capped) {
+         VkImageMemoryBarrier2 *next = capped;
+         for (uint32_t i = 0; i < eventCount; i++) {
+            deps[i] = pDependencyInfos[i];
+            deps[i].imageMemoryBarrierCount = wrapper_cap_image_barriers2(device,
+               pDependencyInfos[i].pImageMemoryBarriers,
+               pDependencyInfos[i].imageMemoryBarrierCount, next);
+            deps[i].pImageMemoryBarriers = next;
+            next += deps[i].imageMemoryBarrierCount;
+         }
+         pDependencyInfos = deps;
+      }
+   }
+
+   device->dispatch_table.CmdWaitEvents2(wcb->dispatch_handle, eventCount,
+      pEvents, pDependencyInfos);
+   free(deps);
+   free(capped);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wrapper_CmdCopyImage(VkCommandBuffer commandBuffer,
+                     VkImage srcImage, VkImageLayout srcImageLayout,
+                     VkImage dstImage, VkImageLayout dstImageLayout,
+                     uint32_t regionCount, const VkImageCopy *pRegions)
+{
+   VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   struct wrapper_device *device = wcb->device;
+   uint32_t src_drop = wrapper_image_mip_drop(device, srcImage);
+   uint32_t dst_drop = wrapper_image_mip_drop(device, dstImage);
+   VkImageCopy stack[WRAPPER_CAP_STACK_ENTRIES];
+   VkImageCopy *capped = NULL;
+
+   if ((src_drop || dst_drop) &&
+       (capped = wrapper_cap_alloc(stack, sizeof(*capped), regionCount))) {
+      uint32_t n = 0;
+      for (uint32_t i = 0; i < regionCount; i++) {
+         capped[n] = pRegions[i];
+         if (wrapper_cap_level(src_drop, &capped[n].srcSubresource.mipLevel) &&
+             wrapper_cap_level(dst_drop, &capped[n].dstSubresource.mipLevel))
+            n++;
+      }
+      if (!n) {
+         wrapper_cap_free(capped, stack);
+         return;
+      }
+      regionCount = n;
+      pRegions = capped;
+   }
+
+   device->dispatch_table.CmdCopyImage(wcb->dispatch_handle, srcImage,
+      srcImageLayout, dstImage, dstImageLayout, regionCount, pRegions);
+   wrapper_cap_free(capped, stack);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wrapper_CmdCopyImage2(VkCommandBuffer commandBuffer,
+                      const VkCopyImageInfo2 *pCopyImageInfo)
+{
+   VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   struct wrapper_device *device = wcb->device;
+   uint32_t src_drop = wrapper_image_mip_drop(device, pCopyImageInfo->srcImage);
+   uint32_t dst_drop = wrapper_image_mip_drop(device, pCopyImageInfo->dstImage);
+   uint32_t count = pCopyImageInfo->regionCount;
+   VkCopyImageInfo2 capped_info;
+   VkImageCopy2 stack[WRAPPER_CAP_STACK_ENTRIES];
+   VkImageCopy2 *capped = NULL;
+
+   if ((src_drop || dst_drop) &&
+       (capped = wrapper_cap_alloc(stack, sizeof(*capped), count))) {
+      uint32_t n = 0;
+      for (uint32_t i = 0; i < count; i++) {
+         capped[n] = pCopyImageInfo->pRegions[i];
+         if (wrapper_cap_level(src_drop, &capped[n].srcSubresource.mipLevel) &&
+             wrapper_cap_level(dst_drop, &capped[n].dstSubresource.mipLevel))
+            n++;
+      }
+      if (!n) {
+         wrapper_cap_free(capped, stack);
+         return;
+      }
+      capped_info = *pCopyImageInfo;
+      capped_info.regionCount = n;
+      capped_info.pRegions = capped;
+      pCopyImageInfo = &capped_info;
+   }
+
+   device->dispatch_table.CmdCopyImage2(wcb->dispatch_handle, pCopyImageInfo);
+   wrapper_cap_free(capped, stack);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wrapper_CmdClearColorImage(VkCommandBuffer commandBuffer, VkImage image,
+                           VkImageLayout imageLayout,
+                           const VkClearColorValue *pColor,
+                           uint32_t rangeCount,
+                           const VkImageSubresourceRange *pRanges)
+{
+   VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   struct wrapper_device *device = wcb->device;
+   uint32_t mip_drop = wrapper_image_mip_drop(device, image);
+   VkImageSubresourceRange stack[WRAPPER_CAP_STACK_ENTRIES];
+   VkImageSubresourceRange *capped = NULL;
+
+   if (mip_drop && (capped = wrapper_cap_alloc(stack, sizeof(*capped), rangeCount))) {
+      uint32_t n = 0;
+      for (uint32_t i = 0; i < rangeCount; i++) {
+         capped[n] = pRanges[i];
+         if (bcn_cap_range(mip_drop, &capped[n]))
+            n++;
+      }
+      if (!n) {
+         wrapper_cap_free(capped, stack);
+         return;
+      }
+      rangeCount = n;
+      pRanges = capped;
+   }
+
+   device->dispatch_table.CmdClearColorImage(wcb->dispatch_handle, image,
+      imageLayout, pColor, rangeCount, pRanges);
+   wrapper_cap_free(capped, stack);
+}
+
+/* Readback of a dropped level returns the reduced base level (best effort),
+ * with the region scaled to fit it and tightly packed. */
+static void
+wrapper_cap_readback_region(uint32_t mip_drop, VkImageSubresourceLayers *sub,
+                            VkOffset3D *offset, VkExtent3D *extent,
+                            uint32_t *row_length, uint32_t *image_height)
+{
+   if (wrapper_cap_level(mip_drop, &sub->mipLevel))
+      return;
+   uint32_t d = mip_drop - sub->mipLevel;
+   sub->mipLevel = 0;
+   offset->x >>= d;
+   offset->y >>= d;
+   extent->width = MAX2(1, extent->width >> d);
+   extent->height = MAX2(1, extent->height >> d);
+   *row_length = 0;
+   *image_height = 0;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wrapper_CmdCopyImageToBuffer(VkCommandBuffer commandBuffer, VkImage srcImage,
+                             VkImageLayout srcImageLayout, VkBuffer dstBuffer,
+                             uint32_t regionCount,
+                             const VkBufferImageCopy *pRegions)
+{
+   VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   struct wrapper_device *device = wcb->device;
+   uint32_t mip_drop = wrapper_image_mip_drop(device, srcImage);
+   VkBufferImageCopy stack[WRAPPER_CAP_STACK_ENTRIES];
+   VkBufferImageCopy *capped = NULL;
+
+   if (mip_drop && (capped = wrapper_cap_alloc(stack, sizeof(*capped), regionCount))) {
+      for (uint32_t i = 0; i < regionCount; i++) {
+         capped[i] = pRegions[i];
+         wrapper_cap_readback_region(mip_drop, &capped[i].imageSubresource,
+            &capped[i].imageOffset, &capped[i].imageExtent,
+            &capped[i].bufferRowLength, &capped[i].bufferImageHeight);
+      }
+      pRegions = capped;
+   }
+
+   device->dispatch_table.CmdCopyImageToBuffer(wcb->dispatch_handle, srcImage,
+      srcImageLayout, dstBuffer, regionCount, pRegions);
+   wrapper_cap_free(capped, stack);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wrapper_CmdCopyImageToBuffer2(VkCommandBuffer commandBuffer,
+                              const VkCopyImageToBufferInfo2 *pInfo)
+{
+   VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   struct wrapper_device *device = wcb->device;
+   uint32_t mip_drop = wrapper_image_mip_drop(device, pInfo->srcImage);
+   VkCopyImageToBufferInfo2 capped_info;
+   VkBufferImageCopy2 stack[WRAPPER_CAP_STACK_ENTRIES];
+   VkBufferImageCopy2 *capped = NULL;
+
+   if (mip_drop && (capped = wrapper_cap_alloc(stack, sizeof(*capped), pInfo->regionCount))) {
+      for (uint32_t i = 0; i < pInfo->regionCount; i++) {
+         capped[i] = pInfo->pRegions[i];
+         wrapper_cap_readback_region(mip_drop, &capped[i].imageSubresource,
+            &capped[i].imageOffset, &capped[i].imageExtent,
+            &capped[i].bufferRowLength, &capped[i].bufferImageHeight);
+      }
+      capped_info = *pInfo;
+      capped_info.pRegions = capped;
+      pInfo = &capped_info;
+   }
+
+   device->dispatch_table.CmdCopyImageToBuffer2(wcb->dispatch_handle, pInfo);
+   wrapper_cap_free(capped, stack);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wrapper_GetImageSubresourceLayout(VkDevice _device, VkImage image,
+                                  const VkImageSubresource *pSubresource,
+                                  VkSubresourceLayout *pLayout)
+{
+   VK_FROM_HANDLE(wrapper_device, device, _device);
+   VkImageSubresource capped_sub;
+   uint32_t mip_drop = wrapper_image_mip_drop(device, image);
+
+   if (mip_drop) {
+      capped_sub = *pSubresource;
+      if (!wrapper_cap_level(mip_drop, &capped_sub.mipLevel))
+         capped_sub.mipLevel = 0;
+      pSubresource = &capped_sub;
+   }
+
+   device->dispatch_table.GetImageSubresourceLayout(device->dispatch_handle,
+      image, pSubresource, pLayout);
 }
 
 VKAPI_ATTR void VKAPI_CALL
