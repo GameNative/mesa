@@ -902,7 +902,6 @@ wrapper_CmdBindVertexBuffers(VkCommandBuffer commandBuffer, uint32_t firstBindin
    free(bufs);
 }
 
-static void wrapper_diag_append(const char *fmt, ...);
 
 /* Images with dropped top mips (policy maxdim); zero keeps every
  * remap hook off the lookup path. */
@@ -1105,6 +1104,7 @@ wrapper_emit_diag(struct wrapper_physical_device *pdev,
      is_astc_4x4(get_format_for_bcn(VK_FORMAT_BC1_RGB_UNORM_BLOCK)) ? "4x4" : "decode",
      (getenv("WRAPPER_BCN_GPU") && atoi(getenv("WRAPPER_BCN_GPU"))) ? "GPU" : "CPU",
      (!getenv("WRAPPER_USE_BCN_CACHE") || atoi(getenv("WRAPPER_USE_BCN_CACHE"))) ? "on" : "off");
+   D("  format diag                   : wrapper-fmtdiag-1\n");
    D("  BCn policy (WRAPPER_BCN_POLICY): %s  BC6H=%s\n", bcn_policy_desc(),
      is_astc_hdr_4x4(get_format_for_bcn(VK_FORMAT_BC6H_UFLOAT_BLOCK)) ? "ASTC 4x4 HDR" : "decode");
    D("  VK_EXT_device_fault report    : %s\n",
@@ -1654,14 +1654,28 @@ wrapper_CreateImage(VkDevice _device,
       if (create_info.flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT)
          create_info.flags &= ~VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
 
+      if (wrapper_diag_on())
+         wrapper_diag_append(
+            "[FMT] CreateImage fmt=%d -> %d flags=0x%x usage=0x%x %ux%u mips=%u layers=%u\n",
+            pCreateInfo->format, create_info.format, pCreateInfo->flags,
+            pCreateInfo->usage, pCreateInfo->extent.width,
+            pCreateInfo->extent.height, pCreateInfo->mipLevels,
+            pCreateInfo->arrayLayers);
+
       for (const VkBaseInStructure *s = pCreateInfo->pNext; s; s = s->pNext) {
          if (s->sType == VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO) {
             const VkImageFormatListCreateInfo *fl =
                (const VkImageFormatListCreateInfo *)s;
             for (uint32_t i = 0; i < fl->viewFormatCount; i++) {
-               if (is_emulated_bcn(device->physical, fl->pViewFormats[i]))
+               if (is_emulated_bcn(device->physical, fl->pViewFormats[i])) {
+                  VkFormat was = fl->pViewFormats[i];
                   ((VkFormat *)fl->pViewFormats)[i] =
                      get_format_for_bcn(fl->pViewFormats[i]);
+                  if (wrapper_diag_on())
+                     wrapper_diag_append(
+                        "[FMT] CreateImage REWROTE caller pViewFormats[%u] at %p: %d -> %d\n",
+                        i, (void *)&fl->pViewFormats[i], was, fl->pViewFormats[i]);
+               }
             }
          }
       }
@@ -1769,6 +1783,9 @@ wrapper_CreateImageView(VkDevice _device,
 
    if (is_emulated_bcn(device->physical, pCreateInfo->format)) {
       create_info.format = get_format_for_bcn(pCreateInfo->format);
+      if (wrapper_diag_on())
+         wrapper_diag_append("[FMT] CreateImageView fmt=%d -> %d type=%d\n",
+            pCreateInfo->format, create_info.format, pCreateInfo->viewType);
    }
 
    uint32_t mip_drop = wrapper_image_mip_drop(device, pCreateInfo->image);
@@ -4562,13 +4579,19 @@ wrapper_bcn_do_copy(struct wrapper_command_buffer *wcb,
 
 /* Append a line to the per-game diag file and mirror to logcat, when
  * WRAPPER_DIAG is set. Used for the copy-level texture log below. */
-static void
-wrapper_diag_append(const char *fmt, ...)
+int
+wrapper_diag_on(void)
 {
    static int on = -1;
    if (on == -1)
       on = getenv("WRAPPER_DIAG") ? atoi(getenv("WRAPPER_DIAG")) : 0;
-   if (!on)
+   return on;
+}
+
+void
+wrapper_diag_append(const char *fmt, ...)
+{
+   if (!wrapper_diag_on())
       return;
    const char *aid = getenv("WRAPPER_DIAG_APPID");
    char tp[256];
@@ -5053,6 +5076,16 @@ wrapper_GetImageSubresourceLayout(VkDevice _device, VkImage image,
 
    device->dispatch_table.GetImageSubresourceLayout(device->dispatch_handle,
       image, pSubresource, pLayout);
+
+   if (wrapper_diag_on()) {
+      struct wrapper_image *wi = get_wrapper_image_from_handle(device, image);
+      if (wi && is_emulated_bcn(device->physical, wi->info.format))
+         wrapper_diag_append(
+            "[FMT] SubresourceLayout fmt=%d mip=%u layer=%u off=%llu size=%llu row=%llu\n",
+            wi->info.format, pSubresource->mipLevel, pSubresource->arrayLayer,
+            (unsigned long long)pLayout->offset, (unsigned long long)pLayout->size,
+            (unsigned long long)pLayout->rowPitch);
+   }
 }
 
 VKAPI_ATTR void VKAPI_CALL

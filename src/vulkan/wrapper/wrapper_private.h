@@ -294,4 +294,7 @@ wrapper_device_memory_create(struct wrapper_device *device,
 void
 wrapper_device_memory_destroy(struct wrapper_device_memory *mem);
 
+int wrapper_diag_on(void);
+void wrapper_diag_append(const char *fmt, ...);
+
 #endif
