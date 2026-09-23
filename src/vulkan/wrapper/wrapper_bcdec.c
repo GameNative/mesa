@@ -810,15 +810,22 @@ bcn_cache_read(const char *path, void *dst, size_t size, int *raw)
    *raw = 0;
    if (stat(path, &sb) != 0)
       return 0;
-   if ((size_t)sb.st_size != size) {
-      if (bcn_cache_read_zstd(path, dst, size, (size_t)sb.st_size))
-         return 1;
-      return 0;
-   }
-   *raw = 1;
    FILE *fp = fopen(path, "rb");
    if (!fp)
       return 0;
+   /* The zstd magic decides, not the size: a frame can be exactly raw size. */
+   unsigned char magic[4];
+   if (fread(magic, 1, 4, fp) == 4 && magic[0] == 0x28 && magic[1] == 0xB5 &&
+       magic[2] == 0x2F && magic[3] == 0xFD) {
+      fclose(fp);
+      return bcn_cache_read_zstd(path, dst, size, (size_t)sb.st_size);
+   }
+   if ((size_t)sb.st_size != size) {
+      fclose(fp);
+      return 0;
+   }
+   *raw = 1;
+   rewind(fp);
    size_t length = fread(dst, 1, size, fp);
    fclose(fp);
    if (length != size) {
