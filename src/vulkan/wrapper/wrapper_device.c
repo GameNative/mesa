@@ -4497,7 +4497,7 @@ wrapper_bcn_cpu_copy_regions(struct wrapper_command_buffer *wcb,
             tex_diag = getenv("WRAPPER_DIAG") ? atoi(getenv("WRAPPER_DIAG")) : 0;
          if (tex_diag) {
             static int tex_n = 0;
-            struct wrapper_image *twi = get_wrapper_image_from_handle(device, dstImage);
+            struct wrapper_image *twi = get_wrapper_image_from_handle_locked(device, dstImage);
             VkFormat tgt = get_format_for_bcn(format);
             /* Write to stderr, which for a D3D process is redirected into the
              * diag file (wrapper_emit_diag), so this lands in the one file. */
