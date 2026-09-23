@@ -644,6 +644,8 @@ is_emulated_bcn(struct wrapper_physical_device *pdev, VkFormat format)
  * The hash walks the logical rows only, so a padded bufferRowLength yields the
  * same key as a tightly packed upload of the same mip. */
 #define BCN_CACHE_HASH_SEED 1
+/* Upload mode: larger mips keep only their .src; the server pack has them. */
+#define BCN_CACHE_UPLOAD_ENTRY_MAX 1024
 
 static const char *
 bcn_cache_src_tag(VkFormat format)
@@ -1239,7 +1241,9 @@ decompress_bcn_format(void *srcBuffer,
    }
 
    if (wrapper_use_bcn_cache && cache_filename) {
-      bcn_cache_write(cache_filename, dst, uncompressed_size);
+      if (!bcn_upload_enabled() ||
+          (w <= BCN_CACHE_UPLOAD_ENTRY_MAX && h <= BCN_CACHE_UPLOAD_ENTRY_MAX))
+         bcn_cache_write(cache_filename, dst, uncompressed_size);
       if (w >= 8 && h >= 8)
          bcn_cache_write_source(cache_filename, src, block_x, block_y, block_x_src, block_size);
    }
