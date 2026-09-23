@@ -1096,14 +1096,15 @@ wrapper_emit_diag(struct wrapper_physical_device *pdev,
      (pdev->vk.supported_extensions.EXT_robustness2 && !pdev->base_supported_extensions.EXT_robustness2) ? "YES" : "no");
    D("  vertex_attr_divisor EXT alias : %s\n",
      (pdev->vk.supported_extensions.EXT_vertex_attribute_divisor && !pdev->base_supported_extensions.EXT_vertex_attribute_divisor) ? "YES (aliased from KHR)" : "no");
-   D("  BCn: emulate=%d  ASTC=%s  BC1=%s  transcode=%s  cache=%s\n",
+   D("  BCn: emulate=%d  ASTC=%s  BC1=%s  transcode=%s  cache=%s  upload=%s\n",
      pdev->emulate_bcn,
      getenv("WRAPPER_ASTC_BLOCK") ? getenv("WRAPPER_ASTC_BLOCK") : "4x4",
      is_astc_6x6(get_format_for_bcn(VK_FORMAT_BC1_RGB_UNORM_BLOCK)) ? "6x6" :
      is_astc_8x8(get_format_for_bcn(VK_FORMAT_BC1_RGB_UNORM_BLOCK)) ? "8x8" :
      is_astc_4x4(get_format_for_bcn(VK_FORMAT_BC1_RGB_UNORM_BLOCK)) ? "4x4" : "decode",
      (getenv("WRAPPER_BCN_GPU") && atoi(getenv("WRAPPER_BCN_GPU"))) ? "GPU" : "CPU",
-     (!getenv("WRAPPER_USE_BCN_CACHE") || atoi(getenv("WRAPPER_USE_BCN_CACHE"))) ? "on" : "off");
+     (!getenv("WRAPPER_USE_BCN_CACHE") || atoi(getenv("WRAPPER_USE_BCN_CACHE"))) ? "on" : "off",
+     bcn_upload_enabled() ? "on" : "off");
    D("  format diag                   : wrapper-fmtdiag-1\n");
    D("  BCn policy (WRAPPER_BCN_POLICY): %s  BC6H=%s\n", bcn_policy_desc(),
      is_astc_hdr_4x4(get_format_for_bcn(VK_FORMAT_BC6H_UFLOAT_BLOCK)) ? "ASTC 4x4 HDR" : "decode");
@@ -4333,7 +4334,7 @@ wrapper_bcn_note_dropped(struct wrapper_device *device, struct wrapper_buffer *w
                          VkFormat format, uint32_t mip_drop, uint32_t regionCount,
                          const VkBufferImageCopy *pRegions)
 {
-   if (!bcn_cache_enabled())
+   if (!bcn_cache_enabled() || !bcn_upload_enabled())
       return;
 
    simple_mtx_lock(&device->resource_mutex);

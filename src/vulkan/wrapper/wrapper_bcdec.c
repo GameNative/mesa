@@ -867,6 +867,8 @@ static void
 bcn_cache_write_source(const char *entry_path, const char *src, int block_x,
                        int block_y, int block_x_src, int block_size)
 {
+   if (!bcn_upload_enabled())
+      return;
    const char *dot = strrchr(entry_path, '.');
    if (!dot || (strcmp(dot + 1, "a4") != 0 && strcmp(dot + 1, "a6") != 0 &&
                 strcmp(dot + 1, "a8") != 0 && strcmp(dot + 1, "h4") != 0))
@@ -1322,6 +1324,18 @@ bcn_cap_copy_regions(uint32_t mip_drop, const VkBufferImageCopy *regions,
    return n;
 }
 
+/* WRAPPER_BCN_UPLOAD=1: leave .src sidecars and needs_full_res for the server. */
+int
+bcn_upload_enabled(void)
+{
+   static int on = -1;
+   if (on == -1) {
+      const char *e = getenv("WRAPPER_BCN_UPLOAD");
+      on = e && !strcmp(e, "1");
+   }
+   return on;
+}
+
 int
 bcn_cache_enabled(void)
 {
@@ -1337,7 +1351,7 @@ void
 bcn_cache_note_source(void *srcBuffer, int w, int h, int src_w,
                       VkFormat format, int offset)
 {
-   if (!bcn_cache_enabled() || w < 8 || h < 8)
+   if (!bcn_cache_enabled() || !bcn_upload_enabled() || w < 8 || h < 8)
       return;
    const char *dir = getenv("WRAPPER_CACHE_PATH") ? getenv("WRAPPER_CACHE_PATH")
                                                    : WRAPPER_CACHE_DIR;
@@ -1474,6 +1488,8 @@ out:
 int
 bcn_scan_shader(const uint32_t *code, size_t size)
 {
+   if (!bcn_upload_enabled())
+      return 0;
    if (__atomic_load_n(&bcn_full_res_seen, __ATOMIC_RELAXED))
       return 1;
    if (!code || !bcn_spirv_needs_full_res(code, size / 4))

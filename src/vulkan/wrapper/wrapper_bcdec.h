@@ -61,6 +61,9 @@ bcn_cap_copy_regions(uint32_t mip_drop, const VkBufferImageCopy *regions,
 int
 bcn_cache_enabled(void);
 
+int
+bcn_upload_enabled(void);
+
 void
 bcn_cache_note_source(void *srcBuffer, int w, int h, int src_w,
                       VkFormat format, int offset);
