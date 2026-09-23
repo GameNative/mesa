@@ -109,7 +109,8 @@ bcn_policy_parse(void)
          WRAPPER_LOG(info, "BCn policy: ignoring %s=%s", it, val);
          continue;
       }
-      if ((b == 6 && idx != BCN_POL_BC1) || (idx == BCN_POL_BC6H && b != 4)) {
+      if ((b == 6 && idx != BCN_POL_BC1) ||
+          ((idx == BCN_POL_BC6H || idx == BCN_POL_BC4 || idx == BCN_POL_BC5) && b != 4)) {
          WRAPPER_LOG(info, "BCn policy: no %dx%d encoder for %s, stock", b, b, it);
          continue;
       }
@@ -157,6 +158,8 @@ bcn_set_astc_hdr(int on)
 static int
 bcn_astc_edge(int idx)
 {
+   if (idx == BCN_POL_BC4 || idx == BCN_POL_BC5)
+      return 4; /* one/two-channel maps are too lossy at 8x8 */
    int b = bcn_policy_block(idx);
    return b ? b : (astc_block8() ? 8 : 4);
 }
