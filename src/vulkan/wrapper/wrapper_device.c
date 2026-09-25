@@ -3908,10 +3908,12 @@ wrapper_CreateShaderModule(VkDevice _device,
 
    if (device->physical->driver_properties.driverID == VK_DRIVER_ID_ARM_PROPRIETARY) {
       uint32_t *code = malloc(create_info.codeSize);
-      memcpy(code, create_info.pCode, create_info.codeSize);
-      if (!wrapper_no_patch_OpConstComp) patch_OpConstantComposite_to_OpSpecConstantComposite(code, create_info.codeSize);
-      if (!wrapper_no_remove_clip_distance) remove_ClipDistance(code, &create_info.codeSize);
-      create_info.pCode = code;
+      if (code) {
+         memcpy(code, create_info.pCode, create_info.codeSize);
+         if (!wrapper_no_patch_OpConstComp) patch_OpConstantComposite_to_OpSpecConstantComposite(code, create_info.codeSize / sizeof(uint32_t));
+         if (!wrapper_no_remove_clip_distance) remove_ClipDistance(code, &create_info.codeSize);
+         create_info.pCode = code;
+      }
    }
 
    simple_mtx_unlock(&device->resource_mutex);
