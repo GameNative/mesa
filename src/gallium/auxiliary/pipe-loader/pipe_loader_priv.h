@@ -63,6 +63,14 @@ pipe_loader_find_module(const char *driver_name,
                         const char *library_paths);
 
 /**
+ * Default directory to search for dynamically loaded gallium "pipe" drivers,
+ * derived at runtime from the location of the loading shared object rather
+ * than the configure-time prefix.  Returns "" if it cannot be determined.
+ */
+const char *
+pipe_loader_default_search_dir(void);
+
+/**
  * Free the base device structure.
  *
  * Implementations of pipe_loader_ops::release must call this.

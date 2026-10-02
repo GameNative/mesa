@@ -1,0 +1,18 @@
+# Overlay libdrm.pc for the Android cross-build.
+#
+# Real libdrm.pc in the termux prefix carries `Cflags: -I${includedir}
+# -I${includedir}/libdrm`.  That -I lands *before* the NDK/libc++ include
+# paths and makes libc++ pick up the prefix's C library headers (its
+# <stdlib.h>/<stdio.h>), which breaks every C++ translation unit in Mesa.
+# We drop the Cflags here and let the cross file add the same directory as
+# `-idirafter` instead, where it is searched after the system headers and
+# only supplies the libdrm headers the NDK does not ship.
+#
+# No -L either: the cross file's c_link_args already put the prefix's lib
+# directory on the link line, so hard-coding a build-host path here would only
+# bake that path into anything that reads this file.
+Name: libdrm
+Description: Userspace interface to kernel DRM services
+Version: 2.4.131
+Libs: -ldrm
+Cflags:

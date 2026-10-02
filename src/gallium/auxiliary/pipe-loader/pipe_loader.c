@@ -35,6 +35,7 @@
 #include "util/xmlconfig.h"
 #include "util/driconf.h"
 
+#include <dlfcn.h>
 #include <string.h>
 
 #ifdef _MSC_VER
@@ -185,6 +186,35 @@ struct pipe_screen *
 pipe_loader_create_screen(struct pipe_loader_device *dev, bool driver_name_is_inferred)
 {
    return pipe_loader_create_screen_vk(dev, false, driver_name_is_inferred);
+}
+
+/**
+ * Default search directory for dynamically loaded gallium "pipe" drivers.
+ *
+ * PIPE_SEARCH_DIR names the build host's staging prefix, which does not exist
+ * where libgallium/libEGL actually ship, so derive the directory at runtime
+ * from this shared object's own on-disk location: the pipe drivers are
+ * installed as <libdir>/gallium-pipe next to the library that loads them.
+ * Returns an empty string when the location cannot be determined, in which
+ * case pipe_loader_find_module() finds no module.
+ */
+const char *
+pipe_loader_default_search_dir(void)
+{
+   static char dir[PATH_MAX];
+   Dl_info info;
+   const char *slash;
+
+   if (dir[0] != '\0')
+      return dir;
+
+   if (dladdr((const void *)&pipe_loader_default_search_dir, &info) &&
+       info.dli_fname && (slash = strrchr(info.dli_fname, '/')) &&
+       snprintf(dir, sizeof(dir), "%.*s/gallium-pipe",
+                (int)(slash - info.dli_fname), info.dli_fname) >= (int)sizeof(dir))
+      dir[0] = '\0';
+
+   return dir;
 }
 
 struct util_dl_library *

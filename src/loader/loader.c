@@ -123,6 +123,41 @@ loader_get_kernel_driver_name(int fd)
    return driver;
 }
 
+/*
+ * gndrm (GameNative userspace DRM): the on-device fd is a Unix socket served
+ * by our daemon through libgndrm_shim.so, not a /dev/dri node.  libdrm's
+ * device probes (drmGetDevice2, and the /sys/dev/char/<maj>:<min> lookups
+ * that key off st_rdev) all fail on it because fstat() reports a socket.
+ * The shim does serve DRM_IOCTL_VERSION, and the daemon names the device
+ * "gamenative" (see gndrm-daemon's DRIVER_NAME).  Keying off that name lets
+ * us treat the fd as a DRM render node and default it to the zink DRI driver
+ * rather than the kernel-driver-name path, which would try - and fail - to
+ * dlopen dri/gamenative_dri.so.
+ *
+ * GNDRM_DRM_NAME    overrides the expected device name (default "gamenative").
+ * GNDRM_MESA_DRIVER overrides the DRI driver picked for such a device.
+ */
+static bool
+loader_is_gndrm_device(int fd)
+{
+   const char *want = getenv("GNDRM_DRM_NAME");
+   drmVersionPtr version;
+   bool match;
+
+   if (!want || !*want)
+      want = "gamenative";
+
+   version = drmGetVersion(fd);
+   if (!version)
+      return false;
+
+   match = version->name_len == (int)strlen(want) &&
+           strncmp(version->name, want, version->name_len) == 0;
+
+   drmFreeVersion(version);
+   return match;
+}
+
 bool
 iris_predicate(int fd, const char *driver)
 {
@@ -230,8 +265,12 @@ loader_is_device_render_capable(int fd)
    drmDevicePtr dev_ptr;
    bool ret;
 
-   if (drmGetDevice2(fd, 0, &dev_ptr) != 0)
-      return false;
+   if (drmGetDevice2(fd, 0, &dev_ptr) != 0) {
+      /* gndrm socket fd: not a real /dev/dri node, but the daemon serves
+       * render-node ioctls, so honour it when the VERSION ioctl names us.
+       */
+      return loader_is_gndrm_device(fd);
+   }
 
    ret = (dev_ptr->available_nodes & (1 << DRM_NODE_RENDER));
 
@@ -720,8 +759,13 @@ loader_get_driver_for_fd(int fd)
 #endif
 
    driver = loader_get_pci_driver(fd);
-   if (!driver)
+   if (!driver) {
+      if (loader_is_gndrm_device(fd)) {
+         const char *override = getenv("GNDRM_MESA_DRIVER");
+         return strdup((override && *override) ? override : "zink");
+      }
       driver = loader_get_kernel_driver_name(fd);
+   }
 
    return driver;
 }
@@ -773,6 +817,39 @@ loader_bind_extensions(void *data,
 
    return ret;
 }
+
+/**
+ * Resolve a directory installed next to the shared object that contains
+ * \p self, writing "<libdir>/<subdir>" into \p buf.
+ *
+ * The configure-time prefix names the build host's staging tree, which does
+ * not exist where the library is actually installed, so a driver directory
+ * must be derived at runtime from the loading library's own on-disk path.
+ * Falls back to \p subdir relative to the current directory when the library
+ * path cannot be determined (e.g. a statically linked caller).
+ */
+const char *
+loader_get_sibling_dir(const void *self, const char *subdir,
+                       char *buf, size_t buf_size)
+{
+   Dl_info info;
+   const char *slash;
+
+   if (buf_size == 0)
+      return NULL;
+
+   if (dladdr(self, &info) && info.dli_fname &&
+       (slash = strrchr(info.dli_fname, '/')) &&
+       snprintf(buf, buf_size, "%.*s/%s", (int)(slash - info.dli_fname),
+                info.dli_fname, subdir) < (int)buf_size)
+      return buf;
+
+   if (snprintf(buf, buf_size, "%s", subdir) < (int)buf_size)
+      return buf;
+
+   return NULL;
+}
+
 /**
  * Opens a driver or backend using its name, returning the library handle.
  *

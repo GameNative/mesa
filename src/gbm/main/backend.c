@@ -108,9 +108,13 @@ backend_create_device(const struct gbm_backend_desc *bd, int fd)
 static struct gbm_device *
 load_backend_by_name(const char *name, int fd, bool warn_on_fail)
 {
+   char backend_dir[PATH_MAX];
+   const char *search_path =
+      loader_get_sibling_dir(&load_backend_by_name, "gbm",
+                             backend_dir, sizeof(backend_dir));
    void *lib = loader_open_driver_lib(name, BACKEND_LIB_SUFFIX,
                                       backend_search_path_vars,
-                                      DEFAULT_BACKENDS_PATH,
+                                      search_path,
                                       warn_on_fail);
 
    if (!lib)

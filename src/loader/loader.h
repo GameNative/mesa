@@ -67,6 +67,22 @@ loader_open_driver_lib(const char *driver_name,
                        const char *default_search_path,
                        bool warn_on_fail);
 
+/**
+ * Resolve a directory installed next to the shared object that contains
+ * \p self, into \p buf as "<libdir>/<subdir>".
+ *
+ * Configure-time prefixes (DEFAULT_BACKENDS_PATH, dri_drivers_path, ...) name
+ * the build host's staging tree, which does not exist where the library is
+ * actually installed.  Callers that need a driver directory should pass the
+ * address of a function defined in their own shared object here so the
+ * directory is derived at runtime from that object's on-disk location.
+ *
+ * \return buf, or NULL if \p subdir alone would not fit in \p buf.
+ */
+const char *
+loader_get_sibling_dir(const void *self, const char *subdir,
+                       char *buf, size_t buf_size);
+
 char *
 loader_get_device_name_for_fd(int fd);
 

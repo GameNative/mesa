@@ -131,7 +131,13 @@ if with_egl
   subdir('egl')
 endif
 if with_gallium and with_gbm
-  if with_glx == 'dri' or with_platform_x11 or with_platform_xcb
+  # The DRI/GBM driver megadriver (targets/dril) is normally only pulled in
+  # for GLX-DRI or an X11/XCB platform.  A minimal GBM+EGL build (Xwayland
+  # glamor) has neither, yet still needs dri/zink_dri.so, dri/softpipe_dri.so,
+  # ... — they are what libEGL_mesa/libgbm dlopen at runtime.  Gate on
+  # with_gbm too so such a build installs them.  (Builds that disable GBM,
+  # e.g. the Vulkan-wrapper build, are unaffected.)
+  if with_glx == 'dri' or with_platform_x11 or with_platform_xcb or with_gbm
     subdir('gallium/targets/dril')
   endif
 endif

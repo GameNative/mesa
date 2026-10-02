@@ -10,9 +10,6 @@ files_gbm = files(
   'main/gbm.h',
   'main/gbmint.h',
 )
-args_gbm = [
-  '-DDEFAULT_BACKENDS_PATH="@0@"'.format(gbm_backends_path),
-]
 incs_gbm = [include_directories('main'), inc_loader, inc_gallium]
 
 if with_dri2
@@ -29,7 +26,6 @@ libgbm = shared_library(
   libgbm_name,
   files_gbm,
   include_directories : incs_gbm,
-  c_args : [args_gbm],
   link_args : [ld_args_gc_sections],
   link_with : [libloader],
   dependencies : [dep_libdrm, idep_xmlconfig],
