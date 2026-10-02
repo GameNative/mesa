@@ -30,6 +30,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdbool.h>
 
 #ifdef MAJOR_IN_MKDEV
 #include <sys/mkdev.h>
@@ -40,6 +41,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <errno.h>
+#include <xf86drm.h>
 
 #include "gbm.h"
 #include "gbmint.h"
@@ -112,6 +114,47 @@ gbm_device_destroy(struct gbm_device *gbm)
    _gbm_device_destroy(gbm);
 }
 
+/**
+ * Decide whether a fd can be a GBM device.
+ *
+ * Normally this is a DRM character device (S_IFCHR).  gndrm (GameNative
+ * userspace DRM) is different: its render-node fd is a Unix socket served by
+ * our daemon through libgndrm_shim.so, an LD_PRELOAD ioctl interceptor, so
+ * fstat() reports S_IFSOCK with st_rdev == 0.  Every probe that keys off
+ * st_mode/st_rdev (drmGetDevice2, the /sys/dev/char/ lookups) fails on it, yet
+ * the shim does forward DRM_IOCTL_VERSION and the daemon names the device
+ * "gamenative" (gndrm-daemon's DRIVER_NAME).  Accept such an fd here;
+ * otherwise gbm_create_device() bails before the backend runs and Xwayland
+ * glamor logs "couldn't create gbm device" and disables itself.
+ *
+ * GNDRM_DRM_NAME overrides the expected device name (default "gamenative").
+ */
+static bool
+gbm_fd_is_device(int fd)
+{
+   struct stat buf;
+
+   if (fd < 0 || fstat(fd, &buf) < 0)
+      return false;
+
+   if (S_ISCHR(buf.st_mode))
+      return true;
+
+   const char *want = getenv("GNDRM_DRM_NAME");
+   if (!want || !*want)
+      want = "gamenative";
+
+   drmVersionPtr version = drmGetVersion(fd);
+   if (!version)
+      return false;
+
+   bool match = version->name_len == (int)strlen(want) &&
+                strncmp(version->name, want, version->name_len) == 0;
+
+   drmFreeVersion(version);
+   return match;
+}
+
 /** Create a gbm device for allocating buffers
  *
  * The file descriptor passed in is used by the backend to communicate with
@@ -128,9 +171,8 @@ GBM_EXPORT struct gbm_device *
 gbm_create_device(int fd)
 {
    struct gbm_device *gbm = NULL;
-   struct stat buf;
 
-   if (fd < 0 || fstat(fd, &buf) < 0 || !S_ISCHR(buf.st_mode)) {
+   if (!gbm_fd_is_device(fd)) {
       errno = EINVAL;
       return NULL;
    }

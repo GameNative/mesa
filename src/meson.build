@@ -161,7 +161,11 @@ if with_egl
   subdir('egl')
 endif
 if with_gallium
-  if with_glx == 'dri' or with_platform_x11
+  # The DRI megadriver (targets/dril) is normally only built for GLX-DRI or an
+  # X11 platform. A minimal GBM+EGL build (Xwayland glamor) has neither, but
+  # the packaged stack still ships lib/dri/libdril_dri.so next to libgallium,
+  # so build it whenever GBM is enabled too.
+  if with_glx == 'dri' or with_platform_x11 or with_gbm
     subdir('gallium/targets/dril')
   endif
 endif

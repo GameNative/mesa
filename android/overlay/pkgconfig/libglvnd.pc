@@ -1,0 +1,6 @@
+# Overlay libglvnd.pc — header-only vendor interface.  Cflags intentionally
+# empty; see libdrm.pc in this directory for why.
+Name: libglvnd
+Description: Vendor-neutral OpenGL dispatch library vendor interface
+Version: 1.7.0
+Cflags:

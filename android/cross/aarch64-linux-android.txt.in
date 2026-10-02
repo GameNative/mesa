@@ -1,0 +1,59 @@
+# Meson cross file template: aarch64-linux-android (API 28) against the aarch64
+# termux prefix (build-time sysroot for libdrm / libglvnd / Vulkan headers).
+#
+# This file is a template. android/build-mesa-glamor.sh fills in the NDK binary
+# directory, the termux prefix and this tree's own path, then writes the result to
+# android/cross/aarch64-linux-android.txt, which is the file `--cross-file`
+# names in that script. Generate it through the script rather than editing the
+# output.
+#
+# NOTE: [host_machine] system is 'linux', NOT 'android', on purpose.  With
+# system == 'android' Mesa would build the Android platform (gralloc/AHardware-
+# Buffer EGL platform, libgbm_mesa, ...) which Xwayland's glamor does not use.
+# We want the plain Linux "drm" GBM backend so EGL gains EGL_PLATFORM_GBM_KHR
+# (src/egl/drivers/dri2/platform_drm.c, compiled for `-Dgbm=enabled` and
+# `not with_platform_android`).  The NDK clang still defines __ANDROID__ so the
+# C sources take their Android code paths (memfd via syscall, zink dlopens
+# "libvulkan.so", ...).
+
+[binaries]
+c          = '@NDK_BIN@/aarch64-linux-android28-clang'
+cpp        = '@NDK_BIN@/aarch64-linux-android28-clang++'
+ar         = '@NDK_BIN@/llvm-ar'
+strip      = '@NDK_BIN@/llvm-strip'
+nm         = '@NDK_BIN@/llvm-nm'
+pkg-config = 'pkg-config'
+# host (build-machine) tools — never the aarch64 ones from the prefix
+bison      = '/usr/bin/bison'
+flex       = '/usr/bin/flex'
+
+[host_machine]
+system     = 'linux'
+cpu_family = 'aarch64'
+cpu        = 'armv8-a'
+endian     = 'little'
+
+[built-in options]
+c_args   = ['-g0', '-O2', '-fPIC', '-DANDROID',
+            '-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES',
+            '-I@REPO_DIR@/android/overlay/include',
+            '-idirafter', '@DEPS@/include',
+            '-idirafter', '@DEPS@/include/libdrm']
+cpp_args = ['-g0', '-O2', '-fPIC', '-DANDROID',
+            '-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES',
+            '-I@REPO_DIR@/android/overlay/include',
+            '-idirafter', '@DEPS@/include',
+            '-idirafter', '@DEPS@/include/libdrm']
+c_link_args   = ['-L@DEPS@/lib',
+                 '-Wl,-z,max-page-size=16384',
+                 '-llog', '-lsync']
+cpp_link_args = ['-L@DEPS@/lib',
+                 '-Wl,-z,max-page-size=16384',
+                 '-llog', '-lsync',
+                 '-static-libstdc++']
+
+[properties]
+# Overlay pkg-config only: the prefix's own .pc files add -I${includedir}
+# ahead of the NDK/libc++ paths and break C++ (see overlay/pkgconfig/*.pc).
+# The prefix's headers are reached via the -idirafter in c_args instead.
+pkg_config_libdir = ['@REPO_DIR@/android/overlay/pkgconfig']

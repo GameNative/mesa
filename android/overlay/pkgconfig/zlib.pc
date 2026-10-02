@@ -1,0 +1,7 @@
+# Overlay zlib.pc — links against bionic's libz (always present on-android).
+# Cflags intentionally empty; see libdrm.pc in this directory for why.
+Name: zlib
+Description: zlib compression library
+Version: 1.3.1
+Libs: -lz
+Cflags:
