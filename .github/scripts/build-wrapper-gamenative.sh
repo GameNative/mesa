@@ -69,8 +69,8 @@ termux_dir = '$TERMUX_PREFIX'
 pkg_config_libdir = termux_dir + '/lib/pkgconfig:' + termux_dir + '/share/pkgconfig'
 
 [built-in options]
-c_args = ['-D__TERMUX__', '-D__USE_GNU', '-U__ANDROID__', '-I' + termux_dir + '/include', '-include', 'fcntl.h', '-include', 'unistd.h']
-cpp_args = ['-D__TERMUX__', '-D__USE_GNU', '-U__ANDROID__', '-I' + termux_dir + '/include', '-include', 'fcntl.h', '-include', 'unistd.h']
+c_args = ['-D__ANDROID_UNAVAILABLE_SYMBOLS_ARE_WEAK__', '-D__TERMUX__', '-D__USE_GNU', '-U__ANDROID__', '-I' + termux_dir + '/include', '-include', 'fcntl.h', '-include', 'unistd.h']
+cpp_args = ['-D__ANDROID_UNAVAILABLE_SYMBOLS_ARE_WEAK__', '-D__TERMUX__', '-D__USE_GNU', '-U__ANDROID__', '-I' + termux_dir + '/include', '-include', 'fcntl.h', '-include', 'unistd.h']
 c_link_args = ['-L' + termux_dir + '/lib', '-landroid-shmem']
 cpp_link_args = ['-L' + termux_dir + '/lib', '-landroid-shmem']
 
