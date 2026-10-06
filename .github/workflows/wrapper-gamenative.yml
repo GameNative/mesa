@@ -1,0 +1,81 @@
+name: wrapper-gamenative package
+
+on:
+  workflow_dispatch:
+    inputs:
+      ndk:
+        description: Android NDK version for libvulkan_wrapper.so
+        default: r29
+      adrenotools_ndk:
+        description: Android NDK version for libadrenotools and hook libraries
+        default: r28c
+  pull_request:
+  push:
+    branches: [gamenative-ci]
+    tags: ["wrapper-*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    outputs:
+      tzst_name: ${{ steps.build.outputs.tzst_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build cmake pkg-config flex bison glslang-tools zstd file unzip
+          python3 -m pip install --user --upgrade meson mako pyyaml packaging
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Cache NDKs
+        uses: actions/cache@v4
+        with:
+          path: work/android-ndk-*
+          key: ndk-${{ inputs.ndk || 'r29' }}-${{ inputs.adrenotools_ndk || 'r28c' }}
+
+      - name: Build and package
+        id: build
+        env:
+          NDK_VERSION: ${{ inputs.ndk || 'r29' }}
+          ADRENOTOOLS_NDK_VERSION: ${{ inputs.adrenotools_ndk || 'r28c' }}
+        run: ./.github/scripts/build-wrapper-gamenative.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.build.outputs.tzst_name }}
+          path: |
+            out/${{ steps.build.outputs.tzst_name }}
+            out/${{ steps.build.outputs.tzst_name }}.sha256
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libvulkan_wrapper-unstripped
+          path: out/libvulkan_wrapper.so.unstripped
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/wrapper-')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.tzst_name }}
+          path: dist
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --notes "Built from ${GITHUB_SHA}. Install: upload dist/${{ needs.build.outputs.tzst_name }} to downloads.gamenative.app/graphics_driver/ and point the wrapper-gamenative entry in graphics_driver_download.json at it."
