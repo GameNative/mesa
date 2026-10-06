@@ -38,14 +38,16 @@ termux_sysroot() {
     mkdir -p "$dl"
     curl -fsSL --retry 3 "$TERMUX_REPO/dists/stable/main/binary-aarch64/Packages" > "$dl/Packages"
     sudo mkdir -p "$TERMUX_PREFIX"
+    sudo chown -R "$(id -u):$(id -g)" /data
     local pkg path
     for pkg in $TERMUX_PACKAGES; do
         path=$(awk -v p="Package: $pkg" '$0==p{f=1} f && /^Filename:/{print $2; exit}' "$dl/Packages")
         [ -n "$path" ] || die "Termux package not found: $pkg"
         log "  $path"
         curl -fsSL --retry 3 -o "$dl/$(basename "$path")" "$TERMUX_REPO/$path"
-        sudo dpkg-deb -x "$dl/$(basename "$path")" /
+        dpkg-deb -x "$dl/$(basename "$path")" /
     done
+    chmod -R u+rwX,go+rX /data
 }
 
 build_wrapper() {
