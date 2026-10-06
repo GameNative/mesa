@@ -109,7 +109,8 @@ build_adrenotools() {
         -DANDROID_PLATFORM="android-$ANDROID_API" \
         -DANDROID_STL=c++_shared \
         -DCMAKE_BUILD_TYPE=Release \
-        -DBUILD_SHARED_LIBS=ON
+        -DBUILD_SHARED_LIBS=ON \
+        -DCMAKE_SHARED_LINKER_FLAGS=-llog
     cmake --build "$build" --target adrenotools hook_impl main_hook file_redirect_hook gsl_alloc_hook
     ADRENOTOOLS_BUILD="$build"
 }
