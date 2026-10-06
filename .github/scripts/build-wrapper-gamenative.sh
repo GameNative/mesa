@@ -45,8 +45,9 @@ termux_sysroot() {
         [ -n "$path" ] || die "Termux package not found: $pkg"
         log "  $path"
         curl -fsSL --retry 3 -o "$dl/$(basename "$path")" "$TERMUX_REPO/$path"
-        dpkg-deb -x "$dl/$(basename "$path")" /
+        dpkg-deb -x "$dl/$(basename "$path")" "$dl/root"
     done
+    cp -a "$dl/root/data/." /data/
     chmod -R u+rwX,go+rX /data
 }
 
