@@ -1,0 +1,52 @@
+name: Upstream sync
+
+on:
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+  push:
+    branches: [gamenative-ci]
+    paths: [.github/workflows/upstream-sync.yml]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: wrapper-25
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
+
+      - name: Mirror Pipetto-crypto/mesa wrapper-25 to upstream-main
+        run: |
+          git fetch --no-tags https://github.com/Pipetto-crypto/mesa.git wrapper-25
+          git push --force origin FETCH_HEAD:refs/heads/upstream-main
+          git fetch --no-tags origin +upstream-main:refs/remotes/origin/upstream-main
+
+      - name: Open or update the sync PR
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN || github.token }}
+        run: |
+          count=$(git rev-list --count origin/wrapper-25..origin/upstream-main)
+          if [ "$count" -eq 0 ]; then
+            echo "wrapper-25 already contains upstream-main"
+            exit 0
+          fi
+          head=$(git rev-parse --short origin/upstream-main)
+          subject=$(git log -1 --format=%s origin/upstream-main)
+          body=$(printf 'upstream-main (Pipetto-crypto/mesa wrapper-25) has %s commits that are not in wrapper-25.\n\nNewest upstream commit: %s %s\n\nMerge this PR with a merge commit (not squash or rebase) so that wrapper-25 keeps the upstream history.' "$count" "$head" "$subject")
+          pr=$(gh pr list --head upstream-main --base wrapper-25 --state open --json number --jq '.[0].number')
+          if [ -n "$pr" ]; then
+            gh pr edit "$pr" --body "$body"
+          else
+            gh pr create --head upstream-main --base wrapper-25 --title "Sync with Pipetto-crypto/mesa wrapper-25" --body "$body"
+          fi
