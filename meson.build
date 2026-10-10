@@ -2430,3 +2430,4 @@ summary(perfetto_summary, section: 'Perfetto', bool_yn: true, list_sep: ' ')
 
 teflon_summary = {'Enabled': with_teflon}
 summary(teflon_summary, section: 'Teflon (TensorFlow Lite delegate)', bool_yn: true, list_sep: ' ')
+
