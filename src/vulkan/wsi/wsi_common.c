@@ -1496,6 +1496,15 @@ wsi_common_queue_present(const struct wsi_device *wsi,
 {
    struct vk_device *dev = vk_device_from_handle(device);
    uint32_t current_frame = p_atomic_fetch_add(&dev->current_frame, 1);
+   /* Bound startup diagnostics so a successful run cannot flood the report.
+    * Log before calls too: Wine may catch a native fault before VkResult is
+    * returned, leaving only its loader-thunk assertion in the game log.
+    */
+   const bool diagnose = current_frame < 4;
+   if (diagnose)
+      fprintf(stderr, "WSI present diagnostic: frame=%u family=%d chains=%u waits=%u stage=trace\n",
+              current_frame, queue_family_index, pPresentInfo->swapchainCount,
+              pPresentInfo->waitSemaphoreCount);
    VkResult final_result = handle_trace(queue, dev, current_frame);
 
    STACK_ARRAY(VkPipelineStageFlags, stage_flags,
@@ -1516,6 +1525,12 @@ wsi_common_queue_present(const struct wsi_device *wsi,
       VK_FROM_HANDLE(wsi_swapchain, swapchain, pPresentInfo->pSwapchains[i]);
       uint32_t image_index = pPresentInfo->pImageIndices[i];
       VkResult result;
+      const char *stage = "present-mode";
+      if (diagnose)
+         fprintf(stderr, "WSI present diagnostic: frame=%u chain=%u image=%u count=%u blit=%u explicit=%u stage=%s\n",
+                 current_frame, i, image_index, swapchain->image_count,
+                 (unsigned)swapchain->blit.type,
+                 (unsigned)swapchain->image_info.explicit_sync, stage);
 
       /* Update the present mode for this present and any subsequent present.
        * Only update the present mode when MESA_VK_WSI_PRESENT_MODE is not used.
@@ -1527,6 +1542,9 @@ wsi_common_queue_present(const struct wsi_device *wsi,
       }
 
       if (swapchain->fences[image_index] == VK_NULL_HANDLE) {
+         stage = "create-fence";
+         if (diagnose)
+            fprintf(stderr, "WSI present diagnostic: frame=%u stage=%s\n", current_frame, stage);
          const VkFenceCreateInfo fence_info = {
             .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
             .pNext = NULL,
@@ -1540,6 +1558,9 @@ wsi_common_queue_present(const struct wsi_device *wsi,
 
          if (swapchain->blit.type != WSI_SWAPCHAIN_NO_BLIT &&
              swapchain->blit.queue != VK_NULL_HANDLE) {
+            stage = "create-blit-semaphore";
+            if (diagnose)
+               fprintf(stderr, "WSI present diagnostic: frame=%u stage=%s\n", current_frame, stage);
             const VkSemaphoreCreateInfo sem_info = {
                .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
                .pNext = NULL,
@@ -1553,6 +1574,9 @@ wsi_common_queue_present(const struct wsi_device *wsi,
          }
       } else {
          MESA_TRACE_SCOPE("throttle");
+         stage = "wait-fence";
+         if (diagnose)
+            fprintf(stderr, "WSI present diagnostic: frame=%u stage=%s\n", current_frame, stage);
          result =
             wsi->WaitForFences(device, 1, &swapchain->fences[image_index],
                                true, ~0ull);
@@ -1560,6 +1584,9 @@ wsi_common_queue_present(const struct wsi_device *wsi,
             goto fail_present;
       }
 
+      stage = "reset-fence";
+      if (diagnose)
+         fprintf(stderr, "WSI present diagnostic: frame=%u stage=%s\n", current_frame, stage);
       result = wsi->ResetFences(device, 1, &swapchain->fences[image_index]);
       if (result != VK_SUCCESS)
          goto fail_present;
@@ -1600,6 +1627,9 @@ wsi_common_queue_present(const struct wsi_device *wsi,
             submit_info.pSignalSemaphores =
                &swapchain->blit.semaphores[image_index];
 
+            stage = "blit-handoff-submit";
+            if (diagnose)
+               fprintf(stderr, "WSI present diagnostic: frame=%u stage=%s\n", current_frame, stage);
             result = wsi->QueueSubmit(queue, 1, &submit_info, VK_NULL_HANDLE);
             if (result != VK_SUCCESS)
                goto fail_present;
@@ -1650,6 +1680,9 @@ wsi_common_queue_present(const struct wsi_device *wsi,
          __vk_append_struct(&submit_info, &timeline_submit_info);
       } else {
 #ifdef HAVE_LIBDRM
+         stage = "prepare-dma-buf";
+         if (diagnose)
+            fprintf(stderr, "WSI present diagnostic: frame=%u stage=%s\n", current_frame, stage);
          result = wsi_prepare_signal_dma_buf_from_semaphore(swapchain, image);
          if (result == VK_SUCCESS) {
             assert(submit_info.signalSemaphoreCount == 0);
@@ -1678,6 +1711,11 @@ wsi_common_queue_present(const struct wsi_device *wsi,
          }
       }
 
+      stage = "present-submit";
+      if (diagnose)
+         fprintf(stderr, "WSI present diagnostic: frame=%u stage=%s commands=%u waits=%u signals=%u\n",
+                 current_frame, stage, submit_info.commandBufferCount,
+                 submit_info.waitSemaphoreCount, submit_info.signalSemaphoreCount);
       result = wsi->QueueSubmit(submit_queue, 1, &submit_info, fence);
       if (result != VK_SUCCESS)
          goto fail_present;
@@ -1690,6 +1728,9 @@ wsi_common_queue_present(const struct wsi_device *wsi,
       if (!explicit_sync) {
 #ifdef HAVE_LIBDRM
          if (has_signal_dma_buf) {
+            stage = "signal-dma-buf";
+            if (diagnose)
+               fprintf(stderr, "WSI present diagnostic: frame=%u stage=%s\n", current_frame, stage);
             result = wsi_signal_dma_buf_from_semaphore(swapchain, image);
             if (result != VK_SUCCESS)
                goto fail_present;
@@ -1699,6 +1740,10 @@ wsi_common_queue_present(const struct wsi_device *wsi,
 #endif
       }
 
+      stage = "sync-fence";
+      if (diagnose)
+         fprintf(stderr, "WSI present diagnostic: frame=%u stage=%s enabled=%u\n",
+                 current_frame, stage, (unsigned)(wsi->sw || wsi->forcesync));
       if (wsi->sw || wsi->forcesync)
 	      wsi->WaitForFences(device, 1, &swapchain->fences[image_index],
 				 true, ~0ull);
@@ -1715,11 +1760,19 @@ wsi_common_queue_present(const struct wsi_device *wsi,
          present_fence = present_fence_info->pFences[i];
 
       if (present_id || present_fence) {
+         stage = "present-id-submit";
+         if (diagnose)
+            fprintf(stderr, "WSI present diagnostic: frame=%u stage=%s id=%llu fence=%u\n",
+                    current_frame, stage, (unsigned long long)present_id,
+                    (unsigned)(present_fence != VK_NULL_HANDLE));
          result = wsi_signal_present_id_timeline(swapchain, queue, present_id, present_fence);
          if (result != VK_SUCCESS)
             goto fail_present;
       }
 
+      stage = "backend-present";
+      if (diagnose)
+         fprintf(stderr, "WSI present diagnostic: frame=%u stage=%s\n", current_frame, stage);
       result = swapchain->queue_present(swapchain, image_index, present_id, region);
       if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR)
          goto fail_present;
@@ -1730,6 +1783,9 @@ wsi_common_queue_present(const struct wsi_device *wsi,
       }
 
    fail_present:
+      if (diagnose)
+         fprintf(stderr, "WSI present diagnostic: frame=%u chain=%u stage=%s result=%d\n",
+                 current_frame, i, stage, result);
       if (pPresentInfo->pResults != NULL)
          pPresentInfo->pResults[i] = result;
 
@@ -1749,6 +1805,8 @@ wsi_QueuePresentKHR(VkQueue _queue, const VkPresentInfoKHR *pPresentInfo)
    MESA_TRACE_FUNC();
    VK_FROM_HANDLE(vk_queue, queue, _queue);
 
+   if (p_atomic_read(&queue->base.device->current_frame) < 4)
+      fprintf(stderr, "WSI present diagnostic: entry family=%u\n", queue->queue_family_index);
    return wsi_common_queue_present(queue->base.device->physical->wsi_device,
                                    vk_device_to_handle(queue->base.device),
                                    _queue,
