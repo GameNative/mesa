@@ -19,6 +19,47 @@
 #include "vk_util.h"
 #include "util/list.h"
 #include "util/simple_mtx.h"
+#include "util/u_atomic.h"
+#include "util/os_time.h"
+
+/* Temporary startup diagnostic: no feature, timeout, or submission changes.
+ * Bound the capture and retain matching end markers for every logged begin,
+ * even if another thread exhausts the budget while the call is in flight. */
+static unsigned flush_trace_count;
+
+static unsigned
+wrapper_flush_trace_begin(const char *op, const void *object, uint32_t count,
+                          uint64_t timeout)
+{
+   if (p_atomic_read(&flush_trace_count) >= 256)
+      return 0;
+   unsigned id = p_atomic_inc_return(&flush_trace_count);
+   if (id > 256)
+      return 0;
+   fprintf(stderr, "[WRAPPER_FLUSH] pid=%u id=%u us=%llu begin %s object=%p count=%u timeout=%llu\n",
+           (unsigned)getpid(), id, (unsigned long long)os_time_get(), op,
+           object, count, (unsigned long long)timeout);
+   if (id == 256)
+      fprintf(stderr, "[WRAPPER_FLUSH] pid=%u capture limit reached; no further begin markers\n",
+              (unsigned)getpid());
+   return id;
+}
+
+static void
+wrapper_flush_trace_end(unsigned id, VkResult result)
+{
+   if (id)
+      fprintf(stderr, "[WRAPPER_FLUSH] pid=%u id=%u us=%llu end result=%d\n",
+              (unsigned)getpid(), id, (unsigned long long)os_time_get(), result);
+}
+
+static void
+wrapper_flush_trace_dispatch(unsigned id)
+{
+   if (id)
+      fprintf(stderr, "[WRAPPER_FLUSH] pid=%u id=%u us=%llu dispatch\n",
+              (unsigned)getpid(), id, (unsigned long long)os_time_get());
+}
 
 const struct vk_device_extension_table wrapper_device_extensions =
 {
@@ -476,13 +517,58 @@ VKAPI_ATTR VkResult VKAPI_CALL
 wrapper_DeviceWaitIdle(VkDevice _device)
 {
    VK_FROM_HANDLE(wrapper_device, device, _device);
-   if (!device->query_reset_queue)
-      return device->dispatch_table.DeviceWaitIdle(device->dispatch_handle);
+   unsigned trace = wrapper_flush_trace_begin("DeviceWaitIdle", device, 0, 0);
+   if (!device->query_reset_queue) {
+      wrapper_flush_trace_dispatch(trace);
+      VkResult result = device->dispatch_table.DeviceWaitIdle(device->dispatch_handle);
+      wrapper_flush_trace_end(trace, result);
+      return result;
+   }
 
    simple_mtx_lock(&device->query_reset_mutex);
+   wrapper_flush_trace_dispatch(trace);
    VkResult result = vk_device_is_lost(&device->vk) ? VK_ERROR_DEVICE_LOST :
       device->dispatch_table.DeviceWaitIdle(device->dispatch_handle);
    simple_mtx_unlock(&device->query_reset_mutex);
+   wrapper_flush_trace_end(trace, result);
+   return result;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+wrapper_QueueWaitIdle(VkQueue _queue)
+{
+   VK_FROM_HANDLE(wrapper_queue, queue, _queue);
+   unsigned trace = wrapper_flush_trace_begin("QueueWaitIdle", queue, 0, 0);
+   VkResult result = queue->device->dispatch_table.QueueWaitIdle(queue->dispatch_handle);
+   wrapper_flush_trace_end(trace, result);
+   return result;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+wrapper_WaitSemaphores(VkDevice _device, const VkSemaphoreWaitInfo *info,
+                       uint64_t timeout)
+{
+   VK_FROM_HANDLE(wrapper_device, device, _device);
+   unsigned trace = wrapper_flush_trace_begin("WaitSemaphores", device,
+                                              info->semaphoreCount, timeout);
+   VkResult result = device->dispatch_table.WaitSemaphores(device->dispatch_handle,
+                                                          info, timeout);
+   wrapper_flush_trace_end(trace, result);
+   return result;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+wrapper_CreateComputePipelines(VkDevice _device, VkPipelineCache cache,
+                               uint32_t count,
+                               const VkComputePipelineCreateInfo *infos,
+                               const VkAllocationCallbacks *allocator,
+                               VkPipeline *pipelines)
+{
+   VK_FROM_HANDLE(wrapper_device, device, _device);
+   unsigned trace = wrapper_flush_trace_begin("CreateComputePipelines", device, count, 0);
+   VkResult result = device->dispatch_table.CreateComputePipelines(
+      device->dispatch_handle, cache, count, infos, allocator, pipelines);
+   wrapper_flush_trace_end(trace, result);
    return result;
 }
 
@@ -1425,6 +1511,12 @@ if (pdf2 && pdf2->features.f) { \
    wrapper_emit_diag(physical_device, pCreateInfo, VK_SUCCESS);
 
    *pDevice = wrapper_device_to_handle(device);
+
+   fprintf(stderr, "[WRAPPER_FLUSH] pid=%u diagnostic-v1 ready device=%p baseApi=%u timeline=%u sync2=%u\n",
+           (unsigned)getpid(), (void *)device,
+           physical_device->properties2.properties.apiVersion,
+           physical_device->base_supported_features.timelineSemaphore,
+           physical_device->base_supported_features.synchronization2);
 
    return VK_SUCCESS;
 }
@@ -3318,9 +3410,12 @@ wrapper_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
       driver_infos = legacy;
    }
 
+   unsigned trace = wrapper_flush_trace_begin("CreateGraphicsPipelines", device,
+                                              createInfoCount, 0);
    VkResult result = device->dispatch_table.CreateGraphicsPipelines(
       device->dispatch_handle, pipelineCache, createInfoCount, driver_infos,
       pAllocator, pPipelines);
+   wrapper_flush_trace_end(trace, result);
 
    if (render_passes) {
       for (uint32_t i = 0; i < createInfoCount; i++) {
@@ -3525,6 +3620,7 @@ wrapper_QueueSubmit(VkQueue _queue, uint32_t submitCount,
    if (queue->device->query_reset_queue && vk_device_is_lost(&queue->device->vk))
       return VK_ERROR_DEVICE_LOST;
    const bool serialise = wrapper_query_reset_owns_queue(queue);
+   unsigned trace = wrapper_flush_trace_begin("QueueSubmit", queue, submitCount, 0);
    VkSubmitInfo wrapper_submits[submitCount];
    VkCommandBuffer *command_buffers;
    VkResult result;
@@ -3548,6 +3644,7 @@ wrapper_QueueSubmit(VkQueue _queue, uint32_t submitCount,
 
    if (serialise)
       simple_mtx_lock(&queue->device->query_reset_mutex);
+   wrapper_flush_trace_dispatch(trace);
    result = queue->device->dispatch_table.QueueSubmit(
       queue->dispatch_handle, submitCount, wrapper_submits, fence);
    if (serialise)
@@ -3559,6 +3656,7 @@ wrapper_QueueSubmit(VkQueue _queue, uint32_t submitCount,
    for (int i = 0; i < submitCount; i++)
       free((void *)wrapper_submits[i].pCommandBuffers);
 
+   wrapper_flush_trace_end(trace, result);
    return result;
 }
 
@@ -3570,6 +3668,7 @@ wrapper_QueueSubmit2(VkQueue _queue, uint32_t submitCount,
    if (queue->device->query_reset_queue && vk_device_is_lost(&queue->device->vk))
       return VK_ERROR_DEVICE_LOST;
    const bool serialise = wrapper_query_reset_owns_queue(queue);
+   unsigned trace = wrapper_flush_trace_begin("QueueSubmit2", queue, submitCount, 0);
    VkSubmitInfo2 wrapper_submits[submitCount];
    VkCommandBufferSubmitInfo *command_buffers;
    VkResult result;
@@ -3593,6 +3692,7 @@ wrapper_QueueSubmit2(VkQueue _queue, uint32_t submitCount,
 
    if (serialise)
       simple_mtx_lock(&queue->device->query_reset_mutex);
+   wrapper_flush_trace_dispatch(trace);
    if (queue->device->dispatch_table.QueueSubmit2) {
       result = queue->device->dispatch_table.QueueSubmit2(
          queue->dispatch_handle, submitCount, wrapper_submits, fence);
@@ -3755,6 +3855,7 @@ legacy_submit_cleanup:
    for (int i = 0; i < submitCount; i++)
       free((void *)wrapper_submits[i].pCommandBufferInfos);
 
+   wrapper_flush_trace_end(trace, result);
    return result;
 }
 
@@ -3828,8 +3929,10 @@ wrapper_WaitForFences(VkDevice _device,
    VK_FROM_HANDLE(wrapper_device, device, _device);
    VkResult res;
 
+   unsigned trace = wrapper_flush_trace_begin("WaitForFences", device, fenceCount, timeout);
    res = device->dispatch_table.WaitForFences(device->dispatch_handle,
      fenceCount, pFences, waitAll, timeout);
+   wrapper_flush_trace_end(trace, res);
 
    if (res != VK_SUCCESS || device->physical->emulate_bcn < 2)
       return res;
