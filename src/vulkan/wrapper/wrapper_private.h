@@ -61,6 +61,9 @@ struct wrapper_queue {
 
    struct wrapper_device *device;
    VkQueue dispatch_handle;
+   /* Queues are externally synchronized; allocation zeroes these counters. */
+   uint32_t diag_submit_count;
+   uint32_t diag_present_count;
 };
 
 VK_DEFINE_HANDLE_CASTS(wrapper_queue, vk.base, VkQueue,

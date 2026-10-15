@@ -1,7 +1,34 @@
 #include <time.h>
+#include <stdarg.h>
+#include <stdio.h>
+#ifdef __ANDROID__
+#include <android/log.h>
+#endif
 
 #include "wrapper_log.h"
 #include "wrapper_util.h"
+
+void
+wrapper_route_diag(const char *fmt, ...)
+{
+   char line[1024];
+   va_list args;
+   va_start(args, fmt);
+   vsnprintf(line, sizeof(line), fmt, args);
+   va_end(args);
+   fprintf(stderr, "[WRAPPER_ROUTE] pid=%ld %s\n", (long)getpid(), line);
+#ifdef __ANDROID__
+   /* Independent of stdout/stderr redirection and WRAPPER_DIAG propagation. */
+   __android_log_print(ANDROID_LOG_INFO, "WRAPPER_ROUTE", "pid=%ld %s",
+                       (long)getpid(), line);
+#endif
+}
+
+__attribute__((constructor)) static void
+wrapper_route_loaded(void)
+{
+   wrapper_route_diag("build=nophenia-route-v1 library-loaded");
+}
 
 #define PATH_MAX_SIZE 1024
 #define WRAPPER_DIR "/sdcard/wrapper"

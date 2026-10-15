@@ -26,6 +26,10 @@ extern "C" {
 void
 init_wrapper_logging(void);
 
+/* Always-on, bounded call-site diagnostics for this diagnostic package. */
+void
+wrapper_route_diag(const char *fmt, ...);
+
 void                                                                         
 dump_shader_code(const uint32_t *code, size_t size);
 
