@@ -214,8 +214,10 @@ wrapper_EnumerateInstanceExtensionProperties(const char* pLayerName,
    VkResult result;
 
    result = wrapper_vulkan_init();
-   if (result != VK_SUCCESS)
+   if (result != VK_SUCCESS) {
+      wrapper_route_diag("wrapper_vulkan_init result=%d", result);
       return vk_error(NULL, result);
+   }
 
    return vk_enumerate_instance_extension_properties(supported_instance_extensions,
                                                      pPropertyCount,
@@ -255,9 +257,16 @@ wrapper_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
    struct wrapper_instance *instance;
    VkResult result;
 
+   const VkApplicationInfo *app = pCreateInfo->pApplicationInfo;
+   wrapper_route_diag("CreateInstance enter app=%s engine=%s api=0x%x",
+                      app && app->pApplicationName ? app->pApplicationName : "(unset)",
+                      app && app->pEngineName ? app->pEngineName : "(unset)",
+                      app ? app->apiVersion : 0);
    result = wrapper_vulkan_init();
-   if (result != VK_SUCCESS)
+   if (result != VK_SUCCESS) {
+      wrapper_route_diag("CreateInstance init result=%d", result);
       return vk_error(NULL, result);
+   }
 
    instance = vk_zalloc2(vk_default_allocator(), pAllocator, sizeof(*instance),
                          8, VK_SYSTEM_ALLOCATION_SCOPE_INSTANCE);
@@ -380,6 +389,7 @@ wrapper_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
 
    result = create_instance(&wrapper_create_info, pAllocator,
                             &instance->dispatch_handle);
+   wrapper_route_diag("driver CreateInstance result=%d", result);
    if (result != VK_SUCCESS) {
       WRAPPER_LOG(error, "Failed driver createInstance, res %d", result);
       vk_instance_finish(&instance->vk);

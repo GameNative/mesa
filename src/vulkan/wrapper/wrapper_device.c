@@ -1318,9 +1318,17 @@ if (pdf2 && pdf2->features.f) { \
       }
    }
 
+   wrapper_route_diag("CreateDevice enter device=%s driverID=%u app=%s engine=%s",
+                      physical_device->properties2.properties.deviceName,
+                      physical_device->driver_properties.driverID,
+                      physical_device->instance->vk.app_info.app_name ?
+                         physical_device->instance->vk.app_info.app_name : "(unset)",
+                      physical_device->instance->vk.app_info.engine_name ?
+                         physical_device->instance->vk.app_info.engine_name : "(unset)");
    result = physical_device->dispatch_table.CreateDevice(
       physical_device->dispatch_handle, &wrapper_create_info,
          pAllocator, &device->dispatch_handle);
+   wrapper_route_diag("driver CreateDevice result=%d", result);
 
    if (result != VK_SUCCESS) {
       if (wrapper_safe_create_device) {
@@ -1330,6 +1338,7 @@ if (pdf2 && pdf2->features.f) { \
          result = physical_device->dispatch_table.CreateDevice(
             physical_device->dispatch_handle, &wrapper_create_info,
                pAllocator, &device->dispatch_handle);
+         wrapper_route_diag("driver CreateDevice fallback result=%d", result);
       }
       
       if (result != VK_SUCCESS) {
@@ -1423,6 +1432,7 @@ if (pdf2 && pdf2->features.f) { \
    if (bc6h_hdr && !used_fallback_create)
       WRAPPER_LOG(info, "BCn policy: BC6H stored as ASTC 4x4 HDR");
    wrapper_emit_diag(physical_device, pCreateInfo, VK_SUCCESS);
+   wrapper_route_diag("CreateDevice ready device=%p", (void *)device);
 
    *pDevice = wrapper_device_to_handle(device);
 
@@ -3529,6 +3539,16 @@ wrapper_QueueSubmit(VkQueue _queue, uint32_t submitCount,
    VkCommandBuffer *command_buffers;
    VkResult result;
 
+   uint32_t n = queue->diag_submit_count;
+   bool sample = n < 0x80000000u;
+   if (sample) {
+      n = ++queue->diag_submit_count;
+      sample = (n & (n - 1)) == 0;
+   }
+   if (sample)
+      wrapper_route_diag("QueueSubmit enter queue=%p sample=%u batches=%u",
+                         (void *)queue, n, submitCount);
+
    struct wrapper_fence *wf = get_wrapper_fence_from_handle(queue->device, fence);
 
    for (int i = 0; i < submitCount; i++) {
@@ -3559,6 +3579,9 @@ wrapper_QueueSubmit(VkQueue _queue, uint32_t submitCount,
    for (int i = 0; i < submitCount; i++)
       free((void *)wrapper_submits[i].pCommandBuffers);
 
+   if (sample)
+      wrapper_route_diag("QueueSubmit exit queue=%p sample=%u result=%d",
+                         (void *)queue, n, result);
    return result;
 }
 
@@ -3567,6 +3590,15 @@ wrapper_QueueSubmit2(VkQueue _queue, uint32_t submitCount,
                      const VkSubmitInfo2* pSubmits, VkFence fence)
 {
    VK_FROM_HANDLE(wrapper_queue, queue, _queue);
+   uint32_t n = queue->diag_submit_count;
+   bool sample = n < 0x80000000u;
+   if (sample) {
+      n = ++queue->diag_submit_count;
+      sample = (n & (n - 1)) == 0;
+   }
+   if (sample)
+      wrapper_route_diag("QueueSubmit2 enter queue=%p sample=%u batches=%u",
+                         (void *)queue, n, submitCount);
    if (queue->device->query_reset_queue && vk_device_is_lost(&queue->device->vk))
       return VK_ERROR_DEVICE_LOST;
    const bool serialise = wrapper_query_reset_owns_queue(queue);
@@ -3755,6 +3787,41 @@ legacy_submit_cleanup:
    for (int i = 0; i < submitCount; i++)
       free((void *)wrapper_submits[i].pCommandBufferInfos);
 
+   if (sample)
+      wrapper_route_diag("QueueSubmit2 exit queue=%p sample=%u result=%d",
+                         (void *)queue, n, result);
+   return result;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+wrapper_QueuePresentKHR(VkQueue _queue, const VkPresentInfoKHR *pPresentInfo)
+{
+   VK_FROM_HANDLE(wrapper_queue, queue, _queue);
+   uint32_t n = queue->diag_present_count;
+   bool sample = n < 0x80000000u;
+   if (sample) {
+      n = ++queue->diag_present_count;
+      sample = (n & (n - 1)) == 0;
+   }
+   if (sample)
+      wrapper_route_diag("QueuePresent enter queue=%p sample=%u swapchains=%u",
+                         (void *)queue, n, pPresentInfo->swapchainCount);
+
+   /* Identical routing to the original wsi_QueuePresentKHR entrypoint. */
+   VkResult result = wsi_common_queue_present(
+      queue->vk.base.device->physical->wsi_device,
+      vk_device_to_handle(queue->vk.base.device), _queue,
+      queue->vk.queue_family_index, pPresentInfo);
+
+   if (sample) {
+      wrapper_route_diag("QueuePresent exit queue=%p sample=%u result=%d",
+                         (void *)queue, n, result);
+      if (result >= VK_SUCCESS && pPresentInfo->pResults) {
+         for (uint32_t i = 0; i < pPresentInfo->swapchainCount && i < 4; i++)
+            wrapper_route_diag("QueuePresent queue=%p sample=%u swapchain=%u result=%d",
+                               (void *)queue, n, i, pPresentInfo->pResults[i]);
+      }
+   }
    return result;
 }
 
