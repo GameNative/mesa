@@ -66,11 +66,9 @@ wrapper_features = custom_target(
   depend_files: vk_physical_device_features_gen_depend_files,
 )
 
-adrenotools_subproj = subproject('libadrenotools')
-
-adrenotools_dep = declare_dependency(
-  include_directories: adrenotools_subproj.get_variable('adrenotools_inc'),
-  link_with: adrenotools_subproj.get_variable('adrenotools_lib'),
+adrenotools_dep = dependency(
+  'adrenotools',
+  allow_fallback: true,
 )
 
 wrapper_files = files(
