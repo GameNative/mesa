@@ -1,6 +1,6 @@
 [wrap-git]
 url = https://github.com/Pipetto-crypto/libadrenotools.git
-revision = 8483dfdaa2abf97ee89ad0e5f337e7b508550c6b
+revision = 228c36135fcf077538e4f6d74a27a76b463c879b
 depth = 1
 clone-recursive = true
 
