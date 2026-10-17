@@ -201,6 +201,8 @@ static int
 bcn_has_alpha(VkFormat bcn_format)
 {
    switch (bcn_format) {
+   case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
+   case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
    case VK_FORMAT_BC2_UNORM_BLOCK:
    case VK_FORMAT_BC2_SRGB_BLOCK:
    case VK_FORMAT_BC3_UNORM_BLOCK:
@@ -209,7 +211,6 @@ bcn_has_alpha(VkFormat bcn_format)
    case VK_FORMAT_BC7_SRGB_BLOCK:
       return 1;
    default:
-      /* BC1 is treated as opaque (bcdec emits alpha=255). */
       return 0;
    }
 }
@@ -653,9 +654,11 @@ bcn_cache_src_tag(VkFormat format)
    switch (format) {
    case VK_FORMAT_BC1_RGB_UNORM_BLOCK:
    case VK_FORMAT_BC1_RGB_SRGB_BLOCK:
+      return "bc1";
    case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
    case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
-      return "bc1";
+      /* Do not reuse opaque BC1 entries written before alpha was preserved. */
+      return "bc1a";
    case VK_FORMAT_BC2_UNORM_BLOCK:
    case VK_FORMAT_BC2_SRGB_BLOCK:
       return "bc2";
