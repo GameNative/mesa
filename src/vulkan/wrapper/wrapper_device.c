@@ -4456,11 +4456,12 @@ wrapper_bcn_gpu_format_id(VkFormat format)
    switch (format) {
    case VK_FORMAT_BC1_RGB_UNORM_BLOCK:
    case VK_FORMAT_BC1_RGB_SRGB_BLOCK:
-   case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
-   case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
       if (is_astc_6x6(get_format_for_bcn(format)))
          return -1; /* BC1 as ASTC 6x6: CPU only */
       return 0; /* BC1: opaque, single-plane RGB */
+   case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
+   case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
+      return -1; /* The GPU BC1 path drops alpha; use the CPU RGBA encoder. */
    case VK_FORMAT_BC7_UNORM_BLOCK:
    case VK_FORMAT_BC7_SRGB_BLOCK:
       return 1; /* BC7: alpha, dual-plane */
