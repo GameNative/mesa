@@ -85,6 +85,9 @@ struct wrapper_device {
    struct wrapper_physical_device *physical;
    struct vk_device_dispatch_table dispatch_table;
 
+   /* Bounded diagnostics for native command-buffer finalization failures. */
+   uint32_t end_diag_reports; /* protected by resource_mutex */
+
    bool emulate_null_descriptor;
    bool device_fault_enabled;
    bool emulate_imageless_framebuffer;
@@ -211,6 +214,10 @@ struct wrapper_command_buffer {
    struct wrapper_push_pool *push_pools;   /* emulated push-descriptor pools */
    struct list_head dynamic_render_objects;
    bool dynamic_rendering_active;
+   VkCommandBufferUsageFlags diag_begin_flags;
+   uint32_t diag_render_passes;
+   uint32_t diag_direct_draws;
+   VkExtent2D diag_render_extent;
 };
 
 VK_DEFINE_HANDLE_CASTS(wrapper_command_buffer, vk.base, VkCommandBuffer,

@@ -2106,6 +2106,8 @@ wrapper_CmdBeginRenderPass(VkCommandBuffer commandBuffer,
                            VkSubpassContents contents)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   wcb->diag_render_passes++;
+   wcb->diag_render_extent = pRenderPassBegin->renderArea.extent;
    VkRenderPassBeginInfo begin = *pRenderPassBegin;
    VkFramebuffer real;
 
@@ -2125,6 +2127,8 @@ wrapper_CmdBeginRenderPass2(VkCommandBuffer commandBuffer,
                             const VkSubpassBeginInfo *pSubpassBeginInfo)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   wcb->diag_render_passes++;
+   wcb->diag_render_extent = pRenderPassBegin->renderArea.extent;
    struct wrapper_device *device = wcb->device;
    VkRenderPassBeginInfo begin = *pRenderPassBegin;
    VkFramebuffer real;
@@ -2731,6 +2735,10 @@ wrapper_BeginCommandBuffer(VkCommandBuffer commandBuffer,
                           const VkCommandBufferBeginInfo *pBeginInfo)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   wcb->diag_begin_flags = pBeginInfo->flags;
+   wcb->diag_render_passes = 0;
+   wcb->diag_direct_draws = 0;
+   wcb->diag_render_extent = (VkExtent2D){0};
    wrapper_dynamic_render_objects_reset(wcb);
    if (wcb->device->emulate_push_descriptor)
       wrapper_push_pool_reset_all(wcb);
@@ -2746,6 +2754,38 @@ wrapper_EndCommandBuffer(VkCommandBuffer commandBuffer)
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
    VkResult result = wcb->device->dispatch_table.EndCommandBuffer(
       wcb->dispatch_handle);
+   if (result != VK_SUCCESS) {
+      struct wrapper_device *device = wcb->device;
+      uint32_t live_cbs = 0;
+      unsigned long long tracked_bytes = 0;
+      simple_mtx_lock(&device->resource_mutex);
+      /* Do not flood a stalled game's log. This is per device, not per CB. */
+      if (device->end_diag_reports < 8) {
+         device->end_diag_reports++;
+         list_for_each_entry(struct wrapper_command_buffer, cb,
+                             &device->command_buffer_list, link)
+            live_cbs++;
+         list_for_each_entry(struct wrapper_device_memory, mem,
+                             &device->device_memory_list, link)
+            tracked_bytes += mem->alloc_size;
+         const VkPhysicalDeviceProperties *props =
+            &device->physical->properties2.properties;
+         fprintf(stderr,
+            "[WRAPPER_CB_DIAG] native EndCommandBuffer result=%d "
+            "pid=%d cb=%p gpu=%s driver=0x%x flags=0x%x "
+            "render_begins=%u direct_draws=%u last_extent=%ux%u "
+            "live_cbs=%u tracked_device_bytes=%llu "
+            "emulate_push=%u emulate_imageless=%u emulate_core13=%u\n",
+            result, (int)getpid(), (void *)wcb->dispatch_handle,
+            props->deviceName, props->driverVersion, wcb->diag_begin_flags,
+            wcb->diag_render_passes, wcb->diag_direct_draws,
+            wcb->diag_render_extent.width, wcb->diag_render_extent.height,
+            live_cbs, tracked_bytes, device->emulate_push_descriptor,
+            device->emulate_imageless_framebuffer,
+            device->physical->emulate_vulkan13);
+      }
+      simple_mtx_unlock(&device->resource_mutex);
+   }
    return result;
 }
 
@@ -3033,6 +3073,8 @@ wrapper_CmdBeginRendering(VkCommandBuffer commandBuffer,
                           const VkRenderingInfo *pRenderingInfo)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   wcb->diag_render_passes++;
+   wcb->diag_render_extent = pRenderingInfo->renderArea.extent;
    struct wrapper_device *device = wcb->device;
 
 
@@ -3381,6 +3423,7 @@ wrapper_CmdDraw(VkCommandBuffer commandBuffer, uint32_t vertexCount,
                 uint32_t firstInstance)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   wcb->diag_direct_draws++;
    wcb->device->dispatch_table.CmdDraw(wcb->dispatch_handle, vertexCount,
                                        instanceCount, firstVertex, firstInstance);
 }
@@ -3391,6 +3434,7 @@ wrapper_CmdDrawIndexed(VkCommandBuffer commandBuffer, uint32_t indexCount,
                        int32_t vertexOffset, uint32_t firstInstance)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   wcb->diag_direct_draws++;
    wcb->device->dispatch_table.CmdDrawIndexed(
       wcb->dispatch_handle, indexCount, instanceCount, firstIndex,
       vertexOffset, firstInstance);
