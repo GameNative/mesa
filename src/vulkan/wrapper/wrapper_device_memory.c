@@ -562,8 +562,36 @@ wrapper_AllocateMemory(VkDevice _device,
    VkResult result;
 
    wrapper_memory_diag(device, "allocate.enter", pAllocateInfo, 0);
+   /* A failed application-side memory-type search can leave a sentinel here.
+    * Reject it before indexing memoryTypes or forwarding it to the native ICD.
+    * There is no safe replacement type without the resource's requirements.
+    */
+   if (pAllocateInfo->memoryTypeIndex >=
+       device->physical->memory_properties.memoryTypeCount) {
+      *pMemory = VK_NULL_HANDLE;
+      if (wrapper_memory_diag_enabled(device)) {
+         const VkPhysicalDeviceMemoryProperties *props =
+            &device->physical->memory_properties;
+         fprintf(stderr, "[WRAPPER_MEM_DIAG] build=nms-memory-type-guard-2 "
+                 "invalid_type=%u memory_types=%u\n",
+                 pAllocateInfo->memoryTypeIndex, props->memoryTypeCount);
+         for (uint32_t i = 0; i < props->memoryTypeCount; i++) {
+            fprintf(stderr, "[WRAPPER_MEM_DIAG] available_type=%u "
+                    "property_flags=0x%x heap=%u\n", i,
+                    props->memoryTypes[i].propertyFlags,
+                    props->memoryTypes[i].heapIndex);
+         }
+      }
+      wrapper_memory_diag(device, "allocate.reject.invalid_type",
+                          pAllocateInfo, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      return vk_errorf(device, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                       "Invalid memory type index %u (count %u)",
+                       pAllocateInfo->memoryTypeIndex,
+                       device->physical->memory_properties.memoryTypeCount);
+   }
+
    if (wrapper_memory_diag_enabled(device)) {
-      fprintf(stderr, "[WRAPPER_MEM_DIAG] build=nms-allocation-diag-1 backend=%s "
+      fprintf(stderr, "[WRAPPER_MEM_DIAG] build=nms-memory-type-guard-2 backend=%s "
               "placed_feature=%u placed_extension=%u memory_types=%u\n",
               device->physical->resource_type,
               (unsigned)device->vk.enabled_features.memoryMapPlaced,
