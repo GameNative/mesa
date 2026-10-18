@@ -2,6 +2,7 @@
 #include <stdarg.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <stdio.h>
 
 #include "wrapper_private.h"
 #include "wrapper_log.h"
@@ -1450,6 +1451,19 @@ wrapper_buffer_destroy(struct wrapper_device *device,
    vk_object_free(&device->vk, &device->vk.alloc, wb);
 }
 
+static bool
+wrapper_buffer_diag_enabled(struct wrapper_device *device)
+{
+   if (!wrapper_memory_diag_enabled(device))
+      return false;
+
+   /* Bound successful-path logging if startup gets past the failing buffer. */
+   if (__atomic_load_n(&device->buffer_diag_lines, __ATOMIC_RELAXED) >= 256)
+      return false;
+   return __atomic_fetch_add(&device->buffer_diag_lines, 1,
+                             __ATOMIC_RELAXED) < 256;
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 wrapper_CreateBuffer(VkDevice _device,
 					 const VkBufferCreateInfo *pCreateInfo,
@@ -1485,6 +1499,15 @@ wrapper_CreateBuffer(VkDevice _device,
    res = device->dispatch_table.CreateBuffer(device->dispatch_handle,
       pCreateInfo, pAllocator, pBuffer);
 
+   if (wrapper_buffer_diag_enabled(device)) {
+      fprintf(stderr, "[WRAPPER_BUFFER_DIAG] create size=%llu usage=0x%x "
+              "flags=0x%x external=0x%x result=%d buffer=0x%llx\n",
+              (unsigned long long)pCreateInfo->size, pCreateInfo->usage,
+              pCreateInfo->flags, handle_types, res,
+              res == VK_SUCCESS ? (unsigned long long)*pBuffer : 0ull);
+      fflush(stderr);
+   }
+
    if (res != VK_SUCCESS) {
       WRAPPER_LOG(error, "Failed to create buffer, res %d", res);
       return res;
@@ -1514,6 +1537,71 @@ wrapper_CreateBuffer(VkDevice _device,
    return VK_SUCCESS;
 }
 
+static void
+wrapper_buffer_requirements_diag(struct wrapper_device *device, VkBuffer buffer,
+                                 const VkMemoryRequirements *req)
+{
+   if (!wrapper_buffer_diag_enabled(device))
+      return;
+
+   fprintf(stderr, "[WRAPPER_BUFFER_DIAG] requirements buffer=0x%llx "
+           "size=%llu alignment=%llu memory_type_bits=0x%x\n",
+           (unsigned long long)buffer, (unsigned long long)req->size,
+           (unsigned long long)req->alignment, req->memoryTypeBits);
+   fflush(stderr);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wrapper_GetBufferMemoryRequirements(VkDevice _device, VkBuffer buffer,
+                                    VkMemoryRequirements *pMemoryRequirements)
+{
+   VK_FROM_HANDLE(wrapper_device, device, _device);
+   device->dispatch_table.GetBufferMemoryRequirements(device->dispatch_handle,
+                                                      buffer, pMemoryRequirements);
+   wrapper_buffer_requirements_diag(device, buffer, pMemoryRequirements);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wrapper_GetBufferMemoryRequirements2(VkDevice _device,
+                                     const VkBufferMemoryRequirementsInfo2 *pInfo,
+                                     VkMemoryRequirements2 *pMemoryRequirements)
+{
+   VK_FROM_HANDLE(wrapper_device, device, _device);
+   device->dispatch_table.GetBufferMemoryRequirements2(device->dispatch_handle,
+                                                       pInfo, pMemoryRequirements);
+   wrapper_buffer_requirements_diag(device, pInfo->buffer,
+                                     &pMemoryRequirements->memoryRequirements);
+   if (wrapper_buffer_diag_enabled(device)) {
+      const VkMemoryDedicatedRequirements *dedicated = vk_find_struct_const(
+         pMemoryRequirements->pNext, MEMORY_DEDICATED_REQUIREMENTS);
+      if (dedicated) {
+         fprintf(stderr, "[WRAPPER_BUFFER_DIAG] dedicated buffer=0x%llx "
+                 "prefers=%u requires=%u\n", (unsigned long long)pInfo->buffer,
+                 dedicated->prefersDedicatedAllocation,
+                 dedicated->requiresDedicatedAllocation);
+         fflush(stderr);
+      }
+   }
+}
+
+static void
+wrapper_buffer_bind_diag(struct wrapper_device *device, const char *stage,
+                         VkBuffer buffer, VkDeviceMemory memory,
+                         VkDeviceSize offset, VkResult result)
+{
+   if (!wrapper_memory_diag_enabled(device))
+      return;
+   if (memory != VK_NULL_HANDLE && result == VK_SUCCESS &&
+       !wrapper_buffer_diag_enabled(device))
+      return;
+
+   fprintf(stderr, "[WRAPPER_BUFFER_DIAG] build=nms-buffer-bind-3 %s "
+           "buffer=0x%llx memory=0x%llx offset=%llu result=%d\n", stage,
+           (unsigned long long)buffer, (unsigned long long)memory,
+           (unsigned long long)offset, result);
+   fflush(stderr);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 wrapper_BindBufferMemory(VkDevice _device,
 						 VkBuffer buffer,
@@ -1523,8 +1611,20 @@ wrapper_BindBufferMemory(VkDevice _device,
    VK_FROM_HANDLE(wrapper_device, device, _device);
    VkResult res;
 
+   /* A caller may continue after AllocateMemory failed. Never pass the null
+    * output handle to the ICD, and never fabricate a successful binding. */
+   if (memory == VK_NULL_HANDLE) {
+      wrapper_buffer_bind_diag(device, "bind.reject.null_memory", buffer,
+                               memory, memoryOffset, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   }
+
+   wrapper_buffer_bind_diag(device, "bind.native.begin", buffer, memory,
+                            memoryOffset, VK_SUCCESS);
    res = device->dispatch_table.BindBufferMemory(device->dispatch_handle,
       buffer, memory, memoryOffset);
+   wrapper_buffer_bind_diag(device, "bind.native.end", buffer, memory,
+                            memoryOffset, res);
    
    if (res != VK_SUCCESS) {
       WRAPPER_LOG(error, "Failed to bind buffer memory, res %d", res);
@@ -1534,7 +1634,6 @@ wrapper_BindBufferMemory(VkDevice _device,
    struct wrapper_buffer *wb = get_wrapper_buffer_from_handle(device, buffer);
    if (wb == NULL) {
       WRAPPER_LOG(error, "Failed to query wrapper_buffer");
-      simple_mtx_unlock(&device->resource_mutex);
       return VK_ERROR_INITIALIZATION_FAILED;
    }
 
@@ -1552,8 +1651,28 @@ wrapper_BindBufferMemory2(VkDevice _device,
    VK_FROM_HANDLE(wrapper_device, device, _device);
    VkResult res;
 
+   /* Validate the entire batch before the ICD can bind any of its buffers. */
+   for (uint32_t i = 0; i < bindInfoCount; i++) {
+      if (pBindInfos[i].memory == VK_NULL_HANDLE) {
+         wrapper_buffer_bind_diag(device, "bind2.reject.null_memory",
+                                  pBindInfos[i].buffer, pBindInfos[i].memory,
+                                  pBindInfos[i].memoryOffset,
+                                  VK_ERROR_OUT_OF_DEVICE_MEMORY);
+         return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+      }
+   }
+   for (uint32_t i = 0; i < bindInfoCount; i++)
+      wrapper_buffer_bind_diag(device, "bind2.native.begin",
+                               pBindInfos[i].buffer, pBindInfos[i].memory,
+                               pBindInfos[i].memoryOffset, VK_SUCCESS);
+
    res = device->dispatch_table.BindBufferMemory2(device->dispatch_handle,
       bindInfoCount, pBindInfos);
+
+   for (uint32_t i = 0; i < bindInfoCount; i++)
+      wrapper_buffer_bind_diag(device, "bind2.native.end",
+                               pBindInfos[i].buffer, pBindInfos[i].memory,
+                               pBindInfos[i].memoryOffset, res);
 
    if (res != VK_SUCCESS) {
       WRAPPER_LOG(error, "Failed to bind buffer memory2, res %d", res);

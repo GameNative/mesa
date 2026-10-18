@@ -84,6 +84,7 @@ struct wrapper_device {
    struct hash_table_u64 *fence_table;
    struct wrapper_physical_device *physical;
    struct vk_device_dispatch_table dispatch_table;
+   unsigned buffer_diag_lines;
 
    bool emulate_null_descriptor;
    bool device_fault_enabled;
@@ -128,6 +129,8 @@ struct wrapper_device {
 
 VK_DEFINE_HANDLE_CASTS(wrapper_device, vk.base, VkDevice,
                        VK_OBJECT_TYPE_DEVICE)
+
+bool wrapper_memory_diag_enabled(struct wrapper_device *device);
 
 struct wrapper_buffer {
    struct vk_buffer vk;
