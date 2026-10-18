@@ -17,7 +17,7 @@
 /* Startup allocation diagnostics for the native Vulkan failure.  Do not
  * change backend selection or swallow a driver exception: the last flushed
  * begin line identifies the operation which did not return. */
-static bool
+bool
 wrapper_memory_diag_enabled(struct wrapper_device *device)
 {
    const char *app = device->physical->instance->vk.app_info.app_name;
