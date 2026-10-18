@@ -12,6 +12,32 @@
 #include <linux/dma-heap.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <stdio.h>
+
+/* Startup allocation diagnostics for the native Vulkan failure.  Do not
+ * change backend selection or swallow a driver exception: the last flushed
+ * begin line identifies the operation which did not return. */
+static bool
+wrapper_memory_diag_enabled(struct wrapper_device *device)
+{
+   const char *app = device->physical->instance->vk.app_info.app_name;
+   return device->physical->driver_properties.driverID ==
+             VK_DRIVER_ID_IMAGINATION_PROPRIETARY &&
+          app && strcmp(app, "No Man's Sky") == 0;
+}
+
+static void
+wrapper_memory_diag(struct wrapper_device *device, const char *stage,
+                    const VkMemoryAllocateInfo *info, int result)
+{
+   if (!wrapper_memory_diag_enabled(device))
+      return;
+
+   fprintf(stderr, "[WRAPPER_MEM_DIAG] %s size=%llu type=%u result=%d\n",
+           stage, (unsigned long long)info->allocationSize,
+           info->memoryTypeIndex, result);
+   fflush(stderr);
+}
 
 static int
 safe_ioctl(int fd, unsigned long request, void *arg)
@@ -265,7 +291,10 @@ wrapper_allocate_memory_dmaheap(struct wrapper_device *device,
    VkMemoryAllocateInfo allocate_info;
    VkResult result;
 
+   wrapper_memory_diag(device, "dmabuf.heap.begin", pAllocateInfo, 0);
    *out_fd = wrapper_dmabuf_alloc(device, pAllocateInfo->allocationSize);
+   wrapper_memory_diag(device, "dmabuf.heap.end", pAllocateInfo,
+                       *out_fd < 0 ? -errno : 0);
    if (*out_fd < 0)
       return VK_ERROR_INVALID_EXTERNAL_HANDLE;
 
@@ -273,9 +302,11 @@ wrapper_allocate_memory_dmaheap(struct wrapper_device *device,
       .sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR,
       .pNext = NULL,
    };
+   wrapper_memory_diag(device, "dmabuf.properties.begin", pAllocateInfo, 0);
    result = device->dispatch_table.GetMemoryFdPropertiesKHR(
       device->dispatch_handle, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
          *out_fd, &memory_fd_props);
+   wrapper_memory_diag(device, "dmabuf.properties.end", pAllocateInfo, result);
 
    if (result != VK_SUCCESS) {
       WRAPPER_LOG(error, "Failed to get memory fd properties, res %d", result);
@@ -311,9 +342,11 @@ wrapper_allocate_memory_dmaheap(struct wrapper_device *device,
    allocate_info.pNext = &import_fd_info;
    allocate_info.memoryTypeIndex = memory_type_index;
 
+   wrapper_memory_diag(device, "dmabuf.import.begin", &allocate_info, 0);
    result = device->dispatch_table.AllocateMemory(
       device->dispatch_handle, &allocate_info,
          pAllocator, pMemory);
+   wrapper_memory_diag(device, "dmabuf.import.end", &allocate_info, result);
 
    if (result != VK_SUCCESS && import_fd_info.fd != -1) {
       WRAPPER_LOG(error, "Failed to import dmaheap memory, res %d", result);
@@ -350,10 +383,12 @@ wrapper_allocate_memory_opaque_fd(struct wrapper_device *device,
    allocate_info = *pAllocateInfo;
    allocate_info.pNext = &export_memory_info;
 
+   wrapper_memory_diag(device, "opaque.allocate.begin", &allocate_info, 0);
    result = device->dispatch_table.AllocateMemory(device->dispatch_handle,
    												  &allocate_info,
    												  pAllocator,
    												  pMemory);
+   wrapper_memory_diag(device, "opaque.allocate.end", &allocate_info, result);
 
    if (result != VK_SUCCESS) {
       WRAPPER_LOG(error, "Failed to allocate opaque fd memory, res %d", result);
@@ -367,9 +402,11 @@ wrapper_allocate_memory_opaque_fd(struct wrapper_device *device,
       .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT,
    };
 
+   wrapper_memory_diag(device, "opaque.export.begin", &allocate_info, 0);
    result = device->dispatch_table.GetMemoryFdKHR(device->dispatch_handle,
    							    &get_memory_fd,
    							    out_fd);
+   wrapper_memory_diag(device, "opaque.export.end", &allocate_info, result);
 
    if (result != VK_SUCCESS || *out_fd < 0) {
       WRAPPER_LOG(error, "Failed to get opaque fd");
@@ -411,15 +448,18 @@ wrapper_allocate_memory_ahardware_buffer(struct wrapper_device *device,
       allocate_info.allocationSize = 0;
    }
    
+   wrapper_memory_diag(device, "ahb.allocate.begin", &allocate_info, 0);
    result = device->dispatch_table.AllocateMemory(device->dispatch_handle,
                                                   &allocate_info,
                                                   pAllocator,
                                                   pMemory);
+   wrapper_memory_diag(device, "ahb.allocate.end", &allocate_info, result);
    if (result != VK_SUCCESS) {
       WRAPPER_LOG(error, "Failed to allocate ahb memory, res %d", result);
       return result;
    }
    
+   wrapper_memory_diag(device, "ahb.export.begin", &allocate_info, 0);
    result = device->dispatch_table.GetMemoryAndroidHardwareBufferANDROID(
       device->dispatch_handle,
       &(VkMemoryGetAndroidHardwareBufferInfoANDROID) {
@@ -428,13 +468,18 @@ wrapper_allocate_memory_ahardware_buffer(struct wrapper_device *device,
          .memory = *pMemory,
       },
       pAHardwareBuffer);
+   wrapper_memory_diag(device, "ahb.export.end", &allocate_info, result);
 
    if (result != VK_SUCCESS) {
       WRAPPER_LOG(error, "Failed to import ahb, res %d", result);
       return result;
    }
    
-   if (AHardwareBuffer_getNativeHandle(*pAHardwareBuffer) == NULL) {
+   wrapper_memory_diag(device, "ahb.native_handle.begin", &allocate_info, 0);
+   const native_handle_t *native_handle = AHardwareBuffer_getNativeHandle(*pAHardwareBuffer);
+   wrapper_memory_diag(device, "ahb.native_handle.end", &allocate_info,
+                       native_handle ? 0 : VK_ERROR_INVALID_EXTERNAL_HANDLE);
+   if (native_handle == NULL) {
       WRAPPER_LOG(error, "Invalid native handle");
       return VK_ERROR_INVALID_EXTERNAL_HANDLE;
    }
@@ -516,9 +561,32 @@ wrapper_AllocateMemory(VkDevice _device,
    struct wrapper_device_memory *mem;
    VkResult result;
 
+   wrapper_memory_diag(device, "allocate.enter", pAllocateInfo, 0);
+   if (wrapper_memory_diag_enabled(device)) {
+      fprintf(stderr, "[WRAPPER_MEM_DIAG] build=nms-allocation-diag-1 backend=%s "
+              "placed_feature=%u placed_extension=%u memory_types=%u\n",
+              device->physical->resource_type,
+              (unsigned)device->vk.enabled_features.memoryMapPlaced,
+              (unsigned)device->vk.enabled_extensions.EXT_map_memory_placed,
+              device->physical->memory_properties.memoryTypeCount);
+      vk_foreach_struct_const(s, pAllocateInfo->pNext) {
+         fprintf(stderr, "[WRAPPER_MEM_DIAG] pnext=%u\n", (unsigned)s->sType);
+         if (s->sType == VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO) {
+            const VkMemoryDedicatedAllocateInfo *d = (const void *)s;
+            fprintf(stderr, "[WRAPPER_MEM_DIAG] dedicated_image=%u dedicated_buffer=%u\n",
+                    d->image != VK_NULL_HANDLE, d->buffer != VK_NULL_HANDLE);
+         }
+      }
+      fflush(stderr);
+   }
+
    VkMemoryPropertyFlags property_flags =
       device->physical->memory_properties.memoryTypes[
          pAllocateInfo->memoryTypeIndex].propertyFlags;
+   if (wrapper_memory_diag_enabled(device)) {
+      fprintf(stderr, "[WRAPPER_MEM_DIAG] property_flags=0x%x\n", property_flags);
+      fflush(stderr);
+   }
    
    if (!(property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))
       goto fallback;
@@ -554,9 +622,12 @@ wrapper_AllocateMemory(VkDevice _device,
    
    WRAPPER_LOG(info, "Emulating vkAllocateMemory");
 
+   wrapper_memory_diag(device, "emulation.lock.begin", pAllocateInfo, 0);
    simple_mtx_lock(&device->resource_mutex);
 
+   wrapper_memory_diag(device, "emulation.object.begin", pAllocateInfo, 0);
    result = wrapper_device_memory_create(device, pAllocator, &mem);
+   wrapper_memory_diag(device, "emulation.object.end", pAllocateInfo, result);
    if (result != VK_SUCCESS) {
       vk_error(device, result);
       goto out;
@@ -581,6 +652,10 @@ wrapper_AllocateMemory(VkDevice _device,
    }
 
    VkMemoryAllocateInfo memory_allocate_info = *pAllocateInfo;
+   if (wrapper_memory_diag_enabled(device)) {
+      fprintf(stderr, "[WRAPPER_MEM_DIAG] valid_handle_types=0x%x\n", valid_handle_types);
+      fflush(stderr);
+   }
    if (dedicated_allocate_info && valid_handle_types == 0) {
       // Driver "bug" on some mobile drivers - providing an empty dedicate memory hint in conjunction with the
       // VkImportMemoryFdInfoKHR / VkExportMemoryAllocateInfo could crash the driver
@@ -651,11 +726,15 @@ wrapper_AllocateMemory(VkDevice _device,
 
 out:
    simple_mtx_unlock(&device->resource_mutex);
+   wrapper_memory_diag(device, "allocate.leave", pAllocateInfo, result);
    return result;
 
 fallback:
-   return device->dispatch_table.AllocateMemory(device->dispatch_handle,
+   wrapper_memory_diag(device, "native.allocate.begin", pAllocateInfo, 0);
+   result = device->dispatch_table.AllocateMemory(device->dispatch_handle,
       pAllocateInfo, pAllocator, pMemory);
+   wrapper_memory_diag(device, "native.allocate.end", pAllocateInfo, result);
+   return result;
 }
 
 VKAPI_ATTR void VKAPI_CALL
