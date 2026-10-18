@@ -2,6 +2,11 @@
 #include <stdarg.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <dlfcn.h>
+#include <link.h>
+#include <pthread.h>
+#include <strings.h>
+#include <sys/syscall.h>
 
 #include "wrapper_private.h"
 #include "wrapper_log.h"
@@ -19,6 +24,7 @@
 #include "vk_util.h"
 #include "util/list.h"
 #include "util/simple_mtx.h"
+#include "util/u_atomic.h"
 
 const struct vk_device_extension_table wrapper_device_extensions =
 {
@@ -3259,6 +3265,38 @@ wrapper_CmdEndRendering(VkCommandBuffer commandBuffer)
    wcb->dynamic_rendering_active = false;
 }
 
+/* Diagnostic build: keep the native call and its inputs unchanged.  Wine's
+ * +seh prints a fault PC but does not map Android ELF modules.  Emit executable
+ * ranges once, then pair entry/return records by call ID (compilation is
+ * concurrent).  Do not install signal handlers or redirect the game's logs. */
+static int
+wrapper_pipeline_diag_module(struct dl_phdr_info *info, size_t size, void *data)
+{
+   (void)size;
+   (void)data;
+   const char *name = strrchr(info->dlpi_name, '/');
+   name = name ? name + 1 : info->dlpi_name;
+   for (unsigned i = 0; i < info->dlpi_phnum; i++) {
+      const ElfW(Phdr) *ph = &info->dlpi_phdr[i];
+      if (ph->p_type != PT_LOAD || !(ph->p_flags & PF_X))
+         continue;
+      fprintf(stderr,
+              "[WRAPPER_PIPELINE] module=%s base=%p exec=%p-%p\n",
+              name, (void *)(uintptr_t)info->dlpi_addr,
+              (void *)(uintptr_t)(info->dlpi_addr + ph->p_vaddr),
+              (void *)(uintptr_t)(info->dlpi_addr + ph->p_vaddr + ph->p_memsz));
+   }
+   return 0;
+}
+
+static void
+wrapper_pipeline_diag_modules(void)
+{
+   fprintf(stderr, "[WRAPPER_PIPELINE] diagnostic=1 pid=%ld\n", (long)getpid());
+   dl_iterate_phdr(wrapper_pipeline_diag_module, NULL);
+   fflush(stderr);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 wrapper_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
                                 uint32_t createInfoCount,
@@ -3270,6 +3308,27 @@ wrapper_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
    VkGraphicsPipelineCreateInfo *legacy = NULL;
    VkRenderPass *render_passes = NULL;
    const VkGraphicsPipelineCreateInfo *driver_infos = pCreateInfos;
+
+   const char *app = device->physical->instance->vk.app_info.app_name;
+   if (app) {
+      const char *base = strrchr(app, '\\');
+      if (base) app = base + 1;
+      base = strrchr(app, '/');
+      if (base) app = base + 1;
+   }
+   const bool pipeline_diag = app && !strcasecmp(app, "P5R.exe");
+   static pthread_once_t modules_once = PTHREAD_ONCE_INIT;
+   static uint32_t call_serial;
+   uint32_t call_id = 0;
+   if (pipeline_diag) {
+      pthread_once(&modules_once, wrapper_pipeline_diag_modules);
+      call_id = p_atomic_inc_return(&call_serial);
+      fprintf(stderr,
+              "[WRAPPER_PIPELINE] enter id=%u native_tid=%ld count=%u lower13=%u\n",
+              call_id, (long)syscall(SYS_gettid), createInfoCount,
+              wrapper_lowers_core13(device));
+      fflush(stderr);
+   }
 
    if (wrapper_lowers_core13(device) &&
        !device->dispatch_table.CmdBeginRendering && createInfoCount) {
@@ -3318,9 +3377,25 @@ wrapper_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
       driver_infos = legacy;
    }
 
+   if (pipeline_diag) {
+      Dl_info module = {0};
+      void *fn = (void *)device->dispatch_table.CreateGraphicsPipelines;
+      dladdr(fn, &module);
+      const char *name = module.dli_fname ? strrchr(module.dli_fname, '/') : NULL;
+      name = name ? name + 1 : (module.dli_fname ? module.dli_fname : "unknown");
+      fprintf(stderr,
+              "[WRAPPER_PIPELINE] native-enter id=%u fn=%p module=%s base=%p cache=%p\n",
+              call_id, fn, name, module.dli_fbase, (void *)(uintptr_t)pipelineCache);
+      fflush(stderr);
+   }
    VkResult result = device->dispatch_table.CreateGraphicsPipelines(
       device->dispatch_handle, pipelineCache, createInfoCount, driver_infos,
       pAllocator, pPipelines);
+   if (pipeline_diag) {
+      fprintf(stderr, "[WRAPPER_PIPELINE] native-return id=%u result=%d\n",
+              call_id, result);
+      fflush(stderr);
+   }
 
    if (render_passes) {
       for (uint32_t i = 0; i < createInfoCount; i++) {
