@@ -34,21 +34,31 @@ cpu        = 'armv8-a'
 endian     = 'little'
 
 [built-in options]
+# -fno-emulated-tls: bionic has had ELF TLS since API 21, and the guest's
+# libGL.so.1 imports the TLS variable _glapi_tls_Context. With emulated TLS the
+# built libglapi exports only __emutls_v._glapi_tls_Context, so any guest library
+# that links libGL and is dlopen'd later (Wine's winegstreamer unixlib) fails with
+# "cannot locate symbol _glapi_tls_Context" — which silently removes every media
+# codec path from the session.
 c_args   = ['-g0', '-O2', '-fPIC', '-DANDROID',
             '-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES',
+            '-fno-emulated-tls',
             '-I@REPO_DIR@/android/overlay/include',
             '-idirafter', '@DEPS@/include',
             '-idirafter', '@DEPS@/include/libdrm']
 cpp_args = ['-g0', '-O2', '-fPIC', '-DANDROID',
             '-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES',
+            '-fno-emulated-tls',
             '-I@REPO_DIR@/android/overlay/include',
             '-idirafter', '@DEPS@/include',
             '-idirafter', '@DEPS@/include/libdrm']
 c_link_args   = ['-L@DEPS@/lib',
                  '-Wl,-z,max-page-size=16384',
+                 '-Wl,-plugin-opt=-emulated-tls=0',
                  '-llog', '-lsync']
 cpp_link_args = ['-L@DEPS@/lib',
                  '-Wl,-z,max-page-size=16384',
+                 '-Wl,-plugin-opt=-emulated-tls=0',
                  '-llog', '-lsync',
                  '-static-libstdc++']
 
