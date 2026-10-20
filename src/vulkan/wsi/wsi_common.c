@@ -416,7 +416,8 @@ wsi_device_setup_syncobj_fd(struct wsi_device *wsi_device,
 static enum wsi_swapchain_blit_type
 get_blit_type(const struct wsi_device *wsi,
               const struct wsi_base_image_params *params,
-              VkDevice device)
+              VkDevice device,
+              VkFormat image_format)
 {
    switch (params->image_type) {
    case WSI_IMAGE_TYPE_CPU: {
@@ -427,7 +428,7 @@ get_blit_type(const struct wsi_device *wsi,
    }
 #ifdef __TERMUX__
    case WSI_IMAGE_TYPE_ANDROID: {
-      return wsi_get_android_blit_type(wsi, params, device);
+      return wsi_get_android_blit_type(wsi, params, device, image_format);
    }
 #endif
 #ifdef HAVE_LIBDRM
@@ -505,7 +506,8 @@ wsi_swapchain_init(const struct wsi_device *wsi,
    chain->wsi = wsi;
    chain->device = _device;
    chain->alloc = *pAllocator;
-   chain->blit.type = get_blit_type(wsi, image_params, _device);
+   chain->blit.type = get_blit_type(wsi, image_params, _device,
+                                  pCreateInfo->imageFormat);
 
    chain->blit.queue = VK_NULL_HANDLE;
    if (chain->blit.type != WSI_SWAPCHAIN_NO_BLIT && wsi->get_blit_queue)
