@@ -445,6 +445,11 @@ wrapper_allocate_memory_ahardware_buffer(struct wrapper_device *device,
 static void
 wrapper_device_memory_reset(struct wrapper_device_memory *mem) {
    struct wrapper_device *device = mem->device;
+   if (mem->driver_mapped) {
+      device->dispatch_table.UnmapMemory(device->dispatch_handle,
+                                        mem->dispatch_handle);
+      mem->driver_mapped = false;
+   }
    if (mem->ahardware_buffer) {
       AHardwareBuffer_release(mem->ahardware_buffer);
       mem->ahardware_buffer = NULL;
@@ -721,6 +726,7 @@ wrapper_MapMemory2KHR(VkDevice _device,
    const VkMemoryMapPlacedInfoEXT *placed_info = NULL;
    struct wrapper_device_memory *mem;
    int fd;
+   void *driver_map;
 
    if (pMemoryMapInfo->flags & VK_MEMORY_MAP_PLACED_BIT_EXT)
       placed_info = vk_find_struct_const(pMemoryMapInfo->pNext,
@@ -799,6 +805,18 @@ wrapper_MapMemory2KHR(VkDevice _device,
 
    WRAPPER_LOG(info, "Mapping memory %p, address %p size %zu\n", pMemoryMapInfo->memory, placed_info->pPlacedAddress, mem->map_size);
 
+   /* Flush/InvalidateMappedMemoryRanges are forwarded to the base driver.
+    * It needs its own mapping for cache maintenance (e.g. Turnip uses
+    * bo->map). The fixed-address alias alone does not establish that state.
+    * Both mappings reference the same backing memory; no copy is needed. */
+   result = device->dispatch_table.MapMemory(device->dispatch_handle,
+      pMemoryMapInfo->memory, 0, VK_WHOLE_SIZE, 0, &driver_map);
+   if (result != VK_SUCCESS) {
+      mem->map_size = 0;
+      goto fail;
+   }
+   mem->driver_mapped = true;
+
    mem->map_address = mmap(placed_info->pPlacedAddress,
       mem->map_size, PROT_READ | PROT_WRITE,
          MAP_SHARED | MAP_FIXED, fd, 0);
@@ -807,6 +825,9 @@ wrapper_MapMemory2KHR(VkDevice _device,
       WRAPPER_LOG(error, "mmap failed: error %d", errno);
       mem->map_address = NULL;
       mem->map_size = 0;
+      device->dispatch_table.UnmapMemory(device->dispatch_handle,
+                                        pMemoryMapInfo->memory);
+      mem->driver_mapped = false;
       result = VK_ERROR_MEMORY_MAP_FAILED;
       goto fail;
    }
@@ -852,6 +873,11 @@ wrapper_UnmapMemory2KHR(VkDevice _device,
       munmap(mem->map_address, mem->map_size);
    }
 
+   if (mem->driver_mapped) {
+      device->dispatch_table.UnmapMemory(device->dispatch_handle,
+                                        pMemoryUnmapInfo->memory);
+      mem->driver_mapped = false;
+   }
    mem->map_size = 0;
    mem->map_address = NULL;
    return VK_SUCCESS;
