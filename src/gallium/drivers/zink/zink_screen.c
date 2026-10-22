@@ -3464,8 +3464,7 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
       screen->driconf.zink_shader_object_enable = driQueryOptionb(config->options, "zink_shader_object_enable");
    }
    */
-   //if (!zink_create_instance(screen, dev_major > 0 && dev_major < 255))
-   if (!zink_create_instance(screen, 1))
+   if (!zink_create_instance(screen, dev_major > 0 && dev_major < 255))
       goto fail;
 
    if (zink_debug & ZINK_DEBUG_VALIDATION) {
