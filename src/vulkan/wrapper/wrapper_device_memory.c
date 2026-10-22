@@ -522,6 +522,41 @@ wrapper_AllocateMemory(VkDevice _device,
    
    if (!(property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))
       goto fallback;
+
+   const VkExportMemoryAllocateInfo *export_info =
+      vk_find_struct_const(pAllocateInfo, EXPORT_MEMORY_ALLOCATE_INFO);
+
+   /* WGL exports its buffer storage to GL and then requests a placed map.
+    * Keep the original allocation and its export flags, but retain an fd so
+    * this allocation can use the same placed-map path as our own buffers.
+    * Also handle clients which enabled the extension without its feature. */
+   if (device->vk.enabled_extensions.EXT_map_memory_placed && export_info &&
+       export_info->handleTypes == VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT &&
+       !vk_find_struct_const(pAllocateInfo, IMPORT_MEMORY_FD_INFO_KHR) &&
+       !vk_find_struct_const(pAllocateInfo, IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID)) {
+      simple_mtx_lock(&device->resource_mutex);
+      result = wrapper_device_memory_create(device, pAllocator, &mem);
+      if (result != VK_SUCCESS)
+         goto out;
+
+      mem->alloc_size = pAllocateInfo->allocationSize;
+      result = device->dispatch_table.AllocateMemory(device->dispatch_handle,
+         pAllocateInfo, pAllocator, &mem->dispatch_handle);
+      if (result == VK_SUCCESS) {
+         const VkMemoryGetFdInfoKHR fd_info = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR,
+            .memory = mem->dispatch_handle,
+            .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT,
+         };
+         result = device->dispatch_table.GetMemoryFdKHR(device->dispatch_handle,
+            &fd_info, &mem->fd);
+      }
+      if (result != VK_SUCCESS)
+         wrapper_device_memory_destroy(mem);
+      else
+         *pMemory = mem->dispatch_handle;
+      goto out;
+   }
     
    if (!device->vk.enabled_features.memoryMapPlaced ||
        !device->vk.enabled_extensions.EXT_map_memory_placed)
@@ -692,6 +727,10 @@ wrapper_MapMemory2KHR(VkDevice _device,
          MEMORY_MAP_PLACED_INFO_EXT);
    
    mem = wrapper_device_memory_from_handle(device, pMemoryMapInfo->memory);
+   if (placed_info && !mem) {
+      WRAPPER_LOG(error, "Cannot honor placed mapping for untracked memory");
+      return VK_ERROR_MEMORY_MAP_FAILED;
+   }
    if (!placed_info || !mem) {
       return device->dispatch_table.MapMemory(device->dispatch_handle,
          pMemoryMapInfo->memory, pMemoryMapInfo->offset, pMemoryMapInfo->size,
@@ -794,7 +833,7 @@ wrapper_UnmapMemory2KHR(VkDevice _device,
    struct wrapper_device_memory *mem;
 
    mem = wrapper_device_memory_from_handle(device, pMemoryUnmapInfo->memory);
-   if (!mem) {
+   if (!mem || !mem->map_address) {
       device->dispatch_table.UnmapMemory(device->dispatch_handle,
          pMemoryUnmapInfo->memory);
       return VK_SUCCESS;
