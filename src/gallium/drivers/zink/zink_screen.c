@@ -1859,43 +1859,35 @@ zink_flush_frontbuffer(struct pipe_screen *pscreen,
 {
    struct zink_screen *screen = zink_screen(pscreen);
    struct zink_resource *res = zink_resource(pres);
-   //struct zink_context *ctx = zink_context(pctx);
 
-   /* if the surface is no longer a swapchain, this is a no-op */
-   /*if (!zink_is_swapchain(res))
-      return;
+   if (zink_is_swapchain(res)) {
+      struct zink_context *ctx = zink_tc_context_unwrap(pctx, screen->threaded);
 
-   ctx = zink_tc_context_unwrap(pctx, screen->threaded);
-
-   if (!zink_kopper_acquired(res->obj->dt, res->obj->dt_idx)) {
-      /* swapbuffers to an undefined surface: acquire and present garbage */
-      /*zink_kopper_acquire(ctx, res, UINT64_MAX);
-      ctx->needs_present = res;
-      /* set batch usage to submit acquire semaphore */
-      /*zink_batch_resource_usage_set(ctx->bs, res, true, false);
-      /* ensure the resource is set up to present garbage */
-      /*ctx->base.flush_resource(&ctx->base, pres);
-   }
-
-   /* handle any outstanding acquire submits (not just from above) */
-
-   /*if (ctx->swapchain || ctx->needs_present) {
-      ctx->bs->has_work = true;
-      pctx->flush(pctx, NULL, PIPE_FLUSH_END_OF_FRAME);
-      if (ctx->last_batch_state && screen->threaded_submit) {
-         struct zink_batch_state *bs = ctx->last_batch_state;
-         util_queue_fence_wait(&bs->flush_completed);
+      if (!zink_kopper_acquired(res->obj->dt, res->obj->dt_idx)) {
+         zink_kopper_acquire(ctx, res, UINT64_MAX);
+         ctx->needs_present = res;
+         zink_batch_resource_usage_set(ctx->bs, res, true, false);
+         ctx->base.flush_resource(&ctx->base, pres);
       }
-   }
+
+      if (ctx->swapchain || ctx->needs_present) {
+         ctx->bs->has_work = true;
+         pctx->flush(pctx, NULL, PIPE_FLUSH_END_OF_FRAME);
+         if (ctx->last_batch_state && screen->threaded_submit) {
+            struct zink_batch_state *bs = ctx->last_batch_state;
+            util_queue_fence_wait(&bs->flush_completed);
+         }
+      }
       res->use_damage = false;
 
-   /* always verify that this was acquired */
-   /*assert(zink_kopper_acquired(res->obj->dt, res->obj->dt_idx));
-   zink_kopper_present_queue(screen, res, nboxes, sub_box);*/
+      assert(zink_kopper_acquired(res->obj->dt, res->obj->dt_idx));
+      zink_kopper_present_queue(screen, res, nboxes, sub_box);
+      return;
+   }
 
    struct sw_winsys *winsys = screen->winsys;
 
-   if (!winsys)
+   if (!winsys || !res->dt)
      return;
    void *map = winsys->displaytarget_map(winsys, res->dt, 0);
 
