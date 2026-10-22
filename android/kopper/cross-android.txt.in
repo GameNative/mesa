@@ -1,0 +1,23 @@
+[binaries]
+c          = '@TC@/aarch64-linux-android28-clang'
+cpp        = '@TC@/aarch64-linux-android28-clang++'
+ar         = '@TC@/llvm-ar'
+strip      = '@TC@/llvm-strip'
+nm         = '@TC@/llvm-nm'
+objcopy    = '@TC@/llvm-objcopy'
+pkg-config = '@PKGCONFIG@'
+
+[host_machine]
+system     = 'linux'
+cpu_family = 'aarch64'
+cpu        = 'armv8-a'
+endian     = 'little'
+
+[built-in options]
+c_args   = ['-g0', '-idirafter', '@T@/include']
+cpp_args = ['-g0', '-idirafter', '@T@/include']
+c_link_args   = ['-L@T@/lib', '-landroid-shmem', '-Wl,-z,max-page-size=16384', '-Wl,--undefined-version']
+cpp_link_args = ['-L@T@/lib', '-landroid-shmem', '-Wl,-z,max-page-size=16384', '-Wl,--undefined-version']
+
+[properties]
+pkg_config_libdir = ['@T@/lib/pkgconfig', '@T@/share/pkgconfig']

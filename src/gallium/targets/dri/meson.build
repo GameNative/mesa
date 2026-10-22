@@ -23,7 +23,7 @@ if with_ld_dynamic_list
 endif
 
 libgallium_dri = shared_library(
-  'gallium',
+  'gallium-@0@'.format(meson.project_version()),
   files('dri_target.c'),
   include_directories : [
     inc_include, inc_src, inc_mapi, inc_mesa, inc_gallium, inc_gallium_aux, inc_util, inc_gallium_drivers,
@@ -46,6 +46,6 @@ libgallium_dri = shared_library(
     driver_asahi, driver_crocus
   ],
   install : true,
-  install_dir : dri_drivers_path,
+  install_dir : get_option('libdir'),
   name_suffix : 'so',
 )
