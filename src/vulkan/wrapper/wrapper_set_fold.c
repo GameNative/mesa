@@ -5,6 +5,7 @@
 #include "vk_util.h"
 #include "util/hash_table.h"
 #include "util/u_math.h"
+#include "util/u_debug.h"
 
 #define FOLD_MAX_MEMBERS 8
 #define FOLD_MAX_BINDINGS 16
@@ -154,7 +155,8 @@ fold_merge_get(struct wrapper_device *device, const VkDescriptorSetLayout *handl
             small += l->bindings[b].vk.descriptorCount;
    }
    uint32_t per_array = budget > small ? (budget - small) / count : 1;
-   uint32_t fixed = MIN2(MAX2(device->fold_max_pool_count, 1), per_array);
+   uint32_t floor = debug_get_num_option("WRAPPER_FOLD_ARRAY_SIZE", 8192);
+   uint32_t fixed = MIN2(MAX2(device->fold_max_pool_count, floor), per_array);
    VkDescriptorSetLayoutCreateFlags flags = 0;
    uint32_t n = 0, base = 0;
    uint64_t total = 0;
