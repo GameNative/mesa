@@ -754,6 +754,10 @@ wrapper_bcn_gpu_readback(struct wrapper_command_buffer *wcb, struct wrapper_imag
    return true;
 }
 
+static bool
+bcn_gpu_upload_region(struct wrapper_command_buffer *wcb, struct wrapper_image *wi,
+                      VkBuffer src, VkImageLayout layout, const VkBufferImageCopy *c);
+
 /* One vkCmdCopyImage region with an emulated BC image on one side or both.
  * Returns false when the region should go to the driver as it is. */
 bool
@@ -797,38 +801,28 @@ wrapper_bcn_gpu_copy_image_region(struct wrapper_command_buffer *wcb,
       return true;
    }
 
-   /* Blocks from an uncompressed image: decode them into the stored format.
-    * Only decoded storage can take them; an ASTC encoder on the GPU would be
-    * needed for the rest. */
-   VkFormat stored = get_format_for_bcn(dst->info.format);
+   /* Blocks from an uncompressed image (a GPU encoder writing BC blocks through
+    * a uint image): copy them out and store them as an upload of the same
+    * blocks would be. */
    int id = bcn_format_id(dst->info.format);
-   if (id < 0 || stored != get_decode_format_for_bcn(dst->info.format) ||
-       dst->info.imageType != VK_IMAGE_TYPE_2D || !bcn_tools_ready(device) ||
-       !device->bcn_decode_pipeline) {
+   if (id < 0 || id == 8 || id == 9 || dst->info.imageType != VK_IMAGE_TYPE_2D ||
+       !bcn_tools_ready(device) || !device->bcn_decode_pipeline) {
       static bool logged;
       if (!logged)
          WRAPPER_LOG(error, "BCn: copy into BC format %d stored as %d is not supported",
-                     dst->info.format, stored);
+                     dst->info.format, get_format_for_bcn(dst->info.format));
       logged = true;
       return false;
    }
    uint32_t layers = bcn_layers(src, &c->srcSubresource);
    uint32_t nbx = c->extent.width, nby = c->extent.height;
    uint32_t bb = bcn_block_bytes(dst->info.format);
-   uint32_t ts = get_texel_size_for_format(stored);
    uint32_t m = c->dstSubresource.mipLevel;
    uint32_t lw = MAX2(1u, dst->info.extent.width >> m), lh = MAX2(1u, dst->info.extent.height >> m);
-   VkExtent3D texels_ext = {
-      MIN2(nbx * 4, lw - (uint32_t)c->dstOffset.x),
-      MIN2(nby * 4, lh - (uint32_t)c->dstOffset.y),
-      1,
-   };
-   VkDeviceAddress blocks_addr, texels_addr;
+   VkDeviceAddress blocks_addr;
    struct wrapper_buffer *blocks = bcn_transient_buffer(wcb,
       (VkDeviceSize)nbx * nby * bb * layers, &blocks_addr);
-   struct wrapper_buffer *texels = bcn_transient_buffer(wcb,
-      (VkDeviceSize)nbx * 4 * nby * 4 * ts * layers, &texels_addr);
-   if (!blocks || !texels)
+   if (!blocks)
       return false;
    bcn_barrier(wcb);
    VkBufferImageCopy pack = {
@@ -838,27 +832,19 @@ wrapper_bcn_gpu_copy_image_region(struct wrapper_command_buffer *wcb,
    };
    device->dispatch_table.CmdCopyImageToBuffer(wcb->dispatch_handle, src->dispatch_handle,
       src_layout, blocks->dispatch_handle, 1, &pack);
-   struct bcn_pc pc = {
-      .src = { (uint32_t)blocks_addr, (uint32_t)(blocks_addr >> 32) },
-      .dst = { (uint32_t)texels_addr, (uint32_t)(texels_addr >> 32) },
-      .src_row_pitch = nbx * bb,
-      .src_slice_pitch = nbx * nby * bb,
-      .dst_row_pitch = nbx * 4 * ts,
-      .dst_slice_pitch = nbx * 4 * nby * 4 * ts,
-      .blocks_x = nbx,
-      .blocks_y = nby,
-      .format = (uint32_t)id,
-   };
-   bcn_dispatch(wcb, device->bcn_decode_pipeline, &pc, layers);
-   VkBufferImageCopy unpack = {
-      .bufferRowLength = nbx * 4,
-      .bufferImageHeight = nby * 4,
+   VkBufferImageCopy up = {
       .imageSubresource = c->dstSubresource,
       .imageOffset = c->dstOffset,
-      .imageExtent = texels_ext,
+      .imageExtent = { MIN2(nbx * 4, lw - (uint32_t)c->dstOffset.x),
+                       MIN2(nby * 4, lh - (uint32_t)c->dstOffset.y), 1 },
    };
-   device->dispatch_table.CmdCopyBufferToImage(wcb->dispatch_handle, texels->dispatch_handle,
-      dst->dispatch_handle, dst_layout, 1, &unpack);
+   if (!bcn_gpu_upload_region(wcb, dst, blocks->dispatch_handle, dst_layout, &up)) {
+      static bool logged;
+      if (!logged)
+         WRAPPER_LOG(error, "BCn: GPU path cannot store a copy into format %d",
+                     dst->info.format);
+      logged = true;
+   }
    return true;
 }
 
