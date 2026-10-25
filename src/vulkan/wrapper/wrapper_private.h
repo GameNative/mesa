@@ -42,6 +42,8 @@ struct wrapper_physical_device {
    bool is_vkd3d;
    bool emulate_imageless_framebuffer;
    bool emulate_vulkan13;
+   bool emulate_vertex_divisor;
+   bool emulate_zero_divisor;
    char *resource_type;
    VkPhysicalDevice dispatch_handle;
    VkPhysicalDeviceProperties2 properties2;
@@ -93,6 +95,9 @@ struct wrapper_device {
    struct hash_table_u64 *stride_pipeline_table;
    struct hash_table_u64 *shader_code_table;
    bool emulate_dynamic_stride;
+   struct hash_table_u64 *divisor_pipeline_table;
+   bool emulate_vertex_divisor;
+   bool emulate_zero_divisor;
    struct hash_table_u64 *fence_table;
    struct wrapper_physical_device *physical;
    struct vk_device_dispatch_table dispatch_table;
@@ -272,6 +277,14 @@ struct wrapper_command_buffer {
    VkPipeline compute_pipeline;
    uint32_t push_count;
    struct wrapper_push_record push[8];
+   const struct wrapper_divisor_pipeline *divisor_pipeline;
+   VkBuffer vb_buffer[32];
+   VkDeviceSize vb_offset[32];
+   VkDeviceSize vb_size[32];
+   VkDeviceSize vb_stride[32];
+   uint32_t vb_valid;
+   uint32_t divisor_saved_strides[32];
+   uint32_t divisor_saved_valid;
 };
 
 VK_DEFINE_HANDLE_CASTS(wrapper_command_buffer, vk.base, VkCommandBuffer,
@@ -368,6 +381,8 @@ struct wrapper_stride_pipeline;
 void wrapper_stride_note_module(struct wrapper_device *device, VkShaderModule module,
                                 const uint32_t *code, size_t size);
 void wrapper_stride_forget_module(struct wrapper_device *device, VkShaderModule module);
+uint32_t *wrapper_stride_module_code(struct wrapper_device *device, VkShaderModule module,
+                                     size_t *size);
 bool wrapper_stride_wants(const struct wrapper_device *device,
                           const VkGraphicsPipelineCreateInfo *info);
 VkResult wrapper_stride_create(struct wrapper_device *device, VkPipelineCache cache,
@@ -380,5 +395,23 @@ void wrapper_stride_set(struct wrapper_command_buffer *wcb, uint32_t first, uint
 void wrapper_stride_flush(struct wrapper_command_buffer *wcb);
 void wrapper_stride_reset(struct wrapper_command_buffer *wcb);
 void wrapper_stride_finish(struct wrapper_device *device);
+
+struct wrapper_divisor_pipeline;
+void *wrapper_divisor_lower(struct wrapper_device *device,
+                            const VkGraphicsPipelineCreateInfo *in,
+                            VkGraphicsPipelineCreateInfo *out);
+void wrapper_divisor_record(struct wrapper_device *device, void *lowering, VkPipeline pipeline);
+void wrapper_divisor_destroy(struct wrapper_device *device, VkPipeline pipeline);
+void wrapper_divisor_bind(struct wrapper_command_buffer *wcb, VkPipeline pipeline);
+void wrapper_divisor_track(struct wrapper_command_buffer *wcb, uint32_t first, uint32_t count,
+                           const VkBuffer *buffers, const VkDeviceSize *offsets,
+                           const VkDeviceSize *sizes, const VkDeviceSize *strides);
+void wrapper_divisor_reset(struct wrapper_command_buffer *wcb);
+void wrapper_divisor_finish(struct wrapper_device *device);
+bool wrapper_divisor_draw(struct wrapper_command_buffer *wcb, bool indexed, uint32_t count,
+                          uint32_t instance_count, uint32_t first, int32_t vertex_offset,
+                          uint32_t first_instance);
+bool wrapper_divisor_begin_indirect(struct wrapper_command_buffer *wcb);
+void wrapper_divisor_end_indirect(struct wrapper_command_buffer *wcb);
 
 #endif

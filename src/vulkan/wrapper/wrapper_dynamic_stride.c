@@ -52,6 +52,21 @@ wrapper_stride_note_module(struct wrapper_device *device, VkShaderModule module,
    simple_mtx_unlock(&device->resource_mutex);
 }
 
+uint32_t *
+wrapper_stride_module_code(struct wrapper_device *device, VkShaderModule module, size_t *size)
+{
+   uint32_t *copy = NULL;
+   simple_mtx_lock(&device->resource_mutex);
+   struct wrapper_stride_code *c =
+      _mesa_hash_table_u64_search(device->shader_code_table, (uint64_t)module);
+   if (c && (copy = malloc(c->size))) {
+      memcpy(copy, c->code, c->size);
+      *size = c->size;
+   }
+   simple_mtx_unlock(&device->resource_mutex);
+   return copy;
+}
+
 void
 wrapper_stride_forget_module(struct wrapper_device *device, VkShaderModule module)
 {
