@@ -468,6 +468,9 @@ bcn_cache_save(struct wrapper_device *device)
    free(data);
 }
 
+static void
+bcn_selftest(struct wrapper_device *device, VkQueue queue, uint32_t family);
+
 static void *
 bcn_tools_worker(void *arg)
 {
@@ -499,6 +502,20 @@ bcn_tools_worker(void *arg)
       device->bcn_slot_state[slot] = r == VK_SUCCESS ? BCN_BUILT : BCN_FAILED;
       __atomic_store_n(&device->bcn_tool_untested, 1, __ATOMIC_RELEASE);
       pthread_cond_broadcast(&device->bcn_tool_cond);
+      if (r == VK_SUCCESS && device->bcn_queue) {
+         /* checked at once on the wrapper's own queue */
+         pthread_mutex_unlock(&device->bcn_tool_lock);
+         simple_mtx_t *qm = device->bcn_queue_shares_query_reset ? &device->query_reset_mutex :
+                            &device->bcn_queue_mutex;
+         /* the same order as vkQueueSubmit: the queue's lock, then the tools' */
+         simple_mtx_lock(qm);
+         simple_mtx_lock(&device->bcn_gpu_mutex);
+         bcn_selftest(device, device->bcn_queue, device->bcn_queue_family);
+         simple_mtx_unlock(&device->bcn_gpu_mutex);
+         simple_mtx_unlock(qm);
+         pthread_mutex_lock(&device->bcn_tool_lock);
+         pthread_cond_broadcast(&device->bcn_tool_cond);
+      }
    }
    pthread_mutex_unlock(&device->bcn_tool_lock);
    return NULL;
@@ -509,6 +526,15 @@ void
 wrapper_bcn_gpu_init(struct wrapper_device *device, uint32_t family)
 {
    device->bcn_tool_family = family;
+   simple_mtx_init(&device->bcn_queue_mutex, mtx_plain);
+   if (device->bcn_queue_reserved) {
+      device->dispatch_table.GetDeviceQueue(device->dispatch_handle, device->bcn_queue_family,
+                                            device->bcn_queue_index, &device->bcn_queue);
+   } else if (device->query_reset_queue && !device->query_reset_shared_queue) {
+      device->bcn_queue = device->query_reset_queue;
+      device->bcn_queue_family = device->query_reset_queue_family;
+      device->bcn_queue_shares_query_reset = true;
+   }
    pthread_mutex_init(&device->bcn_tool_lock, NULL);
    pthread_cond_init(&device->bcn_tool_cond, NULL);
 }
@@ -589,6 +615,7 @@ bcn_tools_start(struct wrapper_device *device)
          }
          fclose(f);
       }
+      device->bcn_cache_warm = data != NULL;
       VkPipelineCacheCreateInfo pcci = {
          .sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,
          .initialDataSize = data ? (size_t)len : 0,
@@ -605,23 +632,28 @@ bcn_tools_start(struct wrapper_device *device)
                 bcn_tables_create(device) &&
                 pthread_create(&device->bcn_tool_thread, NULL, bcn_tools_worker, device) == 0;
       device->bcn_tool_thread_live = ok;
-      wrapper_diag_append("[BCN] GPU shaders: %s (bda=%d, pipeline cache %ld bytes from %s)\n",
+      wrapper_diag_append("[BCN] GPU shaders: %s (bda=%d, pipeline cache %ld bytes from %s; "
+                          "self-test on %s)\n",
                           ok ? "built on first use" : "off, upload=cpu", device->bcn_bda,
-                          data ? len : 0L, path);
+                          device->bcn_cache_warm ? len : 0L, path,
+                          device->bcn_queue_shares_query_reset ? "the query reset queue" :
+                          device->bcn_queue ? "a private queue" : "the next submit");
       __atomic_store_n(&device->bcn_tool_state, ok ? 1 : -1, __ATOMIC_RELEASE);
    }
    simple_mtx_unlock(&device->bcn_gpu_mutex);
    return device->bcn_tool_state > 0;
 }
 
-/* The pipeline of a slot once it is built (its self-test runs at the next
- * submit, before the batch that uses it), or asked for; with wait
- * (readbacks and copies), after its build. */
+/* The pipeline of a slot. Uploads, which have the CPU path, take it only
+ * once it has passed its self-test; with a warm pipeline cache and the
+ * wrapper's own queue the build and the check take milliseconds, so an
+ * upload waits for them (up to 250 ms). Readbacks and copies (wait) take it
+ * as soon as it is built. */
 static VkPipeline
 bcn_pipe(struct wrapper_device *device, int slot, bool wait)
 {
    int st = __atomic_load_n(&device->bcn_slot_state[slot], __ATOMIC_ACQUIRE);
-   if (st == BCN_TESTED || st == BCN_BUILT)
+   if (st == BCN_TESTED || (wait && st == BCN_BUILT))
       return device->bcn_pipe[slot];
    if (st == BCN_FAILED || !bcn_tools_start(device))
       return VK_NULL_HANDLE;
@@ -630,12 +662,28 @@ bcn_pipe(struct wrapper_device *device, int slot, bool wait)
       device->bcn_slot_state[slot] = BCN_QUEUED;
       pthread_cond_broadcast(&device->bcn_tool_cond);
    }
-   while (wait && (device->bcn_slot_state[slot] == BCN_QUEUED ||
-                   device->bcn_slot_state[slot] == BCN_BUILDING))
-      pthread_cond_wait(&device->bcn_tool_cond, &device->bcn_tool_lock);
+   if (wait) {
+      while (device->bcn_slot_state[slot] == BCN_QUEUED ||
+             device->bcn_slot_state[slot] == BCN_BUILDING)
+         pthread_cond_wait(&device->bcn_tool_cond, &device->bcn_tool_lock);
+   } else if (device->bcn_cache_warm && device->bcn_queue) {
+      struct timespec until;
+      clock_gettime(CLOCK_REALTIME, &until);
+      until.tv_nsec += 250000000;
+      if (until.tv_nsec >= 1000000000) {
+         until.tv_sec++;
+         until.tv_nsec -= 1000000000;
+      }
+      while (device->bcn_slot_state[slot] == BCN_QUEUED ||
+             device->bcn_slot_state[slot] == BCN_BUILDING ||
+             device->bcn_slot_state[slot] == BCN_BUILT) {
+         if (pthread_cond_timedwait(&device->bcn_tool_cond, &device->bcn_tool_lock, &until))
+            break;
+      }
+   }
    st = device->bcn_slot_state[slot];
    pthread_mutex_unlock(&device->bcn_tool_lock);
-   return st == BCN_TESTED || st == BCN_BUILT ? device->bcn_pipe[slot] : VK_NULL_HANDLE;
+   return st == BCN_TESTED || (wait && st == BCN_BUILT) ? device->bcn_pipe[slot] : VK_NULL_HANDLE;
 }
 
 static int

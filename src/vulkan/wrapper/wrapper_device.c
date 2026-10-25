@@ -365,6 +365,60 @@ wrapper_query_reset_reserve_queue(struct wrapper_device *device,
    return VK_ERROR_INITIALIZATION_FAILED;
 }
 
+/* A queue of its own for the BCn shaders' self-test, so a shader is checked
+ * right after its build on the worker rather than at the application's next
+ * submit: one more queue in the first graphics or compute family the
+ * application asked for, when the family has one to spare. Otherwise the
+ * private queue of the query reset emulation is shared, or the check waits
+ * for a submit. */
+static void
+wrapper_bcn_reserve_queue(struct wrapper_device *device, VkDeviceCreateInfo *info,
+                          VkDeviceQueueCreateInfo **queues_out, float **priorities_out)
+{
+   struct wrapper_physical_device *physical = device->physical;
+   uint32_t count = 0;
+   physical->dispatch_table.GetPhysicalDeviceQueueFamilyProperties(
+      physical->dispatch_handle, &count, NULL);
+   VkQueueFamilyProperties *families = calloc(count, sizeof(*families));
+   if (!families)
+      return;
+   physical->dispatch_table.GetPhysicalDeviceQueueFamilyProperties(
+      physical->dispatch_handle, &count, families);
+   for (uint32_t i = 0; i < info->queueCreateInfoCount; i++) {
+      const VkDeviceQueueCreateInfo *q = &info->pQueueCreateInfos[i];
+      uint32_t family = q->queueFamilyIndex;
+      if (q->flags || q->pNext || family >= count || !q->queueCount ||
+          !(families[family].queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)))
+         continue;
+      uint32_t requested = 0;
+      for (uint32_t j = 0; j < info->queueCreateInfoCount; j++)
+         if (info->pQueueCreateInfos[j].queueFamilyIndex == family)
+            requested += info->pQueueCreateInfos[j].queueCount;
+      if (requested >= families[family].queueCount)
+         break;
+      VkDeviceQueueCreateInfo *queues = malloc(info->queueCreateInfoCount * sizeof(*queues));
+      float *priorities = malloc((q->queueCount + 1) * sizeof(*priorities));
+      if (!queues || !priorities) {
+         free(queues);
+         free(priorities);
+         break;
+      }
+      memcpy(queues, info->pQueueCreateInfos, info->queueCreateInfoCount * sizeof(*queues));
+      memcpy(priorities, q->pQueuePriorities, q->queueCount * sizeof(*priorities));
+      priorities[q->queueCount] = 0.5f;
+      queues[i].queueCount++;
+      queues[i].pQueuePriorities = priorities;
+      device->bcn_queue_family = family;
+      device->bcn_queue_index = q->queueCount;
+      device->bcn_queue_reserved = true;
+      info->pQueueCreateInfos = queues;
+      *queues_out = queues;
+      *priorities_out = priorities;
+      break;
+   }
+   free(families);
+}
+
 static VkResult
 wrapper_query_reset_init(struct wrapper_device *device)
 {
@@ -1159,6 +1213,8 @@ wrapper_CreateDevice(VkPhysicalDevice physicalDevice,
    bool used_fallback_create = false;
    VkDeviceQueueCreateInfo *query_reset_queues = NULL;
    float *query_reset_priorities = NULL;
+   VkDeviceQueueCreateInfo *bcn_queues = NULL;
+   float *bcn_priorities = NULL;
 
    device = vk_zalloc2(&physical_device->instance->vk.alloc, pAllocator,
                        sizeof(*device), 8, VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
@@ -1356,6 +1412,10 @@ if (pdf2 && pdf2->features.f) { \
       }
    }
 
+   if (physical_device->emulate_bcn &&
+       !(emulate_query_reset && !device->query_reset_shared_queue))
+      wrapper_bcn_reserve_queue(device, &wrapper_create_info, &bcn_queues, &bcn_priorities);
+
    result = physical_device->dispatch_table.CreateDevice(
       physical_device->dispatch_handle, &wrapper_create_info,
          pAllocator, &device->dispatch_handle);
@@ -1375,6 +1435,8 @@ if (pdf2 && pdf2->features.f) { \
       if (result != VK_SUCCESS) {
          free(query_reset_queues);
          free(query_reset_priorities);
+         free(bcn_queues);
+         free(bcn_priorities);
          WRAPPER_LOG(error, "Failed driver createDevice, res %d", result);
          wrapper_emit_diag(physical_device, pCreateInfo, result);
          wrapper_DestroyDevice(wrapper_device_to_handle(device),
@@ -1385,6 +1447,8 @@ if (pdf2 && pdf2->features.f) { \
 
    free(query_reset_queues);
    free(query_reset_priorities);
+   free(bcn_queues);
+   free(bcn_priorities);
 
    void *gdpa = physical_device->instance->dispatch_table.GetInstanceProcAddr(
       physical_device->instance->dispatch_handle, "vkGetDeviceProcAddr");
