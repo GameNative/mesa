@@ -7,6 +7,7 @@
 #define WRAPPER_DIVISOR_MAX_BINDINGS 32
 
 struct wrapper_divisor_pipeline {
+   VkShaderModule module;
    uint32_t mask;
    bool dynamic_stride;
    uint32_t divisor[WRAPPER_DIVISOR_MAX_BINDINGS];
@@ -14,6 +15,7 @@ struct wrapper_divisor_pipeline {
 };
 
 struct wrapper_divisor_lowering {
+   VkPipelineShaderStageCreateInfo stages[8];
    VkPipelineVertexInputStateCreateInfo vi;
    VkVertexInputBindingDescription bindings[WRAPPER_DIVISOR_MAX_BINDINGS];
    struct wrapper_divisor_pipeline info;
@@ -36,8 +38,105 @@ has_dynamic(const VkGraphicsPipelineCreateInfo *info, VkDynamicState state)
    return false;
 }
 
+#define SPV_OP_TYPE_INT 21
+#define SPV_OP_CONSTANT 43
+#define SPV_OP_VARIABLE 59
+#define SPV_OP_LOAD 61
+#define SPV_OP_DECORATE 71
+#define SPV_OP_COPY_OBJECT 83
+#define SPV_DECORATION_BUILTIN 11
+#define SPV_BUILTIN_BASE_INSTANCE 4425
+
+static uint32_t *
+zero_base_instance(const uint32_t *code, size_t size, size_t *out_size)
+{
+   size_t words = size / 4;
+   if (words < 5)
+      return NULL;
+   uint32_t var = 0;
+   for (size_t o = 5; o < words;) {
+      uint32_t len = code[o] >> 16, op = code[o] & 0xffff;
+      if (!len || o + len > words)
+         return NULL;
+      if (op == SPV_OP_DECORATE && len >= 4 && code[o + 2] == SPV_DECORATION_BUILTIN &&
+          code[o + 3] == SPV_BUILTIN_BASE_INSTANCE)
+         var = code[o + 1];
+      o += len;
+   }
+   if (!var)
+      return NULL;
+
+   uint32_t type = 0;
+   size_t type_end = 0;
+   for (size_t o = 5; o < words;) {
+      uint32_t len = code[o] >> 16, op = code[o] & 0xffff;
+      if (op == SPV_OP_LOAD && len >= 4 && code[o + 3] == var)
+         type = code[o + 1];
+      o += len;
+   }
+   if (!type)
+      return NULL;
+   for (size_t o = 5; o < words;) {
+      uint32_t len = code[o] >> 16, op = code[o] & 0xffff;
+      if (op == SPV_OP_TYPE_INT && code[o + 1] == type)
+         type_end = o + len;
+      o += len;
+   }
+   if (!type_end)
+      return NULL;
+
+   uint32_t *out = malloc((words + 4) * 4);
+   if (!out)
+      return NULL;
+   uint32_t zero = code[3];
+   memcpy(out, code, type_end * 4);
+   out[3] = zero + 1;
+   out[type_end] = (4u << 16) | SPV_OP_CONSTANT;
+   out[type_end + 1] = type;
+   out[type_end + 2] = zero;
+   out[type_end + 3] = 0;
+   memcpy(out + type_end + 4, code + type_end, (words - type_end) * 4);
+
+   for (size_t o = 5; o < words + 4;) {
+      uint32_t len = out[o] >> 16, op = out[o] & 0xffff;
+      if (op == SPV_OP_LOAD && len >= 4 && out[o + 3] == var) {
+         out[o] = (4u << 16) | SPV_OP_COPY_OBJECT;
+         out[o + 3] = zero;
+         for (uint32_t k = 4; k < len; k++)
+            out[o + k] = 1u << 16;
+      }
+      o += len;
+   }
+   *out_size = (words + 4) * 4;
+   return out;
+}
+
+static VkShaderModule
+vertex_module_without_base_instance(struct wrapper_device *device, VkShaderModule module)
+{
+   size_t size = 0, patched_size = 0;
+   uint32_t *code = wrapper_stride_module_code(device, module, &size);
+   if (!code)
+      return VK_NULL_HANDLE;
+   uint32_t *patched = zero_base_instance(code, size, &patched_size);
+   free(code);
+   if (!patched)
+      return VK_NULL_HANDLE;
+   VkShaderModuleCreateInfo mi = {
+      .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+      .codeSize = patched_size,
+      .pCode = patched,
+   };
+   VkShaderModule out = VK_NULL_HANDLE;
+   if (device->dispatch_table.CreateShaderModule(device->dispatch_handle, &mi, NULL, &out) ==
+       VK_SUCCESS)
+      wrapper_stride_note_module(device, out, patched, patched_size);
+   free(patched);
+   return out;
+}
+
 void *
-wrapper_divisor_lower(const struct wrapper_device *device,
+wrapper_divisor_lower(struct wrapper_device *device,
                       const VkGraphicsPipelineCreateInfo *in,
                       VkGraphicsPipelineCreateInfo *out)
 {
@@ -78,18 +177,49 @@ wrapper_divisor_lower(const struct wrapper_device *device,
       }
    }
    out->pVertexInputState = &l->vi;
+
+   bool grouped = false;
+   u_foreach_bit(b, l->info.mask)
+      grouped |= l->info.divisor[b] > 1;
+   if (grouped && in->stageCount <= ARRAY_SIZE(l->stages)) {
+      memcpy(l->stages, in->pStages, in->stageCount * sizeof(*l->stages));
+      for (uint32_t i = 0; i < in->stageCount; i++) {
+         if (l->stages[i].stage != VK_SHADER_STAGE_VERTEX_BIT || !l->stages[i].module)
+            continue;
+         l->info.module = vertex_module_without_base_instance(device, l->stages[i].module);
+         if (l->info.module) {
+            l->stages[i].module = l->info.module;
+            out->pStages = l->stages;
+         }
+      }
+   }
    return l;
+}
+
+static void
+drop_module(struct wrapper_device *device, VkShaderModule module)
+{
+   if (!module)
+      return;
+   wrapper_stride_forget_module(device, module);
+   device->dispatch_table.DestroyShaderModule(device->dispatch_handle, module, NULL);
 }
 
 void
 wrapper_divisor_record(struct wrapper_device *device, void *lowering, VkPipeline pipeline)
 {
    struct wrapper_divisor_lowering *l = lowering;
-   if (!l || pipeline == VK_NULL_HANDLE || !l->info.mask)
+   if (!l)
       return;
+   if (pipeline == VK_NULL_HANDLE || !l->info.mask) {
+      drop_module(device, l->info.module);
+      return;
+   }
    struct wrapper_divisor_pipeline *p = malloc(sizeof(*p));
-   if (!p)
+   if (!p) {
+      drop_module(device, l->info.module);
       return;
+   }
    *p = l->info;
    simple_mtx_lock(&device->resource_mutex);
    _mesa_hash_table_u64_insert(device->divisor_pipeline_table, (uint64_t)pipeline, p);
@@ -105,6 +235,8 @@ wrapper_divisor_destroy(struct wrapper_device *device, VkPipeline pipeline)
    if (p)
       _mesa_hash_table_u64_remove(device->divisor_pipeline_table, (uint64_t)pipeline);
    simple_mtx_unlock(&device->resource_mutex);
+   if (p)
+      drop_module(device, p->module);
    free(p);
 }
 
@@ -244,6 +376,13 @@ wrapper_divisor_draw(struct wrapper_command_buffer *wcb, bool indexed, uint32_t 
          group = group ? gcd(group, p->divisor[b]) : p->divisor[b];
    if (!group)
       group = MAX2(instance_count, 1);
+
+   static bool warned_first;
+   if (first_instance && p->module && !warned_first) {
+      warned_first = true;
+      WRAPPER_LOG(error, "Instanced draw with firstInstance %u and a vertex attribute divisor: "
+                         "the shader instance index is off by firstInstance", first_instance);
+   }
 
    uint32_t saved[WRAPPER_DIVISOR_MAX_BINDINGS], saved_valid = 0;
    if (wcb->stride_pipeline) {

@@ -4406,7 +4406,8 @@ wrapper_CreateShaderModule(VkDevice _device,
    
    VkResult result = device->dispatch_table.CreateShaderModule(
       device->dispatch_handle, &create_info, pAllocator, pShaderModule);
-   if (result == VK_SUCCESS && device->emulate_dynamic_stride)
+   if (result == VK_SUCCESS &&
+       (device->emulate_dynamic_stride || device->emulate_vertex_divisor))
       wrapper_stride_note_module(device, *pShaderModule, create_info.pCode,
                                  create_info.codeSize);
    return result;
@@ -4417,7 +4418,7 @@ wrapper_DestroyShaderModule(VkDevice _device, VkShaderModule shaderModule,
                             const VkAllocationCallbacks *pAllocator)
 {
    VK_FROM_HANDLE(wrapper_device, device, _device);
-   if (device->emulate_dynamic_stride)
+   if (device->emulate_dynamic_stride || device->emulate_vertex_divisor)
       wrapper_stride_forget_module(device, shaderModule);
    device->dispatch_table.DestroyShaderModule(device->dispatch_handle, shaderModule,
                                               pAllocator);

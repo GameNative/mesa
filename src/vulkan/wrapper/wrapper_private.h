@@ -328,6 +328,8 @@ struct wrapper_stride_pipeline;
 void wrapper_stride_note_module(struct wrapper_device *device, VkShaderModule module,
                                 const uint32_t *code, size_t size);
 void wrapper_stride_forget_module(struct wrapper_device *device, VkShaderModule module);
+uint32_t *wrapper_stride_module_code(struct wrapper_device *device, VkShaderModule module,
+                                     size_t *size);
 bool wrapper_stride_wants(const struct wrapper_device *device,
                           const VkGraphicsPipelineCreateInfo *info);
 VkResult wrapper_stride_create(struct wrapper_device *device, VkPipelineCache cache,
@@ -342,7 +344,7 @@ void wrapper_stride_reset(struct wrapper_command_buffer *wcb);
 void wrapper_stride_finish(struct wrapper_device *device);
 
 struct wrapper_divisor_pipeline;
-void *wrapper_divisor_lower(const struct wrapper_device *device,
+void *wrapper_divisor_lower(struct wrapper_device *device,
                             const VkGraphicsPipelineCreateInfo *in,
                             VkGraphicsPipelineCreateInfo *out);
 void wrapper_divisor_record(struct wrapper_device *device, void *lowering, VkPipeline pipeline);
