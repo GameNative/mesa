@@ -33,8 +33,8 @@ astc_enabled(void)
 /* ASTC block footprint: 0 = 4x4 (8bpp, crisp), 1 = 8x8 (2bpp, 4x smaller/softer).
  * Selected by WRAPPER_ASTC_BLOCK ("4x4" default, "8x8"). */
 /* bcnEmulationType=compute (ENABLE_BCN_COMPUTE=1, the app's default) means
- * the parity policy on the GPU path whatever the quality setting; 8x8 is
- * taken only with the CPU path (bcnEmulationType=cpu, quality=low). */
+ * the parity policy whatever the quality setting; 8x8 is taken only with
+ * bcnEmulationType=cpu and quality=low. */
 static int
 astc_block8(void)
 {
@@ -240,38 +240,24 @@ get_block_size(VkFormat format)
     }
 }
 
-/* An RGB half texel as E5B9G9R9 (shared exponent, 9-bit mantissas). Negative
- * values clamp to 0. */
+/* An RGB half texel as B10G11R11 (5-bit exponents, 6/6/5-bit mantissas,
+ * rounded to nearest). Negative values and NaN become 0. */
 static uint32_t
-bcn_half_to_e5b9g9r9(const uint16_t rgb[3])
+bcn_half_to_b10g11r11(const uint16_t rgb[3])
 {
-   float v[3], m = 0.0f;
+   static const int mbits[3] = { 6, 6, 5 };
+   uint32_t out = 0, shift = 0;
    for (int c = 0; c < 3; c++) {
-      _Float16 hv;
-      memcpy(&hv, &rgb[c], 2);
-      v[c] = (float)hv;
-      if (!(v[c] > 0.0f))
-         v[c] = 0.0f;
-      if (v[c] > 65408.0f)
-         v[c] = 65408.0f;
-      m = v[c] > m ? v[c] : m;
-   }
-   int e = m > 0.0f ? (int)floorf(log2f(m)) : -16;
-   if (e < -16)
-      e = -16;
-   int shared = e + 16;
-   float scale = exp2f((float)(shared - 15 - 9));
-   if ((int)floorf(m / scale + 0.5f) == 512) {
-      shared++;
-      scale *= 2.0f;
-   }
-   if (shared > 31)
-      shared = 31;
-   uint32_t out = (uint32_t)shared << 27;
-   for (int c = 0; c < 3; c++) {
-      int q = (int)floorf(v[c] / scale + 0.5f);
-      q = q > 511 ? 511 : q;
-      out |= (uint32_t)q << (9 * c);
+      uint32_t h = rgb[c];
+      uint32_t drop = 10 - mbits[c];
+      uint32_t maxv = (30u << mbits[c]) | ((1u << mbits[c]) - 1);
+      uint32_t v;
+      if ((h & 0x8000) || (h & 0x7fff) > 0x7c00)
+         v = 0;
+      else
+         v = MIN2(((h & 0x7fff) + (1u << (drop - 1))) >> drop, maxv);
+      out |= v << shift;
+      shift += mbits[c] + 5;
    }
    return out;
 }
@@ -379,7 +365,7 @@ decompression_routine(void *args)
                bcdec_bc6h_half(src, rgb, 12, is_signed);
                if (params->texel_size == 4) {
                   for (int i = 0; i < 16; i++)
-                     ((uint32_t *)scratch)[i] = bcn_half_to_e5b9g9r9(rgb + i * 3);
+                     ((uint32_t *)scratch)[i] = bcn_half_to_b10g11r11(rgb + i * 3);
                   break;
                }
                for (int i = 0; i < 16; i++) {
@@ -440,7 +426,7 @@ get_decode_format_for_bcn(VkFormat bcn_format)
 /* Storage (image) format. The UNORM formats go to ASTC (BC4 as luminance,
  * BC5 as luminance + alpha, put back in place by the image view swizzle),
  * BC6H to ASTC 4x4 HDR where the device has it, else unsigned BC6H to
- * E5B9G9R9 and signed BC6H to RGBA16F. ASTC has no signed formats, so the
+ * B10G11R11 and signed BC6H to RGBA16F. ASTC has no signed formats, so the
  * SNORM BC4/BC5 variants are decoded. */
 VkFormat
 get_format_for_bcn(VkFormat bcn_format)
@@ -471,7 +457,7 @@ get_format_for_bcn(VkFormat bcn_format)
          if (__atomic_load_n(&bcn_astc_hdr, __ATOMIC_RELAXED))
             return VK_FORMAT_ASTC_4x4_SFLOAT_BLOCK;
          if (bcn_format == VK_FORMAT_BC6H_UFLOAT_BLOCK)
-            return VK_FORMAT_E5B9G9R9_UFLOAT_PACK32;
+            return VK_FORMAT_B10G11R11_UFLOAT_PACK32;
          break;
       default:
          break;
@@ -514,7 +500,7 @@ bcn_stored_name(VkFormat img)
    case VK_FORMAT_R8G8_UNORM: return "rg8";
    case VK_FORMAT_R8G8_SNORM: return "rg8snorm";
    case VK_FORMAT_R16G16B16A16_SFLOAT: return "rgba16f";
-   case VK_FORMAT_E5B9G9R9_UFLOAT_PACK32: return "e5b9g9r9";
+   case VK_FORMAT_B10G11R11_UFLOAT_PACK32: return "b10g11r11";
    default: return "rgba8";
    }
 }
