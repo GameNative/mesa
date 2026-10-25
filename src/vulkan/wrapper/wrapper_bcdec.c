@@ -445,47 +445,61 @@ decompression_routine(void *args)
             continue;
          }
 
-         char *dst = dst_base + (pixel_y * params->stride) + (pixel_x * params->texel_size);
-         if (!dst || !src)
-            return NULL;
+         uint8_t scratch[128];
+         int pitch = params->texel_size * 4;
+         int is_signed = params->format == VK_FORMAT_BC4_SNORM_BLOCK ||
+                         params->format == VK_FORMAT_BC5_SNORM_BLOCK ||
+                         params->format == VK_FORMAT_BC6H_SFLOAT_BLOCK;
 
          switch (params->format) {
             case VK_FORMAT_BC1_RGB_UNORM_BLOCK:
             case VK_FORMAT_BC1_RGB_SRGB_BLOCK:
+               bcdec_bc1(src, scratch, pitch);
+               for (int i = 0; i < 16; i++)
+                  scratch[i * 4 + 3] = 255;
+               break;
             case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
             case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
-               bcdec_bc1(src, dst, params->stride);
+               bcdec_bc1(src, scratch, pitch);
                break;
             case VK_FORMAT_BC2_SRGB_BLOCK:
             case VK_FORMAT_BC2_UNORM_BLOCK:
-               bcdec_bc2(src, dst, params->stride);
+               bcdec_bc2(src, scratch, pitch);
                break;
             case VK_FORMAT_BC3_UNORM_BLOCK:
             case VK_FORMAT_BC3_SRGB_BLOCK:
-               bcdec_bc3(src, dst, params->stride);
+               bcdec_bc3(src, scratch, pitch);
                break;
             case VK_FORMAT_BC4_UNORM_BLOCK:
             case VK_FORMAT_BC4_SNORM_BLOCK:
-               bcdec_bc4(src, dst, params->stride, params->format == VK_FORMAT_BC4_SNORM_BLOCK);
+               bcdec_bc4(src, scratch, pitch, is_signed);
                break;
             case VK_FORMAT_BC5_SNORM_BLOCK:
             case VK_FORMAT_BC5_UNORM_BLOCK:
-               bcdec_bc5(src, dst, params->stride, params->format == VK_FORMAT_BC5_SNORM_BLOCK);
+               bcdec_bc5(src, scratch, pitch, is_signed);
                break;
             case VK_FORMAT_BC6H_SFLOAT_BLOCK:
             case VK_FORMAT_BC6H_UFLOAT_BLOCK:
-               bcdec_bc6h_half(src, dst, (params->stride / params->texel_size) * 3, params->format == VK_FORMAT_BC6H_SFLOAT_BLOCK);
+               bcdec_bc6h_half(src, scratch, pitch / 2, is_signed);
                break;
             case VK_FORMAT_BC7_SRGB_BLOCK:
             case VK_FORMAT_BC7_UNORM_BLOCK:
-               bcdec_bc7(src, dst, params->stride);
+               bcdec_bc7(src, scratch, pitch);
                break;
             default:
+               memset(scratch, 0, sizeof(scratch));
                break;
          }
+
+         int cols = MIN2(4, params->w - pixel_x);
+         int rows = MIN2(4, params->h - pixel_y);
+         for (int y = 0; y < rows; y++)
+            memcpy(dst_base + (size_t)(pixel_y + y) * params->stride +
+                      (size_t)pixel_x * params->texel_size,
+                   scratch + y * pitch, (size_t)cols * params->texel_size);
       }
    }
-   
+
    return NULL;
 }
 
@@ -1195,6 +1209,8 @@ decompress_bcn_format(void *srcBuffer,
       args[0].astc8 = 0;
       args[0].astc6 = 0;
       args[0].has_alpha = has_alpha;
+      args[0].w = w;
+      args[0].h = h;
       decompression_routine(&args[0]);
    } else {
       int core_count = sysconf(_SC_NPROCESSORS_CONF);
@@ -1231,6 +1247,8 @@ decompress_bcn_format(void *srcBuffer,
          args[i].astc8 = 0;
          args[i].astc6 = 0;
          args[i].has_alpha = has_alpha;
+         args[i].w = w;
+         args[i].h = h;
          pthread_create(&threads[i], NULL, decompression_routine, &args[i]);
          current_row += rows;
       }
