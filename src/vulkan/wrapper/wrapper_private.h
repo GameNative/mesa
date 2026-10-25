@@ -41,6 +41,7 @@ struct wrapper_physical_device {
    bool is_vkd3d;
    bool emulate_imageless_framebuffer;
    bool emulate_vulkan13;
+   bool fold_sets;
    bool emulate_vertex_divisor;
    bool emulate_zero_divisor;
    char *resource_type;
@@ -87,6 +88,16 @@ struct wrapper_device {
    struct hash_table_u64 *stride_pipeline_table;
    struct hash_table_u64 *shader_code_table;
    bool emulate_dynamic_stride;
+   bool emulate_eds;
+   bool emulate_eds2;
+   bool fold_sets;
+   simple_mtx_t fold_mutex;
+   struct hash_table_u64 *fold_layout_table;
+   struct hash_table_u64 *fold_pl_table;
+   struct hash_table_u64 *fold_set_table;
+   struct fold_merge *fold_merges;
+   uint32_t fold_max_pool_count;
+   uint32_t max_viewports;
    struct hash_table_u64 *divisor_pipeline_table;
    bool emulate_vertex_divisor;
    bool emulate_zero_divisor;
@@ -203,6 +214,31 @@ struct wrapper_fence {
  * a single command buffer recording. Pools live on the command buffer and are
  * reset (not freed) at Begin/Reset -- safe because a CB can't be re-recorded
  * while still executing -- and destroyed when the command buffer is freed. */
+enum wrapper_eds_field {
+   WRAPPER_EDS_CULL,
+   WRAPPER_EDS_FRONT,
+   WRAPPER_EDS_TOPOLOGY,
+   WRAPPER_EDS_DEPTH_TEST,
+   WRAPPER_EDS_DEPTH_WRITE,
+   WRAPPER_EDS_DEPTH_COMPARE,
+   WRAPPER_EDS_DEPTH_BOUNDS,
+   WRAPPER_EDS_STENCIL_TEST,
+   WRAPPER_EDS_FRONT_FAIL,
+   WRAPPER_EDS_FRONT_PASS,
+   WRAPPER_EDS_FRONT_DEPTH_FAIL,
+   WRAPPER_EDS_FRONT_COMPARE,
+   WRAPPER_EDS_BACK_FAIL,
+   WRAPPER_EDS_BACK_PASS,
+   WRAPPER_EDS_BACK_DEPTH_FAIL,
+   WRAPPER_EDS_BACK_COMPARE,
+   WRAPPER_EDS_RASTER_DISCARD,
+   WRAPPER_EDS_DEPTH_BIAS,
+   WRAPPER_EDS_PRIM_RESTART,
+   WRAPPER_EDS_VIEWPORTS,
+   WRAPPER_EDS_SCISSORS,
+   WRAPPER_EDS_COUNT,
+};
+
 struct wrapper_push_pool {
    struct wrapper_push_pool *next;
    VkDescriptorPool pool;
@@ -226,6 +262,8 @@ struct wrapper_command_buffer {
    VkPipeline stride_bound;
    uint32_t vertex_strides[32];
    uint32_t vertex_strides_valid;
+   uint32_t eds[WRAPPER_EDS_COUNT];
+   uint32_t eds_valid;
    const struct wrapper_divisor_pipeline *divisor_pipeline;
    VkBuffer vb_buffer[32];
    VkDeviceSize vb_offset[32];
@@ -325,6 +363,46 @@ wrapper_device_memory_destroy(struct wrapper_device_memory *mem);
 int wrapper_diag_on(void);
 void wrapper_diag_append(const char *fmt, ...);
 
+bool wrapper_core13_wanted(const struct wrapper_physical_device *pdevice,
+                           const char *engine_name);
+void wrapper_core13_init_physical_device(struct wrapper_physical_device *pdevice);
+void wrapper_core13_fill_properties(struct wrapper_physical_device *pdevice,
+                                    VkPhysicalDeviceProperties2 *props);
+void wrapper_format_properties3_from_legacy(struct wrapper_physical_device *pdevice,
+                                            VkFormat format,
+                                            VkFormatProperties2 *props);
+void *wrapper_core13_lower_device_create(struct wrapper_device *device,
+                                         VkDeviceCreateInfo *info,
+                                         const char **exts, uint32_t *ext_count);
+void wrapper_core13_free_device_create(void *storage);
+
+void wrapper_fold_init(struct wrapper_device *device);
+void wrapper_fold_note_pool(struct wrapper_device *device, const VkDescriptorPoolCreateInfo *info);
+void wrapper_fold_note_layout(struct wrapper_device *device,
+                              const VkDescriptorSetLayoutCreateInfo *info,
+                              VkDescriptorSetLayout handle);
+bool wrapper_fold_create_pipeline_layout(struct wrapper_device *device,
+                                         const VkPipelineLayoutCreateInfo *info,
+                                         const VkAllocationCallbacks *alloc,
+                                         VkPipelineLayout *out, VkResult *result);
+void wrapper_fold_destroy_pipeline_layout(struct wrapper_device *device, VkPipelineLayout layout);
+bool wrapper_fold_layout_folded(struct wrapper_device *device, VkPipelineLayout layout);
+uint32_t wrapper_fold_set_index(struct wrapper_device *device, VkPipelineLayout layout,
+                                uint32_t set);
+uint32_t *wrapper_fold_remap_spirv(struct wrapper_device *device, VkPipelineLayout layout,
+                                   const uint32_t *code, size_t words);
+void wrapper_fold_note_sets(struct wrapper_device *device, const VkDescriptorSetAllocateInfo *info,
+                            const VkDescriptorSet *sets);
+void wrapper_fold_free_sets(struct wrapper_device *device, uint32_t count,
+                            const VkDescriptorSet *sets);
+void wrapper_fold_reset_pool(struct wrapper_device *device, VkDescriptorPool pool);
+bool wrapper_fold_remap_updates(struct wrapper_device *device,
+                                uint32_t *write_count, VkWriteDescriptorSet **writes,
+                                uint32_t *copy_count, VkCopyDescriptorSet **copies);
+bool wrapper_fold_bind(struct wrapper_command_buffer *wcb, VkPipelineBindPoint bind_point,
+                       VkPipelineLayout layout, uint32_t first, uint32_t count,
+                       const VkDescriptorSet *sets, uint32_t dyn_count, const uint32_t *dyn);
+
 struct wrapper_stride_pipeline;
 
 void wrapper_stride_note_module(struct wrapper_device *device, VkShaderModule module,
@@ -342,6 +420,8 @@ void wrapper_stride_bind(struct wrapper_command_buffer *wcb, VkPipeline pipeline
 void wrapper_stride_set(struct wrapper_command_buffer *wcb, uint32_t first, uint32_t count,
                         const VkDeviceSize *strides);
 void wrapper_stride_flush(struct wrapper_command_buffer *wcb);
+void wrapper_eds_set(struct wrapper_command_buffer *wcb, enum wrapper_eds_field field,
+                     uint32_t value);
 void wrapper_stride_reset(struct wrapper_command_buffer *wcb);
 void wrapper_stride_finish(struct wrapper_device *device);
 

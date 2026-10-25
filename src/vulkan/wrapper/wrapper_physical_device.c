@@ -325,19 +325,19 @@ VkResult enumerate_physical_device(struct vk_instance *_instance)
       pdevice->dispatch_table.GetPhysicalDeviceProperties2(
          pdevice->dispatch_handle, &pdevice->properties2);
 
-      /* Raising the reported core version above the base ICD requires
-       * substantial lowering. Keep it opt-in and select it from the actual API
-       * gap, not from a vendor ID. */
       pdevice->emulate_vulkan13 =
-         getenv("WRAPPER_EMULATE_VULKAN_1_3") &&
-         atoi(getenv("WRAPPER_EMULATE_VULKAN_1_3")) &&
-         pdevice->properties2.properties.apiVersion < VK_API_VERSION_1_3;
+         wrapper_core13_wanted(pdevice, instance->vk.app_info.engine_name);
       if (pdevice->emulate_vulkan13)
-         WRAPPER_LOG(info, "Lowering Vulkan 1.3 core calls for a %u.%u base driver "
-                           "(WRAPPER_EMULATE_VULKAN_1_3)",
-                     VK_API_VERSION_MAJOR(pdevice->properties2.properties.apiVersion),
-                     VK_API_VERSION_MINOR(pdevice->properties2.properties.apiVersion));
-         
+         wrapper_core13_init_physical_device(pdevice);
+      pdevice->fold_sets = pdevice->emulate_vulkan13 &&
+         instance->vk.app_info.engine_name &&
+         strstr(instance->vk.app_info.engine_name, "vkd3d") &&
+         pdevice->properties2.properties.limits.maxBoundDescriptorSets < 8 &&
+         debug_get_bool_option("WRAPPER_FOLD_DESCRIPTOR_SETS", true);
+      if (pdevice->fold_sets)
+         WRAPPER_LOG(info, "Reporting 8 descriptor sets (driver has %u); bindless sets are folded",
+                     pdevice->properties2.properties.limits.maxBoundDescriptorSets);
+
       pdevice->dispatch_table.GetPhysicalDeviceMemoryProperties(
          pdevice->dispatch_handle, &pdevice->memory_properties);
       wrapper_setup_coherent_memory_types(pdevice);
@@ -367,7 +367,7 @@ VkResult enumerate_physical_device(struct vk_instance *_instance)
 
       if (!pdevice->base_supported_features.hostQueryReset &&
           debug_get_bool_option("WRAPPER_EMULATE_HOST_QUERY_RESET",
-                                nvidia_proprietary)) {
+                                nvidia_proprietary || pdevice->emulate_vulkan13)) {
          WRAPPER_LOG(info, "Emulating VK_EXT_host_query_reset "
                            "(base driver lacks it; resets go through a command buffer)");
          pdevice->vk.supported_extensions.EXT_host_query_reset = true;
@@ -429,6 +429,10 @@ VkResult enumerate_physical_device(struct vk_instance *_instance)
             !pdevice->base_supported_features.vertexAttributeInstanceRateZeroDivisor;
          pdevice->vk.supported_extensions.EXT_vertex_attribute_divisor = true;
          pdevice->vk.supported_extensions.KHR_vertex_attribute_divisor = true;
+         if (pdevice->emulate_vertex_divisor) {
+            supported_features->vertexAttributeInstanceRateDivisor = true;
+            supported_features->vertexAttributeInstanceRateZeroDivisor = true;
+         }
          WRAPPER_LOG(info, "Disabling VK_EXT_calibrated_timestamps");
          pdevice->vk.supported_extensions.EXT_calibrated_timestamps = false;
          if (!is_d3d) {
@@ -654,6 +658,8 @@ wrapper_GetPhysicalDeviceProperties(VkPhysicalDevice physicalDevice,
 
    if (api_version > 0)
       pProperties->apiVersion = api_version;
+   if (pdevice->fold_sets)
+      pProperties->limits.maxBoundDescriptorSets = 8;
 
    /* See wrapper_GetPhysicalDeviceProperties2: bump push constant size to the
     * DXVK-required minimum on Xclipse. */
@@ -722,6 +728,8 @@ wrapper_GetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice,
 
    if (api_version > 0)
       pProperties->properties.apiVersion = api_version;
+   if (pdevice->fold_sets)
+      pProperties->properties.limits.maxBoundDescriptorSets = 8;
 
    /* DXVK 2.6+ requires maxPushConstantsSize >= 256 (its unified "push data"
     * model) and skips the adapter otherwise. Xclipse reports less; the RDNA
@@ -732,6 +740,9 @@ wrapper_GetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice,
    if (pdevice->driver_properties.driverID == VK_DRIVER_ID_SAMSUNG_PROPRIETARY &&
        pProperties->properties.limits.maxPushConstantsSize < 256)
       pProperties->properties.limits.maxPushConstantsSize = 256;
+
+   if (pdevice->emulate_vulkan13)
+      wrapper_core13_fill_properties(pdevice, pProperties);
 
    vk_foreach_struct(prop, pProperties->pNext) {
       switch (prop->sType) {
@@ -1101,6 +1112,9 @@ wrapper_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice,
 
    pdevice->dispatch_table.GetPhysicalDeviceFormatProperties2(pdevice->dispatch_handle,
       format, pFormatProperties);
+   if (pdevice->properties2.properties.apiVersion < VK_API_VERSION_1_3 &&
+       !pdevice->base_supported_extensions.KHR_format_feature_flags2)
+      wrapper_format_properties3_from_legacy(pdevice, format, pFormatProperties);
 
    switch (format) {
    case VK_FORMAT_BC1_RGB_UNORM_BLOCK:
