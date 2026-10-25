@@ -43,6 +43,9 @@ int
 get_texel_size_for_format(VkFormat format);
 
 int
+bcn_is_native(struct wrapper_physical_device *pdev, VkFormat format);
+
+int
 is_emulated_bcn(struct wrapper_physical_device *pdev, VkFormat format);
 
 int
