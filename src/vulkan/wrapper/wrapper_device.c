@@ -1395,6 +1395,9 @@ if (pdf2 && pdf2->features.f) { \
          WRAPPER_LOG(error, "Driver vkCreateDevice failed (%d) with the feature chain, "
                             "retrying with a NULL pNext chain: every requested "
                             "extension feature is dropped", result);
+         WRAPPER_LOG(info, "Forcing device creation with a NULL pNext chain");
+         wrapper_diag_append("[BCN] vkCreateDevice returned %d, retrying without the "
+                             "feature chain\n", result);
          wrapper_create_info.pNext = NULL;
          used_fallback_create = true;
          result = physical_device->dispatch_table.CreateDevice(
@@ -1495,6 +1498,12 @@ if (pdf2 && pdf2->features.f) { \
       char storage[512];
       bcn_describe_storage(storage, sizeof(storage));
       wrapper_diag_append("[BCN] storage %s\n", storage);
+      wrapper_diag_append("[BCN] bufferDeviceAddress: base=%d api=%u.%u requested=%d "
+                          "fallback=%d\n",
+                          physical_device->base_supported_features.bufferDeviceAddress,
+                          VK_API_VERSION_MAJOR(physical_device->properties2.properties.apiVersion),
+                          VK_API_VERSION_MINOR(physical_device->properties2.properties.apiVersion),
+                          bcn_bda, used_fallback_create);
       wrapper_bcn_gpu_init(device, pCreateInfo->queueCreateInfoCount ?
          pCreateInfo->pQueueCreateInfos[0].queueFamilyIndex : UINT32_MAX);
    }
