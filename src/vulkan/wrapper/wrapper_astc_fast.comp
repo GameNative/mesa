@@ -444,6 +444,8 @@ void main()
 
    float best = 1e30;
    uint best_out[4] = uint[](0u, 0u, 0u, 0u);
+   float first_err = -1.0;
+   uint first_q = 0u;
    [[dont_unroll]] for (uint k = 0u; k < passes; k++) {
       uint cls = min(cls0 + k, cls1);
       bool dual = cls == 2u || cls == 5u;
@@ -487,6 +489,10 @@ void main()
       if (cls == 3u)
          te += (255.0 - texel.a) * (255.0 - texel.a);
       float err = sumf(live ? te : 0.0);
+      if (first_err < 0.0) {
+         first_err = err;
+         first_q = cq | (wq << 8) | (cls << 16) | (W << 20) | (H << 24);
+      }
       if (ti != 0u || !live || same || k > 0u && cls == min(cls0, cls1) && cls1 == cls0 || err >= best)
          continue;
       best = err;
@@ -539,6 +545,9 @@ void main()
       d.w[off + 3u] = u.b | (u.a << 16);
       return;
    }
+   /* no candidate kept: what the self-test log shows to find out why */
+   if (best_out[0] == 0u)
+      best_out = uint[](0u, floatBitsToUint(first_err), first_q, floatBitsToUint(texel.r));
    d.w[off] = best_out[0];
    d.w[off + 1u] = best_out[1];
    d.w[off + 2u] = best_out[2];
