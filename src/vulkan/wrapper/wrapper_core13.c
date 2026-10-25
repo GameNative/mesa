@@ -202,6 +202,13 @@ wrapper_core13_init_physical_device(struct wrapper_physical_device *pdevice)
    f->dynamicRendering = true;
    f->synchronization2 = true;
    f->maintenance4 = true;
+   f->shaderZeroInitializeWorkgroupMemory = true;
+   f->descriptorIndexing |= e->EXT_descriptor_indexing;
+   f->samplerMirrorClampToEdge |= e->KHR_sampler_mirror_clamp_to_edge;
+   f->drawIndirectCount |= e->KHR_draw_indirect_count;
+   f->samplerFilterMinmax |= e->EXT_sampler_filter_minmax;
+   f->shaderOutputViewportIndex |= e->EXT_shader_viewport_index_layer;
+   f->shaderOutputLayer |= e->EXT_shader_viewport_index_layer;
    if (debug_get_bool_option("WRAPPER_EMULATE_EXTENDED_DYNAMIC_STATE", true)) {
       f->extendedDynamicState = true;
       f->extendedDynamicState2 = true;

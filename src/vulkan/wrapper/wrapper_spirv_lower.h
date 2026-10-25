@@ -14,8 +14,10 @@ enum wrapper_spirv_lower_result {
    WRAPPER_SPIRV_FAILED,
 };
 
+#define WRAPPER_SPIRV_STRIP_WORKGROUP_INIT (1u << 0)
+
 enum wrapper_spirv_lower_result
-wrapper_spirv_lower_to_1_3(const uint32_t *in, size_t words,
+wrapper_spirv_lower_to_1_3(const uint32_t *in, size_t words, uint32_t flags,
                            uint32_t **out_code, size_t *out_words);
 
 #ifdef __cplusplus

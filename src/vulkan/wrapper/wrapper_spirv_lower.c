@@ -274,7 +274,7 @@ spv_copy_logical(struct spv_info *info, struct spv_buf *b, uint32_t dst_type,
 }
 
 enum wrapper_spirv_lower_result
-wrapper_spirv_lower_to_1_3(const uint32_t *in, size_t words,
+wrapper_spirv_lower_to_1_3(const uint32_t *in, size_t words, uint32_t flags,
                            uint32_t **out_code, size_t *out_words)
 {
    if (words < 5 || in[0] != SPV_MAGIC || in[1] <= SPV_1_3)
@@ -420,6 +420,13 @@ wrapper_spirv_lower_to_1_3(const uint32_t *in, size_t words,
       case OP_MEMBER_DECORATE:
          if (n >= 4 && (w[3] == 4469 || w[3] == 4470))
             continue;
+         break;
+      case OP_VARIABLE:
+         if (n == 5 && w[3] == 4 && (flags & WRAPPER_SPIRV_STRIP_WORKGROUP_INIT)) {
+            uint32_t v[4] = { (4u << 16) | OP_VARIABLE, w[1], w[2], w[3] };
+            buf_put(&b, v, 4);
+            continue;
+         }
          break;
       case OP_TERMINATE_INVOCATION: {
          uint32_t k = (1u << 16) | OP_KILL;

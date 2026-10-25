@@ -4553,8 +4553,10 @@ wrapper_CreateShaderModule(VkDevice _device,
 
    if (create_info.codeSize >= 20 &&
        create_info.pCode[1] > wrapper_max_spirv_version(device->physical)) {
+      uint32_t flags = device->physical->base_supported_features.shaderZeroInitializeWorkgroupMemory
+         ? 0 : WRAPPER_SPIRV_STRIP_WORKGROUP_INIT;
       enum wrapper_spirv_lower_result r = wrapper_spirv_lower_to_1_3(
-         create_info.pCode, create_info.codeSize / 4, &lowered, &lowered_words);
+         create_info.pCode, create_info.codeSize / 4, flags, &lowered, &lowered_words);
       if (r == WRAPPER_SPIRV_LOWERED) {
          create_info.pCode = lowered;
          create_info.codeSize = lowered_words * 4;
