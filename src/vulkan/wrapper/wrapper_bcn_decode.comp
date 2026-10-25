@@ -10,7 +10,8 @@
  *
  * format: 0 BC1, 1 BC1 without alpha, 2 BC2, 3 BC3, 4 BC4, 5 BC4 SNORM,
  *         6 BC5, 7 BC5 SNORM, 8 BC6H UF16, 9 BC6H SF16, 10 BC7
- * flags bit 0: write BC4/BC5 as RGBA8 texels (for the ASTC encoder)
+ * flags bit 0: write BC4/BC5 as RGBA8 texels for the ASTC encoder, with the
+ *              second BC5 channel also in alpha
  */
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Words { uint w[]; };
@@ -493,6 +494,8 @@ void main()
       decode_channel(blk.x, blk.y, fmt == 7u, r);
       decode_channel(blk.z, blk.w, fmt == 7u, g);
       for (uint i = 0u; i < 16u; i++) texels[i] = (uint(r[i]) & 0xffu) | ((uint(g[i]) & 0xffu) << 8);
+      if ((pc.flags & 1u) != 0u)
+         for (uint i = 0u; i < 16u; i++) texels[i] |= (texels[i] & 0xff00u) << 16;
    } else if (fmt == 8u || fmt == 9u) {
       decode_bc6h(fmt == 9u);
    } else {

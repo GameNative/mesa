@@ -4749,11 +4749,15 @@ wrapper_bcn_do_copy_regions(struct wrapper_command_buffer *wcb,
                     uint32_t regionCount,
                     const VkBufferImageCopy *pRegions)
 {
-   uint32_t done = wrapper_bcn_gpu_path() ?
-      wrapper_bcn_gpu_upload(wcb, wi, wb->dispatch_handle, dstLayout, regionCount, pRegions) : 0;
-   if (done < regionCount)
+   bool gpu = wrapper_bcn_gpu_path();
+   for (uint32_t i = 0; i < regionCount; i++) {
+      /* the GPU path, or a region that has to be merged into whole ASTC blocks */
+      if ((gpu || wrapper_bcn_gpu_misaligned(wi, &pRegions[i])) &&
+          wrapper_bcn_gpu_upload(wcb, wi, wb->dispatch_handle, dstLayout, 1, &pRegions[i]))
+         continue;
       wrapper_bcn_cpu_copy_regions(wcb, device, wb, wi->dispatch_handle, dstLayout,
-                                   wi->info.format, regionCount - done, pRegions + done);
+                                   wi->info.format, 1, &pRegions[i]);
+   }
 }
 
 /* Capped images: dropped mips leave only their .src, the rest move down,
