@@ -285,6 +285,98 @@ bcn_decode_rg_rgba(VkFormat format, const char *src, unsigned char *dst, int str
    }
 }
 
+#define W(q) (1u << (q))
+
+/* Texels of a BC1 block in three-colour mode that decode to transparent black. */
+static uint16_t
+bcn_bc1_clear_mask(const uint8_t *blk)
+{
+   uint16_t c0 = blk[0] | (blk[1] << 8), c1 = blk[2] | (blk[3] << 8), m = 0;
+   if (c0 > c1)
+      return 0;
+   for (int i = 0; i < 16; i++)
+      if (((blk[4 + i / 4] >> ((i & 3) * 2)) & 3) == 3)
+         m |= 1 << i;
+   return m;
+}
+
+/* Block configurations worth trying for one source block, from what the BC
+ * block can hold: BC1 is one colour line, BC2/BC3 add an independent alpha,
+ * BC5 two independent channels, and a BC7 block names its own mode, partition
+ * and rotation. */
+static void
+bcn_astc_hint(VkFormat format, const uint8_t *blk, struct astc_hint *h)
+{
+   memset(h, 0, sizeof(*h));
+   h->srgb = get_decode_format_for_bcn(format) == VK_FORMAT_R8G8B8A8_SRGB;
+   h->alpha = bcn_has_alpha(format);
+   h->dual_ccs = -1;
+   h->seed3 = -1;
+
+   switch (format) {
+   case VK_FORMAT_BC1_RGB_UNORM_BLOCK:
+   case VK_FORMAT_BC1_RGB_SRGB_BLOCK:
+   case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
+   case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
+      h->single_wq = W(1) | W(2) | W(5);
+      h->dual_ccs = 3;
+      h->dual_wq = W(1) | W(2);
+      if (h->alpha && bcn_bc1_clear_mask(blk)) {
+         h->masks[h->nmasks++] = bcn_bc1_clear_mask(blk);
+         h->clear = 1;
+         h->part_wq = W(1) | W(2);
+      }
+      break;
+   case VK_FORMAT_BC2_UNORM_BLOCK:
+   case VK_FORMAT_BC2_SRGB_BLOCK:
+   case VK_FORMAT_BC3_UNORM_BLOCK:
+   case VK_FORMAT_BC3_SRGB_BLOCK:
+      h->single_wq = W(5);
+      h->dual_ccs = 3;
+      h->dual_wq = W(1) | W(2);
+      break;
+   case VK_FORMAT_BC5_UNORM_BLOCK:
+      h->single_wq = W(5);
+      h->dual_ccs = 1;
+      h->dual_wq = W(2) | W(3);
+      break;
+   case VK_FORMAT_BC7_UNORM_BLOCK:
+   case VK_FORMAT_BC7_SRGB_BLOCK: {
+      int mode = 0;
+      while (mode < 8 && !((blk[0] >> mode) & 1))
+         mode++;
+      h->single_wq = W(5) | W(8);
+      h->dual_ccs = 3;
+      h->dual_wq = W(1) | W(2);
+      h->part_wq = W(2) | W(5);
+      if (mode == 4 || mode == 5) {
+         int rot = mode == 4 ? (blk[0] >> 5) & 3 : (blk[0] >> 6) & 3;
+         h->dual_ccs = rot ? rot - 1 : 3;
+         h->dual_wq = W(1) | W(2) | W(3);
+      } else if (mode == 1 || mode == 3 || mode == 7) {
+         int part = mode == 1 ? (blk[0] >> 2) & 63 :
+                    mode == 3 ? ((blk[0] >> 4) | (blk[1] << 4)) & 63 : blk[1] & 63;
+         h->masks[h->nmasks++] = astc_bc7_part2[part];
+      } else if (mode == 0 || mode == 2) {
+         int part = mode == 0 ? (blk[0] >> 1) & 15 : ((blk[0] >> 3) | (blk[1] << 5)) & 63;
+         h->seed3 = astc_bc7_seed3[part];
+         for (int s = 0; s < 3; s++) {
+            uint16_t m = 0;
+            for (int i = 0; i < 16; i++)
+               m |= (((astc_bc7_part3[part] >> (2 * i)) & 3) == s) << i;
+            h->masks[h->nmasks++] = m;
+         }
+      }
+      break;
+   }
+   default:
+      h->single_wq = W(2) | W(5) | W(8);
+      break;
+   }
+}
+
+#undef W
+
 static void *
 decompression_routine(void *args)
 {
@@ -438,10 +530,9 @@ decompression_routine(void *args)
             }
             int block_index = (by + params->block_y_start) * params->block_x + bx;
             uint8_t *blk = (uint8_t *)dst_base + (size_t)block_index * 16;
-            if (params->format == VK_FORMAT_BC5_UNORM_BLOCK)
-               astc_encode_rg_4x4(scratch, blk);
-            else
-               astc_encode_block_4x4(scratch, params->has_alpha, blk);
+            struct astc_hint hint;
+            bcn_astc_hint(params->format, (const uint8_t *)src, &hint);
+            astc_encode_4x4_search(scratch, &hint, blk);
             continue;
          }
 
