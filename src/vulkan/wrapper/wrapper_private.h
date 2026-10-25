@@ -38,6 +38,7 @@ struct wrapper_physical_device {
 
    int dma_heap_fd;
    int emulate_bcn;
+   uint32_t native_bcn_mask;
    bool is_vkd3d;
    bool emulate_imageless_framebuffer;
    bool emulate_vulkan13;
