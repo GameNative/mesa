@@ -13,8 +13,9 @@
  * image, needs BC blocks where the image holds ASTC or decoded texels: the
  * stored texels are blitted to an RGBA image (the driver decodes ASTC) and
  * BC-encoded by a compute shader; blocks copied in are decoded by another.
- * The GPU upload path (bcnEmulationType=compute) decodes uploads and encodes
- * them to ASTC on the GPU instead of the CPU. Nothing is kept beyond the
+ * Uploads are decoded and encoded to ASTC on the GPU whenever the shaders
+ * passed the self-test; the CPU path is the fallback, or forced with
+ * WRAPPER_BCN_FORCE_CPU=1. Nothing is kept beyond the
  * command buffer: the BC blocks of the original upload are not stored. */
 
 int
@@ -22,11 +23,8 @@ wrapper_bcn_gpu_path(void)
 {
    static int on = -1;
    if (on == -1) {
-      const char *gpu = getenv("WRAPPER_BCN_GPU");
-      const char *compute = getenv("ENABLE_BCN_COMPUTE");
-      const char *keep = getenv("WRAPPER_KEEP_BCN_LAYER");
-      on = (gpu && atoi(gpu)) ||
-           (compute && atoi(compute) && !(keep && atoi(keep)));
+      const char *cpu = getenv("WRAPPER_BCN_FORCE_CPU");
+      on = !(cpu && atoi(cpu));
    }
    return on;
 }
@@ -510,7 +508,9 @@ wrapper_bcn_gpu_init(struct wrapper_device *device, uint32_t family)
                device->bcn_bda, layout, dec, enc, astc, report);
    wrapper_diag_append("[BCN] GPU shaders (VkResult): bda=%d layout=%d decode=%d bc-encode=%d "
                        "astc-encode=%d, %s, upload=%s\n", device->bcn_bda, layout, dec, enc,
-                       astc, report, wrapper_bcn_gpu_path() ? "gpu" : "cpu");
+                       astc, report,
+                       wrapper_bcn_gpu_path() && device->bcn_decode_pipeline &&
+                       device->bcn_astc_pipeline[0] ? "gpu" : "cpu");
    simple_mtx_unlock(&device->bcn_gpu_mutex);
 }
 

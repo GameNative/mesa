@@ -12,7 +12,7 @@
 
 /* bcnEmulationType=compute sets ENABLE_BCN_COMPUTE=1, which turns on the
  * implicit BCn compute layer above the wrapper. The wrapper emulates BC
- * formats itself, on the GPU in that mode (wrapper_bcn_gpu_path), so it
+ * formats itself, on the GPU (wrapper_bcn_gpu_path), so it
  * switches the layer off through its disable variable before the loader
  * decides which implicit layers to enable: the loader opens the ICDs first,
  * in vkEnumerateInstanceExtensionProperties and in vkCreateInstance.
