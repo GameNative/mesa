@@ -2989,17 +2989,6 @@ wrapper_BeginCommandBuffer(VkCommandBuffer commandBuffer,
 }
 
 VKAPI_ATTR void VKAPI_CALL
-wrapper_CmdBindPipeline(VkCommandBuffer commandBuffer,
-                        VkPipelineBindPoint pipelineBindPoint, VkPipeline pipeline)
-{
-   VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
-   if (wcb->device->bcn_bda)
-      wrapper_cmd_track_pipeline(wcb, pipelineBindPoint, pipeline);
-   wcb->device->dispatch_table.CmdBindPipeline(wcb->dispatch_handle,
-      pipelineBindPoint, pipeline);
-}
-
-VKAPI_ATTR void VKAPI_CALL
 wrapper_CmdPushConstants(VkCommandBuffer commandBuffer, VkPipelineLayout layout,
                          VkShaderStageFlags stageFlags, uint32_t offset,
                          uint32_t size, const void *pValues)
@@ -4636,6 +4625,8 @@ wrapper_CmdBindPipeline(VkCommandBuffer commandBuffer,
                         VkPipelineBindPoint pipelineBindPoint, VkPipeline pipeline)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   if (wcb->device->bcn_bda)
+      wrapper_cmd_track_pipeline(wcb, pipelineBindPoint, pipeline);
    if (wcb->device->emulate_dynamic_stride &&
        pipelineBindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS)
       wrapper_stride_bind(wcb, pipeline);
