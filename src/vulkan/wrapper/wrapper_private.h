@@ -82,6 +82,9 @@ struct wrapper_device {
    struct hash_table_u64 *image_view_table;
    struct hash_table_u64 *imageless_fb_table;
    struct hash_table_u64 *dynamic_pipeline_table;
+   struct hash_table_u64 *stride_pipeline_table;
+   struct hash_table_u64 *shader_code_table;
+   bool emulate_dynamic_stride;
    struct hash_table_u64 *fence_table;
    struct wrapper_physical_device *physical;
    struct vk_device_dispatch_table dispatch_table;
@@ -214,6 +217,10 @@ struct wrapper_command_buffer {
    struct list_head dynamic_render_objects;
    bool dynamic_rendering_active;
    bool secondary;
+   struct wrapper_stride_pipeline *stride_pipeline;
+   VkPipeline stride_bound;
+   uint32_t vertex_strides[32];
+   uint32_t vertex_strides_valid;
 };
 
 VK_DEFINE_HANDLE_CASTS(wrapper_command_buffer, vk.base, VkCommandBuffer,
@@ -299,5 +306,23 @@ wrapper_device_memory_destroy(struct wrapper_device_memory *mem);
 
 int wrapper_diag_on(void);
 void wrapper_diag_append(const char *fmt, ...);
+
+struct wrapper_stride_pipeline;
+
+void wrapper_stride_note_module(struct wrapper_device *device, VkShaderModule module,
+                                const uint32_t *code, size_t size);
+void wrapper_stride_forget_module(struct wrapper_device *device, VkShaderModule module);
+bool wrapper_stride_wants(const struct wrapper_device *device,
+                          const VkGraphicsPipelineCreateInfo *info);
+VkResult wrapper_stride_create(struct wrapper_device *device, VkPipelineCache cache,
+                               const VkGraphicsPipelineCreateInfo *info,
+                               const VkAllocationCallbacks *alloc, VkPipeline *pipeline);
+void wrapper_stride_destroy(struct wrapper_device *device, VkPipeline pipeline);
+void wrapper_stride_bind(struct wrapper_command_buffer *wcb, VkPipeline pipeline);
+void wrapper_stride_set(struct wrapper_command_buffer *wcb, uint32_t first, uint32_t count,
+                        const VkDeviceSize *strides);
+void wrapper_stride_flush(struct wrapper_command_buffer *wcb);
+void wrapper_stride_reset(struct wrapper_command_buffer *wcb);
+void wrapper_stride_finish(struct wrapper_device *device);
 
 #endif
