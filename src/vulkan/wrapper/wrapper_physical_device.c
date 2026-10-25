@@ -62,6 +62,14 @@ wrapper_effective_api_version(struct wrapper_physical_device *pdevice,
       }
    }
 
+   if (requested > base_api_version && base_api_version < VK_API_VERSION_1_3 &&
+       !pdevice->emulate_vulkan13 && engine && !strcmp(engine, "mesa zink")) {
+      WRAPPER_LOG(info, "Reporting the base Vulkan %u.%u to zink",
+                  VK_API_VERSION_MAJOR(base_api_version),
+                  VK_API_VERSION_MINOR(base_api_version));
+      return base_api_version;
+   }
+
    return requested ? requested : base_api_version;
 }
 
