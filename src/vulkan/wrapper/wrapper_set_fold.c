@@ -232,6 +232,20 @@ fold_merge_get(struct wrapper_device *device, const VkDescriptorSetLayout *handl
       class_cap[c] = arrays[c] ? MAX2(room / arrays[c], 1) : UINT32_MAX;
    }
    uint32_t override = debug_get_num_option("WRAPPER_FOLD_ARRAY_SIZE", 0);
+   static const char *const class_env[FOLD_CLASS_COUNT] = {
+      [FOLD_CLASS_SAMPLER] = "WRAPPER_FOLD_SIZE_SAMPLER",
+      [FOLD_CLASS_SAMPLED] = "WRAPPER_FOLD_SIZE_SAMPLED",
+      [FOLD_CLASS_STORAGE_IMAGE] = "WRAPPER_FOLD_SIZE_STORAGE_IMAGE",
+      [FOLD_CLASS_UBO] = "WRAPPER_FOLD_SIZE_UBO",
+      [FOLD_CLASS_SSBO] = "WRAPPER_FOLD_SIZE_SSBO",
+   };
+   for (uint32_t c = 0; c < FOLD_CLASS_COUNT; c++) {
+      uint32_t v = debug_get_num_option(class_env[c], 0);
+      if (v)
+         class_cap[c] = MIN2(class_cap[c], v);
+      else if (override)
+         class_cap[c] = MIN2(class_cap[c], override);
+   }
    VkDescriptorSetLayoutCreateFlags flags = 0;
    uint32_t n = 0, base = 0;
    uint64_t total = 0;
@@ -248,8 +262,6 @@ fold_merge_get(struct wrapper_device *device, const VkDescriptorSetLayout *handl
          vb.binding += base;
          if (b == l->variable_binding) {
             uint32_t cap = fold_binding_cap(class_cap, resource_cap, vb.descriptorType);
-            if (override)
-               cap = MIN2(cap, override);
             vb.descriptorCount = MIN2(vb.descriptorCount, cap);
             if (last) {
                m->declared_variable = vb.descriptorCount;
@@ -257,9 +269,8 @@ fold_merge_get(struct wrapper_device *device, const VkDescriptorSetLayout *handl
                bf &= ~VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT;
                total += vb.descriptorCount;
             }
-            WRAPPER_LOG(info, "Folded set binding %u (type %d): cap %u from driver limits%s",
-                        vb.binding, vb.descriptorType, vb.descriptorCount,
-                        override ? " and WRAPPER_FOLD_ARRAY_SIZE" : "");
+            WRAPPER_LOG(info, "Folded set binding %u (type %d): cap %u", vb.binding,
+                        vb.descriptorType, vb.descriptorCount);
          } else {
             total += vb.descriptorCount;
          }

@@ -693,6 +693,23 @@ wrapper_GetPhysicalDeviceProperties(VkPhysicalDevice physicalDevice,
    if ((p)->maxDescriptorSetUpdateAfterBindStorageImages < _t)     (p)->maxDescriptorSetUpdateAfterBindStorageImages = _t; \
 } while (0)
 
+static void
+wrapper_keep_real_ubo_limits(struct wrapper_physical_device *pdevice,
+                             uint32_t *per_stage, uint32_t *per_set)
+{
+   static bool logged;
+   if (!pdevice->fold_sets)
+      return;
+   *per_stage = pdevice->vk.properties.maxPerStageDescriptorUpdateAfterBindUniformBuffers;
+   *per_set = pdevice->vk.properties.maxDescriptorSetUpdateAfterBindUniformBuffers;
+   if (!logged) {
+      logged = true;
+      WRAPPER_LOG(info, "Reporting the driver's update-after-bind uniform buffer limits "
+                  "(%u per stage, %u per set) so heap CBVs go to storage buffers",
+                  *per_stage, *per_set);
+   }
+}
+
 VKAPI_ATTR void VKAPI_CALL
 wrapper_GetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice,
                                      VkPhysicalDeviceProperties2* pProperties)
@@ -851,15 +868,24 @@ wrapper_GetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice,
          strcpy(vk12_prop->driverName, "Wrapper driver");
 
          /* Vulkan12Properties folds in the descriptor-indexing limits. */
-         if (is_d3d)
+         if (is_d3d) {
             BUMP_UAB(vk12_prop, WRAPPER_D3D_BINDLESS_LIMIT);
+            wrapper_keep_real_ubo_limits(pdevice,
+               &vk12_prop->maxPerStageDescriptorUpdateAfterBindUniformBuffers,
+               &vk12_prop->maxDescriptorSetUpdateAfterBindUniformBuffers);
+         }
          break;
       }
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_PROPERTIES:
       {
-         if (is_d3d)
-            BUMP_UAB((VkPhysicalDeviceDescriptorIndexingProperties *)prop,
-                     WRAPPER_D3D_BINDLESS_LIMIT);
+         if (is_d3d) {
+            VkPhysicalDeviceDescriptorIndexingProperties *di =
+               (VkPhysicalDeviceDescriptorIndexingProperties *)prop;
+            BUMP_UAB(di, WRAPPER_D3D_BINDLESS_LIMIT);
+            wrapper_keep_real_ubo_limits(pdevice,
+               &di->maxPerStageDescriptorUpdateAfterBindUniformBuffers,
+               &di->maxDescriptorSetUpdateAfterBindUniformBuffers);
+         }
          break;
       }
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES:
