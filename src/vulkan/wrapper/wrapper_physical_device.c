@@ -1096,6 +1096,9 @@ wrapper_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice,
 
    pdevice->dispatch_table.GetPhysicalDeviceFormatProperties2(pdevice->dispatch_handle,
       format, pFormatProperties);
+   if (pdevice->properties2.properties.apiVersion < VK_API_VERSION_1_3 &&
+       !pdevice->base_supported_extensions.KHR_format_feature_flags2)
+      wrapper_format_properties3_from_legacy(pdevice, format, pFormatProperties);
 
    switch (format) {
    case VK_FORMAT_BC1_RGB_UNORM_BLOCK:

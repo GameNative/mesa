@@ -251,6 +251,47 @@ wrapper_core13_fill_properties(struct wrapper_physical_device *pdevice,
    }
 }
 
+void
+wrapper_format_properties3_from_legacy(struct wrapper_physical_device *pdevice,
+                                       VkFormat format,
+                                       VkFormatProperties2 *props)
+{
+   VkFormatProperties3 *p3 = vk_find_struct(props->pNext, FORMAT_PROPERTIES_3);
+   if (!p3)
+      return;
+
+   const VkFormatProperties *legacy = &props->formatProperties;
+   const struct vk_features *f = &pdevice->base_supported_features;
+   VkFormatFeatureFlags2 extra_image = 0, extra_buffer = 0;
+
+   if (f->shaderStorageImageReadWithoutFormat)
+      extra_image |= VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT;
+   if (f->shaderStorageImageWriteWithoutFormat)
+      extra_image |= VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT;
+   extra_buffer = extra_image;
+
+   bool depth = vk_format_is_depth_or_stencil(format);
+
+   VkFormatFeatureFlags2 opt = legacy->optimalTilingFeatures;
+   VkFormatFeatureFlags2 lin = legacy->linearTilingFeatures;
+   VkFormatFeatureFlags2 buf = legacy->bufferFeatures;
+
+   if (opt & VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT)
+      opt |= extra_image;
+   if (lin & VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT)
+      lin |= extra_image;
+   if (buf & VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_BIT)
+      buf |= extra_buffer;
+   if (depth && (opt & VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT))
+      opt |= VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_DEPTH_COMPARISON_BIT;
+   if (depth && (lin & VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT))
+      lin |= VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_DEPTH_COMPARISON_BIT;
+
+   p3->optimalTilingFeatures = opt;
+   p3->linearTilingFeatures = lin;
+   p3->bufferFeatures = buf;
+}
+
 static void
 wrapper_add_extension(const char **exts, uint32_t *count, const char *name)
 {

@@ -330,6 +330,9 @@ bool wrapper_core13_wanted(const struct wrapper_physical_device *pdevice,
 void wrapper_core13_init_physical_device(struct wrapper_physical_device *pdevice);
 void wrapper_core13_fill_properties(struct wrapper_physical_device *pdevice,
                                     VkPhysicalDeviceProperties2 *props);
+void wrapper_format_properties3_from_legacy(struct wrapper_physical_device *pdevice,
+                                            VkFormat format,
+                                            VkFormatProperties2 *props);
 void *wrapper_core13_lower_device_create(struct wrapper_device *device,
                                          VkDeviceCreateInfo *info,
                                          const char **exts, uint32_t *ext_count);
