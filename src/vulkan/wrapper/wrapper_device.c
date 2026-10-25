@@ -9,6 +9,8 @@
 #include "wrapper_bcn_spv.h"
 #include "spirv_patcher.hpp"
 #include "wrapper_spirv_lower.h"
+#include "util/ralloc.h"
+#include "vk_enum_to_str.h"
 #include "wrapper_entrypoints.h"
 #include "wrapper_trampolines.h"
 #include "vk_alloc.h"
@@ -2930,6 +2932,13 @@ wrapper_DestroyDescriptorUpdateTemplate(VkDevice _device,
    wrapper_destroy_update_template(device, descriptorUpdateTemplate, pAllocator);
 }
 
+static VkResult
+wrapper_create_legacy_render_pass_for_pipeline(
+   struct wrapper_device *device,
+   const VkPipelineRenderingCreateInfo *rendering,
+   VkSampleCountFlagBits samples,
+   VkRenderPass *render_pass);
+
 VKAPI_ATTR VkResult VKAPI_CALL
 wrapper_BeginCommandBuffer(VkCommandBuffer commandBuffer,
                           const VkCommandBufferBeginInfo *pBeginInfo)
@@ -2940,6 +2949,50 @@ wrapper_BeginCommandBuffer(VkCommandBuffer commandBuffer,
    wrapper_divisor_reset(wcb);
    if (wcb->device->emulate_push_descriptor)
       wrapper_push_pool_reset_all(wcb);
+
+   VkCommandBufferBeginInfo legacy_begin;
+   VkCommandBufferInheritanceInfo legacy_inheritance;
+   const VkCommandBufferInheritanceRenderingInfo *rendering =
+      pBeginInfo->pInheritanceInfo
+         ? vk_find_struct_const(pBeginInfo->pInheritanceInfo->pNext,
+                                COMMAND_BUFFER_INHERITANCE_RENDERING_INFO)
+         : NULL;
+   if (rendering && wrapper_lowers_core13(wcb->device) &&
+       !wcb->device->dispatch_table.CmdBeginRendering &&
+       pBeginInfo->pInheritanceInfo->renderPass == VK_NULL_HANDLE &&
+       (pBeginInfo->flags & VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT)) {
+      VkPipelineRenderingCreateInfo info = {
+         .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
+         .viewMask = rendering->viewMask,
+         .colorAttachmentCount = rendering->colorAttachmentCount,
+         .pColorAttachmentFormats = rendering->pColorAttachmentFormats,
+         .depthAttachmentFormat = rendering->depthAttachmentFormat,
+         .stencilAttachmentFormat = rendering->stencilAttachmentFormat,
+      };
+      VkRenderPass render_pass = VK_NULL_HANDLE;
+      struct wrapper_dynamic_render_object *object = calloc(1, sizeof(*object));
+      if (object &&
+          wrapper_create_legacy_render_pass_for_pipeline(
+             wcb->device, &info,
+             rendering->rasterizationSamples ? rendering->rasterizationSamples
+                                             : VK_SAMPLE_COUNT_1_BIT,
+             &render_pass) == VK_SUCCESS) {
+         object->render_pass = render_pass;
+         list_addtail(&object->link, &wcb->dynamic_render_objects);
+         legacy_inheritance = *pBeginInfo->pInheritanceInfo;
+         legacy_inheritance.pNext = NULL;
+         legacy_inheritance.renderPass = render_pass;
+         legacy_inheritance.subpass = 0;
+         legacy_inheritance.framebuffer = VK_NULL_HANDLE;
+         legacy_begin = *pBeginInfo;
+         legacy_begin.pInheritanceInfo = &legacy_inheritance;
+         pBeginInfo = &legacy_begin;
+      } else {
+         free(object);
+         WRAPPER_LOG(error, "Failed to lower dynamic-rendering inheritance");
+      }
+   }
+
    VkResult begin_result =
       wcb->device->dispatch_table.BeginCommandBuffer(wcb->dispatch_handle,
                                                      pBeginInfo);
@@ -3141,6 +3194,28 @@ wrapper_find_pipeline_rendering_info(const void *pNext)
       current = current->pNext;
    }
    return NULL;
+}
+
+static const void *
+wrapper_chain_without(void **mem, const void *pNext, VkStructureType skip)
+{
+   if (!vk_find_struct_const(pNext, PIPELINE_RENDERING_CREATE_INFO))
+      return pNext;
+   if (!*mem)
+      *mem = ralloc_context(NULL);
+   VkBaseOutStructure *head = NULL, *tail = NULL;
+   for (const VkBaseInStructure *in = pNext; in; in = in->pNext) {
+      if (in->sType == skip)
+         continue;
+      VkBaseOutStructure *out = ralloc_memdup(*mem, in, vk_structure_type_size(in));
+      out->pNext = NULL;
+      if (tail)
+         tail->pNext = out;
+      else
+         head = out;
+      tail = out;
+   }
+   return head;
 }
 
 static VkResult
@@ -3585,6 +3660,7 @@ wrapper_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
    VK_FROM_HANDLE(wrapper_device, device, _device);
    VkGraphicsPipelineCreateInfo *legacy = NULL;
    VkRenderPass *render_passes = NULL;
+   void *chain_mem = NULL;
    const VkGraphicsPipelineCreateInfo *driver_infos = pCreateInfos;
    VkGraphicsPipelineCreateInfo *m5_infos = NULL;
    VkPipelineShaderStageCreateInfo *m5_stages = NULL;
@@ -3678,17 +3754,10 @@ wrapper_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
          }
          legacy[i].renderPass = render_passes[i];
          legacy[i].subpass = 0;
-         /* The base ICD does not support dynamic rendering.  Once a compatible
-          * legacy render pass is supplied, do not also pass its Vulkan 1.3
-          * VkPipelineRenderingCreateInfo to that Vulkan 1.1 driver.  D8VK puts
-          * this structure at the head of the chain (and currently it is the
-          * only entry), so unlink it from the driver-facing create info. */
-         if (pCreateInfos[i].pNext == rendering)
-            legacy[i].pNext = rendering->pNext;
-         WRAPPER_LOG(info,
-            "Lowering dynamic graphics pipeline %u to legacy render pass %p; strippedRenderingInfo=%u",
-            i, (void *)(uintptr_t)render_passes[i],
-            pCreateInfos[i].pNext == rendering);
+         legacy[i].pNext = wrapper_chain_without(&chain_mem, pCreateInfos[i].pNext,
+            VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO);
+         WRAPPER_LOG(debug, "Lowering dynamic graphics pipeline %u to legacy render pass %p",
+                     i, (void *)(uintptr_t)render_passes[i]);
       }
       driver_infos = legacy;
    }
@@ -3764,6 +3833,7 @@ wrapper_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
    }
    free(legacy);
    free(render_passes);
+   ralloc_free(chain_mem);
    if (m5_infos) {
       wrapper_destroy_lowered_modules(device, m5_modules, m5_module_count);
       free(m5_infos);
