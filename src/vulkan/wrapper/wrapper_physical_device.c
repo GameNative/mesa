@@ -145,14 +145,14 @@ wrapper_wsi_proc_addr(VkPhysicalDevice physicalDevice, const char *pName)
 
 /* Auto mode: a BC format the base driver can sample and copy into in optimal
  * tiling is used natively even without textureCompressionBC (PowerVR exposes
- * BC1-BC5 that way); the rest are emulated. */
+ * BC1-BC5 that way); the rest are emulated, on every driver alike. */
 static void
 wrapper_probe_native_bcn(struct wrapper_physical_device *pdevice)
 {
    const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
       VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
       VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
-   char native[160] = "", emulated[160] = "";
+   char native[160] = "", emulated[160] = "", features[400] = "";
 
    pdevice->native_bcn_mask = 0;
    for (VkFormat f = VK_FORMAT_BC1_RGB_UNORM_BLOCK; f <= VK_FORMAT_BC7_SRGB_BLOCK; f++) {
@@ -166,19 +166,20 @@ wrapper_probe_native_bcn(struct wrapper_physical_device *pdevice)
             pdevice->dispatch_handle, f, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
             VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, 0,
             &ifp) == VK_SUCCESS;
-      if (pdevice->driver_properties.driverID == VK_DRIVER_ID_SAMSUNG_PROPRIETARY &&
-          f <= VK_FORMAT_BC3_SRGB_BLOCK)
-         ok = true;
       if (ok)
          pdevice->native_bcn_mask |= bit;
       char *list = ok ? native : emulated;
       size_t len = strlen(list);
       snprintf(list + len, sizeof(native) - len, "%s%d", len ? "," : "", f);
+      len = strlen(features);
+      snprintf(features + len, sizeof(features) - len, "%s%d=0x%x", len ? " " : "", f,
+               props.optimalTilingFeatures);
    }
 
    WRAPPER_LOG(info, "BCn auto: native formats [%s], emulated [%s]", native, emulated);
    wrapper_diag_append("[BCN] auto: native formats [%s], emulated [%s]\n",
                        native, emulated);
+   wrapper_diag_append("[BCN] optimal tiling features: %s\n", features);
 }
 
 VkResult enumerate_physical_device(struct vk_instance *_instance)
