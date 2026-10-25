@@ -17,10 +17,10 @@
  * texels on a later submit to the queue the upload went to, between two
  * barriers from and back to the layout the image was last moved to. A later
  * write to the same texels, the image's destruction or the command buffer
- * being reset before it is submitted drops the job, and so does a barrier
- * moving the image to another queue family or a submit of a command buffer
- * that moved it to another queue: the copy is only ordered against work on
- * its own queue.
+ * being reset before it is submitted drops the job. The copy is only ordered
+ * against work on its own queue: an ownership transfer moves the job to the
+ * queue the acquiring command buffer is submitted to, and a submit to any
+ * other queue of a command buffer that moved the image drops it.
  *
  * The worker runs at the lowest priority (SCHED_IDLE, nice 19), encodes in
  * strips of 96 rows, waits between strips while CPU BCn work the application
@@ -374,9 +374,12 @@ wrapper_bcn_hq_barrier(struct wrapper_command_buffer *wcb, VkImage image, VkImag
    pthread_mutex_lock(&hq->lock);
    if (src_family != dst_family && src_family != VK_QUEUE_FAMILY_IGNORED &&
        dst_family != VK_QUEUE_FAMILY_IGNORED) {
-      list_for_each_entry_safe(struct bcn_hq_job, j, &hq->jobs, link)
-         if (j->wi == wi)
-            hq_drop_logged(device, hq, j, "queue family transfer");
+      /* an ownership transfer: the jobs follow the image to the family that
+       * acquires it, and the release half keeps them off the old one */
+      wi->bcn_owner = dst_family + 1;
+      wi->bcn_touch = wcb;
+      if (old_layout != new_layout)
+         wi->bcn_layout = new_layout;
    } else {
       if (old_layout != new_layout)
          wi->bcn_layout = new_layout;
@@ -418,7 +421,10 @@ wrapper_bcn_hq_submitted(struct wrapper_queue *queue, struct wrapper_command_buf
          j->wcb = NULL;
          j->queue = queue;
       } else if (j->wi && j->wi->bcn_touch == wcb && j->queue && j->queue != queue) {
-         hq_drop_logged(device, hq, j, "image used on another queue");
+         if (j->wi->bcn_owner == queue->vk.queue_family_index + 1)
+            j->queue = queue;
+         else if (!j->wi->bcn_owner)
+            hq_drop_logged(device, hq, j, "image used on another queue");
       }
    }
    pthread_mutex_unlock(&hq->lock);
@@ -479,7 +485,8 @@ wrapper_bcn_hq_flush(struct wrapper_queue *queue)
    size_t total = 0;
    uint32_t count = 0;
    list_for_each_entry(struct bcn_hq_job, j, &hq->jobs, link) {
-      if (j->state == HQ_READY && j->queue == queue && j->wi && hq_layout_ok(j->wi->bcn_layout)) {
+      if (j->state == HQ_READY && j->queue == queue && j->wi && hq_layout_ok(j->wi->bcn_layout) &&
+          (!j->wi->bcn_owner || j->wi->bcn_owner == family + 1)) {
          total += j->layer_out * j->sub.layerCount;
          count++;
       }
@@ -552,7 +559,8 @@ wrapper_bcn_hq_flush(struct wrapper_queue *queue)
    VkDeviceSize at = 0;
    double now = now_ms();
    list_for_each_entry_safe(struct bcn_hq_job, j, &hq->jobs, link) {
-      if (!(j->state == HQ_READY && j->queue == queue && j->wi && hq_layout_ok(j->wi->bcn_layout)))
+      if (!(j->state == HQ_READY && j->queue == queue && j->wi && hq_layout_ok(j->wi->bcn_layout) &&
+            (!j->wi->bcn_owner || j->wi->bcn_owner == family + 1)))
          continue;
       VkImageLayout old = j->wi->bcn_layout;
       VkImageLayout dst = old == VK_IMAGE_LAYOUT_GENERAL ? old : VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
