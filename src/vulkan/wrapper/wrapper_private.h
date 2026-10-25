@@ -138,6 +138,7 @@ struct wrapper_device {
    VkShaderModule bcn_astc_fast_sg_module;
    VkPipeline bcn_pipe[BCN_SLOT_COUNT];
    uint32_t bcn_slot_group[BCN_SLOT_COUNT]; /* blocks per workgroup edge */
+   uint32_t bcn_astc_block_only;           /* slots whose workgroup encoder failed */
    int bcn_slot_state[BCN_SLOT_COUNT];
    VkPipeline bcn_retired[BCN_SLOT_COUNT]; /* dropped by the self-test */
    struct bcn_hq *bcn_hq;                  /* background astcenc stage */
