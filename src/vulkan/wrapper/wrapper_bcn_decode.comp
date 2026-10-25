@@ -12,6 +12,7 @@
  *         6 BC5, 7 BC5 SNORM, 8 BC6H UF16, 9 BC6H SF16, 10 BC7
  * flags bit 0: write BC4/BC5 as RGBA8 texels for the ASTC encoder, with the
  *              second BC5 channel also in alpha
+ * flags bit 1: write BC6H UF16 as B10G11R11 texels, as the CPU path packs them
  */
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Words { uint w[]; };
@@ -456,6 +457,15 @@ void decode_bc7()
    }
 }
 
+uint b10g11r11(uint h, uint mbits)
+{
+   uint drop = 10u - mbits;
+   uint maxv = (30u << mbits) | ((1u << mbits) - 1u);
+   if ((h & 0x8000u) != 0u || (h & 0x7fffu) > 0x7c00u)
+      return 0u;
+   return min(((h & 0x7fffu) + (1u << (drop - 1u))) >> drop, maxv);
+}
+
 void main()
 {
    uvec3 id = gl_GlobalInvocationID;
@@ -470,6 +480,8 @@ void main()
 
    uint tsize = fmt == 4u || fmt == 5u ? 1u : (fmt == 6u || fmt == 7u ? 2u : (fmt == 8u || fmt == 9u ? 8u : 4u));
    if ((pc.flags & 1u) != 0u && fmt >= 4u && fmt <= 7u)
+      tsize = 4u;
+   if ((pc.flags & 2u) != 0u && fmt == 8u)
       tsize = 4u;
    if (fmt <= 1u) {
       decode_color(blk.x, blk.y, false);
@@ -498,6 +510,10 @@ void main()
          for (uint i = 0u; i < 16u; i++) texels[i] |= (texels[i] & 0xff00u) << 16;
    } else if (fmt == 8u || fmt == 9u) {
       decode_bc6h(fmt == 9u);
+      if (tsize == 4u)
+         for (uint i = 0u; i < 16u; i++)
+            texels[i] = b10g11r11(texels[i] & 0xffffu, 6u) | (b10g11r11(texels[i] >> 16, 6u) << 11) |
+                        (b10g11r11(texels_hi[i] & 0xffffu, 5u) << 22);
    } else {
       decode_bc7();
    }
