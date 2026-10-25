@@ -33,6 +33,9 @@ void
 wrapper_bcn_gpu_finish(struct wrapper_device *device);
 
 void
+wrapper_bcn_gpu_submit(struct wrapper_queue *queue);
+
+void
 wrapper_cmd_track_pipeline(struct wrapper_command_buffer *wcb, VkPipelineBindPoint bind_point,
                            VkPipeline pipeline);
 
