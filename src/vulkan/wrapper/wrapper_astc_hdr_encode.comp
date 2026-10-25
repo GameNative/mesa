@@ -641,7 +641,9 @@ void main()
    const uvec4 cands[3] = uvec4[](uvec4(593u, 7u, 20u, 58u), uvec4(578u, 8u, 19u, 64u),
                                   uvec4(83u, 5u, 20u, 48u));
    float best = 1e30;
-   uint best_out[4] = uint[](0u, 0u, 0u, 0u);
+   /* a uvec4, not a uint[4]: Mali-G715 drops a whole-array copy into an
+    * initialised local array made in this loop and writes the zeros */
+   uvec4 best_out = uvec4(0u);
    float first_err = -1.0;
    float top = 0.0;
    [[dont_unroll]] for (uint i = 0u; i < 16u; i++)
@@ -690,7 +692,7 @@ void main()
          [[dont_unroll]] for (uint b = 0u; b < ipos; b++)
             if (((ib[b >> 5] >> (b & 31u)) & 1u) != 0u)
                ob[(127u - b) >> 5] |= 1u << ((127u - b) & 31u);
-         best_out = ob;
+         best_out = uvec4(ob[0], ob[1], ob[2], ob[3]);
       }
       /* endpoint mode 7: one offset for all channels, more weight levels */
       const uvec4 ocands[2] = uvec4[](uvec4(595u, 11u, 19u, 80u), uvec4(579u, 10u, 20u, 74u));
@@ -730,12 +732,12 @@ void main()
          [[dont_unroll]] for (uint b = 0u; b < ipos; b++)
             if (((ib[b >> 5] >> (b & 31u)) & 1u) != 0u)
                ob[(127u - b) >> 5] |= 1u << ((127u - b) & 31u);
-         best_out = ob;
+         best_out = uvec4(ob[0], ob[1], ob[2], ob[3]);
       }
    }
    /* no candidate kept: what the self-test log shows to find out why */
    if (best_out[0] == 0u)
-      best_out = uint[](0u, floatBitsToUint(first_err), floatBitsToUint(top),
+      best_out = uvec4(0u, floatBitsToUint(first_err), floatBitsToUint(top),
                         floatBitsToUint(orig[5].r));
    d.w[off] = best_out[0];
    d.w[off + 1u] = best_out[1];

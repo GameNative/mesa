@@ -443,7 +443,9 @@ void main()
    uint bsi = BLOCK == 4u ? 0u : 1u;
 
    float best = 1e30;
-   uint best_out[4] = uint[](0u, 0u, 0u, 0u);
+   /* a uvec4, not a uint[4]: Mali-G715 drops a whole-array copy into an
+    * initialised local array made in this loop and writes the zeros */
+   uvec4 best_out = uvec4(0u);
    float first_err = -1.0;
    uint first_q = 0u;
    [[dont_unroll]] for (uint k = 0u; k < passes; k++) {
@@ -530,7 +532,7 @@ void main()
       [[dont_unroll]] for (uint b = 0u; b < ipos; b++)
          if (((ib[b >> 5] >> (b & 31u)) & 1u) != 0u)
             setbits(127u - b, 1u, 1u);
-      best_out = ob;
+      best_out = uvec4(ob[0], ob[1], ob[2], ob[3]);
    }
    if (!live || ti != 0u)
       return;
@@ -547,7 +549,7 @@ void main()
    }
    /* no candidate kept: what the self-test log shows to find out why */
    if (best_out[0] == 0u)
-      best_out = uint[](0u, floatBitsToUint(first_err), first_q, floatBitsToUint(texel.r));
+      best_out = uvec4(0u, floatBitsToUint(first_err), first_q, floatBitsToUint(texel.r));
    d.w[off] = best_out[0];
    d.w[off + 1u] = best_out[1];
    d.w[off + 2u] = best_out[2];
