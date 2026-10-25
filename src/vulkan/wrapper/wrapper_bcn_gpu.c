@@ -377,6 +377,8 @@ bcn_astc_encoder(struct wrapper_device *device, int slot)
                 (sg.supportedOperations & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT) &&
                 (sg.supportedOperations & VK_SUBGROUP_FEATURE_CLUSTERED_BIT);
    int enc = sg_ok ? 2 : 1;
+   if (device->bcn_astc_block_only & (1u << slot))
+      e = "block";
    if (e && !strcmp(e, "block"))
       enc = 0;
    else if (e && !strcmp(e, "group"))
@@ -769,7 +771,7 @@ bcn_selftest(struct wrapper_device *device, VkQueue queue, uint32_t family)
                                                  2000000000ull) == VK_SUCCESS;
    }
    clock_gettime(CLOCK_MONOTONIC, &t1);
-   char report[256];
+   char report[768];
    size_t at = 0;
    for (int k = 0; k < n; k++) {
       int s = todo[k];
@@ -796,14 +798,28 @@ bcn_selftest(struct wrapper_device *device, VkQueue queue, uint32_t family)
                         s <= BCN_SLOT_ASTC8 ? "astc" : "bc";
       if (force && strstr(force, tag))
          ok = false;
+      bool retry = false;
       pthread_mutex_lock(&device->bcn_tool_lock);
-      if (ok)
+      if (ok) {
          device->bcn_slot_state[s] = BCN_TESTED;
-      else
+      } else {
          bcn_retire(device, s);
+         /* a workgroup encoder that fails falls back to the block encoder */
+         if ((s == BCN_SLOT_ASTC4 || s == BCN_SLOT_ASTC6) && device->bcn_slot_group[s] != 8 &&
+             !(force && strstr(force, tag))) {
+            device->bcn_astc_block_only |= 1u << s;
+            device->bcn_slot_state[s] = BCN_QUEUED;
+            pthread_cond_broadcast(&device->bcn_tool_cond);
+            retry = true;
+         }
+      }
       pthread_mutex_unlock(&device->bcn_tool_lock);
-      at += snprintf(report + at, sizeof(report) - MIN2(at, sizeof(report)), " %s=%s",
-                     bcn_slot_names[s], ok ? "ok" : "off");
+      uint32_t w[4] = { 0 };
+      if (o)
+         memcpy(w, o, 16);
+      at += snprintf(report + at, sizeof(report) - MIN2(at, sizeof(report)), ok ? " %s=ok" :
+                     " %s=off(%08x %08x %08x %08x%s)", bcn_slot_names[s], w[0], w[1], w[2], w[3],
+                     retry ? ", block encoder next" : "");
       if (at >= sizeof(report))
          at = sizeof(report) - 1;
    }
