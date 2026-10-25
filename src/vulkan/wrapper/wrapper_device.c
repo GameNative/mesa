@@ -1490,6 +1490,7 @@ if (pdf2 && pdf2->features.f) { \
       char storage[512];
       bcn_describe_storage(storage, sizeof(storage));
       wrapper_diag_append("[BCN] storage %s\n", storage);
+      wrapper_bcn_gpu_init(device);
    }
    if (bc6h_hdr && !used_fallback_create)
       WRAPPER_LOG(info, "BCn policy: BC6H stored as ASTC 4x4 HDR");

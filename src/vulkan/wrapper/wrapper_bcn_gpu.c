@@ -222,7 +222,7 @@ bcn_transient_image(struct wrapper_command_buffer *wcb, VkFormat format, uint32_
    return b->bcn_image;
 }
 
-static bool
+static VkResult
 bcn_create_pipeline(struct wrapper_device *device, const uint32_t *code, size_t size,
                     VkShaderModule *module, VkPipeline *pipeline)
 {
@@ -231,9 +231,10 @@ bcn_create_pipeline(struct wrapper_device *device, const uint32_t *code, size_t 
       .codeSize = size,
       .pCode = code,
    };
-   if (device->dispatch_table.CreateShaderModule(device->dispatch_handle, &smci, NULL,
-                                                 module) != VK_SUCCESS)
-      return false;
+   VkResult r = device->dispatch_table.CreateShaderModule(device->dispatch_handle, &smci,
+                                                          NULL, module);
+   if (r != VK_SUCCESS)
+      return r;
    VkComputePipelineCreateInfo cpci = {
       .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
       .stage = {
@@ -244,43 +245,59 @@ bcn_create_pipeline(struct wrapper_device *device, const uint32_t *code, size_t 
       },
       .layout = device->bcn_tool_layout,
    };
-   return device->dispatch_table.CreateComputePipelines(device->dispatch_handle,
-      VK_NULL_HANDLE, 1, &cpci, NULL, pipeline) == VK_SUCCESS;
+   r = device->dispatch_table.CreateComputePipelines(device->dispatch_handle,
+      VK_NULL_HANDLE, 1, &cpci, NULL, pipeline);
+   if (r != VK_SUCCESS)
+      *pipeline = VK_NULL_HANDLE;
+   return r;
+}
+
+/* Creates the shaders once per device; each one that fails only disables
+ * the work that needs it. */
+void
+wrapper_bcn_gpu_init(struct wrapper_device *device)
+{
+   simple_mtx_lock(&device->bcn_gpu_mutex);
+   if (device->bcn_tool_state != 0) {
+      simple_mtx_unlock(&device->bcn_gpu_mutex);
+      return;
+   }
+   device->bcn_tool_state = -1;
+   VkPushConstantRange pcr = {
+      .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+      .size = sizeof(struct bcn_pc),
+   };
+   VkPipelineLayoutCreateInfo plci = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+      .pushConstantRangeCount = 1,
+      .pPushConstantRanges = &pcr,
+   };
+   VkResult layout = VK_ERROR_FEATURE_NOT_PRESENT, dec = layout, enc = layout, astc = layout;
+   if (device->bcn_bda)
+      layout = device->dispatch_table.CreatePipelineLayout(device->dispatch_handle, &plci,
+                                                           NULL, &device->bcn_tool_layout);
+   if (layout == VK_SUCCESS) {
+      device->bcn_tool_state = 1;
+      dec = bcn_create_pipeline(device, wrapper_bcn_decode_spv, sizeof(wrapper_bcn_decode_spv),
+                                &device->bcn_decode_module, &device->bcn_decode_pipeline);
+      enc = bcn_create_pipeline(device, wrapper_bcn_encode_spv, sizeof(wrapper_bcn_encode_spv),
+                                &device->bcn_encode_module, &device->bcn_encode_pipeline);
+      astc = bcn_create_pipeline(device, wrapper_astc_encode_spv, sizeof(wrapper_astc_encode_spv),
+                                 &device->bcn_astc_module, &device->bcn_astc_pipeline);
+   }
+   WRAPPER_LOG(info, "BCn GPU shaders: bda=%d layout=%d decode=%d bc-encode=%d astc-encode=%d",
+               device->bcn_bda, layout, dec, enc, astc);
+   wrapper_diag_append("[BCN] GPU shaders: bda=%d layout=%d decode=%d bc-encode=%d "
+                       "astc-encode=%d upload=%s\n", device->bcn_bda, layout, dec, enc, astc,
+                       wrapper_bcn_gpu_path() ? "gpu" : "cpu");
+   simple_mtx_unlock(&device->bcn_gpu_mutex);
 }
 
 static bool
 bcn_tools_ready(struct wrapper_device *device)
 {
-   simple_mtx_lock(&device->bcn_gpu_mutex);
-   if (device->bcn_tool_state == 0) {
-      device->bcn_tool_state = -1;
-      VkPushConstantRange pcr = {
-         .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
-         .size = sizeof(struct bcn_pc),
-      };
-      VkPipelineLayoutCreateInfo plci = {
-         .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-         .pushConstantRangeCount = 1,
-         .pPushConstantRanges = &pcr,
-      };
-      if (device->bcn_bda &&
-          device->dispatch_table.CreatePipelineLayout(device->dispatch_handle, &plci, NULL,
-                                                      &device->bcn_tool_layout) == VK_SUCCESS &&
-          bcn_create_pipeline(device, wrapper_bcn_decode_spv, sizeof(wrapper_bcn_decode_spv),
-                              &device->bcn_decode_module, &device->bcn_decode_pipeline) &&
-          bcn_create_pipeline(device, wrapper_bcn_encode_spv, sizeof(wrapper_bcn_encode_spv),
-                              &device->bcn_encode_module, &device->bcn_encode_pipeline) &&
-          bcn_create_pipeline(device, wrapper_astc_encode_spv, sizeof(wrapper_astc_encode_spv),
-                              &device->bcn_astc_module, &device->bcn_astc_pipeline))
-         device->bcn_tool_state = 1;
-      const char *state = device->bcn_tool_state == 1 ? "ready" :
-         device->bcn_bda ? "failed to initialise" : "needs bufferDeviceAddress";
-      WRAPPER_LOG(info, "BCn GPU shaders %s", state);
-      wrapper_diag_append("[BCN] GPU shaders %s\n", state);
-   }
-   bool ready = device->bcn_tool_state == 1;
-   simple_mtx_unlock(&device->bcn_gpu_mutex);
-   return ready;
+   wrapper_bcn_gpu_init(device);
+   return device->bcn_tool_state == 1;
 }
 
 void
@@ -434,7 +451,7 @@ bcn_encode_region(struct wrapper_command_buffer *wcb, struct wrapper_image *wi,
    uint32_t layers = bcn_layers(wi, sub);
    int id = bcn_format_id(wi->info.format);
    if (id < 0 || wi->info.imageType != VK_IMAGE_TYPE_2D || !ext.width || !ext.height ||
-       !bcn_tools_ready(device))
+       !bcn_tools_ready(device) || !device->bcn_encode_pipeline)
       return NULL;
    if (!bcn_blit_supported(device, stored, unpacked)) {
       static bool logged;
@@ -583,7 +600,8 @@ wrapper_bcn_gpu_copy_image_region(struct wrapper_command_buffer *wcb,
    VkFormat stored = get_format_for_bcn(dst->info.format);
    int id = bcn_format_id(dst->info.format);
    if (id < 0 || stored != get_decode_format_for_bcn(dst->info.format) ||
-       dst->info.imageType != VK_IMAGE_TYPE_2D || !bcn_tools_ready(device)) {
+       dst->info.imageType != VK_IMAGE_TYPE_2D || !bcn_tools_ready(device) ||
+       !device->bcn_decode_pipeline) {
       static bool logged;
       if (!logged)
          WRAPPER_LOG(error, "BCn: copy into BC format %d stored as %d is not supported",
@@ -684,7 +702,8 @@ bcn_gpu_upload_region(struct wrapper_command_buffer *wcb, struct wrapper_image *
    uint32_t w = c->imageExtent.width, h = c->imageExtent.height;
    uint32_t m = c->imageSubresource.mipLevel;
    uint32_t lw = MAX2(1u, wi->info.extent.width >> m), lh = MAX2(1u, wi->info.extent.height >> m);
-   if (!w || !h || !bcn_tools_ready(device))
+   if (!w || !h || !bcn_tools_ready(device) || !device->bcn_decode_pipeline ||
+       (astc && !device->bcn_astc_pipeline))
       return false;
    bool merge = astc && wrapper_bcn_gpu_misaligned(wi, c);
    /* the rectangle written: the region, or the ASTC blocks covering it */
