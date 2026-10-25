@@ -292,6 +292,11 @@ void destroy_physical_device(struct vk_physical_device *pdevice);
 void
 wrapper_setup_device_features(struct wrapper_physical_device *physical_device);
 
+unsigned
+wrapper_mask_feature_chain(const struct wrapper_physical_device *physical_device,
+                           VkPhysicalDeviceFeatures *enabled_features,
+                           void *chain);
+
 uint32_t
 wrapper_select_device_memory_type(struct wrapper_device *device,
                                   VkMemoryPropertyFlags flags);

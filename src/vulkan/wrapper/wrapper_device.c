@@ -1287,6 +1287,9 @@ if (pdf2 && pdf2->features.f) { \
 #undef DISABLE_FEATURE
 
    process_pnext_chain((VkBaseInStructure *)&wrapper_create_info, device->physical);
+   wrapper_mask_feature_chain(physical_device,
+                              (VkPhysicalDeviceFeatures *)wrapper_create_info.pEnabledFeatures,
+                              (void *)wrapper_create_info.pNext);
 
    device->emulate_dynamic_stride = debug_get_bool_option("WRAPPER_EMULATE_DYNAMIC_STRIDE",
       physical_device->driver_properties.driverID == VK_DRIVER_ID_ARM_PROPRIETARY &&
@@ -1336,7 +1339,7 @@ if (pdf2 && pdf2->features.f) { \
    }
 
    if (wrapper_safe_create_device == -1) {
-      wrapper_safe_create_device = getenv("WRAPPER_SAFE_CREATE_DEVICE") ? atoi(getenv("WRAPPER_SAFE_CREATE_DEVICE")) : 1;
+      wrapper_safe_create_device = getenv("WRAPPER_SAFE_CREATE_DEVICE") ? atoi(getenv("WRAPPER_SAFE_CREATE_DEVICE")) : 0;
    }
    
    const bool emulate_query_reset = device->vk.enabled_features.hostQueryReset &&
@@ -1357,7 +1360,9 @@ if (pdf2 && pdf2->features.f) { \
 
    if (result != VK_SUCCESS) {
       if (wrapper_safe_create_device) {
-         WRAPPER_LOG(info, "Forcing device creation with a NULL pNext chain");
+         WRAPPER_LOG(error, "Driver vkCreateDevice failed (%d) with the feature chain, "
+                            "retrying with a NULL pNext chain: every requested "
+                            "extension feature is dropped", result);
          wrapper_create_info.pNext = NULL;
          used_fallback_create = true;
          result = physical_device->dispatch_table.CreateDevice(
