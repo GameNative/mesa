@@ -429,6 +429,10 @@ VkResult enumerate_physical_device(struct vk_instance *_instance)
             !pdevice->base_supported_features.vertexAttributeInstanceRateZeroDivisor;
          pdevice->vk.supported_extensions.EXT_vertex_attribute_divisor = true;
          pdevice->vk.supported_extensions.KHR_vertex_attribute_divisor = true;
+         if (pdevice->emulate_vertex_divisor) {
+            supported_features->vertexAttributeInstanceRateDivisor = true;
+            supported_features->vertexAttributeInstanceRateZeroDivisor = true;
+         }
          WRAPPER_LOG(info, "Disabling VK_EXT_calibrated_timestamps");
          pdevice->vk.supported_extensions.EXT_calibrated_timestamps = false;
          if (!is_d3d) {
