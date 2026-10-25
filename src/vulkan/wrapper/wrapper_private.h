@@ -122,7 +122,7 @@ struct wrapper_device {
    VkShaderModule bcn_astc_module;
    VkPipeline bcn_decode_pipeline;
    VkPipeline bcn_encode_pipeline;
-   VkPipeline bcn_astc_pipeline;
+   VkPipeline bcn_astc_pipeline[3];        /* 4x4, 6x6, 8x8 */
 
    /* Private queue and synchronous command buffer for host query reset. */
    simple_mtx_t query_reset_mutex;
