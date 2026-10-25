@@ -155,6 +155,7 @@ wrapper_probe_native_bcn(struct wrapper_physical_device *pdevice)
    char native[160] = "", emulated[160] = "", features[400] = "";
 
    pdevice->native_bcn_mask = 0;
+   bcn_set_vendor(pdevice->properties2.properties.vendorID);
    for (VkFormat f = VK_FORMAT_BC1_RGB_UNORM_BLOCK; f <= VK_FORMAT_BC7_SRGB_BLOCK; f++) {
       uint32_t bit = 1u << (f - VK_FORMAT_BC1_RGB_UNORM_BLOCK);
       VkFormatProperties props = { 0 };
