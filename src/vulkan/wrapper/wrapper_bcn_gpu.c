@@ -2,12 +2,27 @@
 #include <string.h>
 
 #include "wrapper_bcn_gpu.h"
+#include "wrapper_bcdec.h"
+#include "wrapper_bcn_decode_spv.h"
 #include "wrapper_log.h"
 #include "util/macros.h"
 
 /* An emulated BC image keeps the blocks it was given in a device buffer, the
  * shadow, packed per level and slice. Readbacks are served from it, so they
- * return the application's BC data rather than the stored format. */
+ * return the application's BC data rather than the stored format, and the GPU
+ * decoder reads it to produce the stored texels. */
+
+struct wrapper_bcn_decode_pc {
+   uint32_t src[2];
+   uint32_t dst[2];
+   uint32_t src_row_pitch;
+   uint32_t src_slice_pitch;
+   uint32_t dst_row_pitch;
+   uint32_t dst_slice_pitch;
+   uint32_t blocks_x;
+   uint32_t blocks_y;
+   uint32_t format;
+};
 
 static uint32_t
 bcn_block_bytes(VkFormat format)
@@ -23,6 +38,52 @@ bcn_block_bytes(VkFormat format)
    default:
       return 16;
    }
+}
+
+static int
+bcn_decode_format_id(VkFormat format)
+{
+   switch (format) {
+   case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
+   case VK_FORMAT_BC1_RGBA_SRGB_BLOCK: return 0;
+   case VK_FORMAT_BC1_RGB_UNORM_BLOCK:
+   case VK_FORMAT_BC1_RGB_SRGB_BLOCK: return 1;
+   case VK_FORMAT_BC2_UNORM_BLOCK:
+   case VK_FORMAT_BC2_SRGB_BLOCK: return 2;
+   case VK_FORMAT_BC3_UNORM_BLOCK:
+   case VK_FORMAT_BC3_SRGB_BLOCK: return 3;
+   case VK_FORMAT_BC4_UNORM_BLOCK: return 4;
+   case VK_FORMAT_BC4_SNORM_BLOCK: return 5;
+   case VK_FORMAT_BC5_UNORM_BLOCK: return 6;
+   case VK_FORMAT_BC5_SNORM_BLOCK: return 7;
+   case VK_FORMAT_BC6H_UFLOAT_BLOCK: return 8;
+   case VK_FORMAT_BC6H_SFLOAT_BLOCK: return 9;
+   case VK_FORMAT_BC7_UNORM_BLOCK:
+   case VK_FORMAT_BC7_SRGB_BLOCK: return 10;
+   default: return -1;
+   }
+}
+
+static uint32_t
+bcn_decoded_texel_size(VkFormat bcn_format)
+{
+   switch (get_decode_format_for_bcn(bcn_format)) {
+   case VK_FORMAT_R8_UNORM:
+   case VK_FORMAT_R8_SNORM: return 1;
+   case VK_FORMAT_R8G8_UNORM:
+   case VK_FORMAT_R8G8_SNORM: return 2;
+   case VK_FORMAT_R16G16B16A16_SFLOAT: return 8;
+   default: return 4;
+   }
+}
+
+int
+wrapper_bcn_gpu_requested(void)
+{
+   static int on = -1;
+   if (on == -1)
+      on = getenv("WRAPPER_BCN_GPU") ? atoi(getenv("WRAPPER_BCN_GPU")) : 0;
+   return on;
 }
 
 static int
@@ -49,12 +110,15 @@ bcn_memory_type(struct wrapper_device *device, uint32_t bits, VkMemoryPropertyFl
 
 static bool
 bcn_alloc_buffer(struct wrapper_device *device, VkDeviceSize size, VkBufferUsageFlags usage,
-                 VkMemoryPropertyFlags props, VkBuffer *buffer, VkDeviceMemory *memory)
+                 VkMemoryPropertyFlags props, VkBuffer *buffer, VkDeviceMemory *memory,
+                 VkDeviceAddress *address)
 {
+   bool bda = device->bcn_bda;
    VkBufferCreateInfo bci = {
       .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
       .size = size,
-      .usage = usage,
+      .usage = usage | (bda ? VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                              VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0),
       .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
    };
    if (device->dispatch_table.CreateBuffer(device->dispatch_handle, &bci, NULL,
@@ -62,8 +126,13 @@ bcn_alloc_buffer(struct wrapper_device *device, VkDeviceSize size, VkBufferUsage
       return false;
    VkMemoryRequirements mr;
    device->dispatch_table.GetBufferMemoryRequirements(device->dispatch_handle, *buffer, &mr);
+   VkMemoryAllocateFlagsInfo flags = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
+      .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT,
+   };
    VkMemoryAllocateInfo ai = {
       .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      .pNext = bda ? &flags : NULL,
       .allocationSize = mr.size,
       .memoryTypeIndex = bcn_memory_type(device, mr.memoryTypeBits, props),
    };
@@ -74,7 +143,37 @@ bcn_alloc_buffer(struct wrapper_device *device, VkDeviceSize size, VkBufferUsage
       return false;
    }
    device->dispatch_table.BindBufferMemory(device->dispatch_handle, *buffer, *memory, 0);
+   *address = 0;
+   if (bda) {
+      VkBufferDeviceAddressInfo dai = {
+         .sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
+         .buffer = *buffer,
+      };
+      *address = device->dispatch_table.GetBufferDeviceAddress(device->dispatch_handle, &dai);
+   }
    return true;
+}
+
+/* A device-local buffer freed with the command buffer. */
+static struct wrapper_buffer *
+bcn_transient_buffer(struct wrapper_command_buffer *wcb, VkDeviceSize size,
+                     VkBufferUsageFlags usage, VkDeviceAddress *address)
+{
+   struct wrapper_device *device = wcb->device;
+   struct wrapper_buffer *b = vk_object_zalloc(&device->vk, &device->vk.alloc,
+      sizeof(struct wrapper_buffer), VK_OBJECT_TYPE_BUFFER);
+   if (!b)
+      return NULL;
+   if (!bcn_alloc_buffer(device, size, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                         &b->dispatch_handle, &b->memory, address)) {
+      vk_object_free(&device->vk, &device->vk.alloc, b);
+      return NULL;
+   }
+   b->device = device;
+   b->wcb = wcb;
+   b->size = size;
+   list_addtail(&b->link, &wcb->bcn_transients);
+   return b;
 }
 
 static uint32_t
@@ -114,7 +213,8 @@ wrapper_bcn_shadow_get(struct wrapper_device *device, struct wrapper_image *wi)
    s->size = size;
    if (!bcn_alloc_buffer(device, size,
                          VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &s->buffer, &s->memory)) {
+                         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &s->buffer, &s->memory,
+                         &s->address)) {
       WRAPPER_LOG(error, "BCn: no shadow buffer for a %ux%u image",
                   wi->info.extent.width, wi->info.extent.height);
       free(s);
@@ -273,4 +373,213 @@ wrapper_bcn_shadow_readback(struct wrapper_command_buffer *wcb, struct wrapper_i
       return false;
    bcn_shadow_regions(wcb, s, dst, count, regions, false);
    return true;
+}
+
+static void
+bcn_gpu_init(struct wrapper_device *device)
+{
+   VkShaderModuleCreateInfo smci = {
+      .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+      .codeSize = sizeof(wrapper_bcn_decode_spv),
+      .pCode = wrapper_bcn_decode_spv,
+   };
+   VkPushConstantRange pcr = {
+      .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+      .size = sizeof(struct wrapper_bcn_decode_pc),
+   };
+   VkPipelineLayoutCreateInfo plci = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+      .pushConstantRangeCount = 1,
+      .pPushConstantRanges = &pcr,
+   };
+   device->bcn_gpu_state = -1;
+   if (!device->bcn_bda ||
+       device->dispatch_table.CreateShaderModule(device->dispatch_handle, &smci, NULL,
+                                                 &device->bcn_shader) != VK_SUCCESS ||
+       device->dispatch_table.CreatePipelineLayout(device->dispatch_handle, &plci, NULL,
+                                                   &device->bcn_pipe_layout) != VK_SUCCESS)
+      return;
+   VkComputePipelineCreateInfo cpci = {
+      .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+      .stage = {
+         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+         .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+         .module = device->bcn_shader,
+         .pName = "main",
+      },
+      .layout = device->bcn_pipe_layout,
+   };
+   if (device->dispatch_table.CreateComputePipelines(device->dispatch_handle, VK_NULL_HANDLE,
+                                                     1, &cpci, NULL,
+                                                     &device->bcn_pipeline) != VK_SUCCESS)
+      return;
+   device->bcn_gpu_state = 1;
+}
+
+static bool
+bcn_gpu_ready(struct wrapper_device *device)
+{
+   simple_mtx_lock(&device->bcn_gpu_mutex);
+   if (device->bcn_gpu_state == 0) {
+      bcn_gpu_init(device);
+      const char *state = device->bcn_gpu_state == 1 ? "ready" :
+         device->bcn_bda ? "failed to initialise" : "needs bufferDeviceAddress";
+      WRAPPER_LOG(info, "BCn GPU decode %s", state);
+      wrapper_diag_append("[BCN] GPU decode %s\n", state);
+   }
+   bool ready = device->bcn_gpu_state == 1;
+   simple_mtx_unlock(&device->bcn_gpu_mutex);
+   return ready;
+}
+
+void
+wrapper_bcn_gpu_finish(struct wrapper_device *device)
+{
+   if (device->bcn_pipeline)
+      device->dispatch_table.DestroyPipeline(device->dispatch_handle, device->bcn_pipeline, NULL);
+   if (device->bcn_pipe_layout)
+      device->dispatch_table.DestroyPipelineLayout(device->dispatch_handle,
+                                                   device->bcn_pipe_layout, NULL);
+   if (device->bcn_shader)
+      device->dispatch_table.DestroyShaderModule(device->dispatch_handle, device->bcn_shader,
+                                                 NULL);
+}
+
+void
+wrapper_cmd_track_pipeline(struct wrapper_command_buffer *wcb, VkPipelineBindPoint bind_point,
+                           VkPipeline pipeline)
+{
+   if (bind_point == VK_PIPELINE_BIND_POINT_COMPUTE)
+      wcb->compute_pipeline = pipeline;
+}
+
+void
+wrapper_cmd_track_push(struct wrapper_command_buffer *wcb, VkPipelineLayout layout,
+                       VkShaderStageFlags stages, uint32_t offset, uint32_t size,
+                       const void *data)
+{
+   if (size > sizeof(wcb->push[0].data))
+      return;
+   uint32_t i;
+   for (i = 0; i < wcb->push_count; i++) {
+      const struct wrapper_push_record *p = &wcb->push[i];
+      if (p->layout == layout && p->stages == stages && p->offset == offset &&
+          p->size == size)
+         break;
+   }
+   if (i == wcb->push_count && wcb->push_count < ARRAY_SIZE(wcb->push))
+      wcb->push_count++;
+   else if (i == wcb->push_count)
+      i = 0;
+   memmove(&wcb->push[i], &wcb->push[i + 1],
+           (wcb->push_count - 1 - i) * sizeof(wcb->push[0]));
+   struct wrapper_push_record *p = &wcb->push[wcb->push_count - 1];
+   p->layout = layout;
+   p->stages = stages;
+   p->offset = offset;
+   p->size = size;
+   memcpy(p->data, data, size);
+}
+
+void
+wrapper_cmd_track_reset(struct wrapper_command_buffer *wcb)
+{
+   wcb->compute_pipeline = VK_NULL_HANDLE;
+   wcb->push_count = 0;
+}
+
+/* The decode binds its own pipeline and push constants in the application's
+ * command buffer; put back what the application had set. */
+static void
+bcn_restore_compute(struct wrapper_command_buffer *wcb)
+{
+   struct wrapper_device *device = wcb->device;
+   if (wcb->compute_pipeline)
+      device->dispatch_table.CmdBindPipeline(wcb->dispatch_handle,
+         VK_PIPELINE_BIND_POINT_COMPUTE, wcb->compute_pipeline);
+   for (uint32_t i = 0; i < wcb->push_count; i++)
+      device->dispatch_table.CmdPushConstants(wcb->dispatch_handle, wcb->push[i].layout,
+         wcb->push[i].stages, wcb->push[i].offset, wcb->push[i].size, wcb->push[i].data);
+}
+
+static bool
+bcn_gpu_can_decode(const struct wrapper_image *wi)
+{
+   return !wi->mip_drop && bcn_decode_format_id(wi->info.format) >= 0 &&
+          get_format_for_bcn(wi->info.format) == get_decode_format_for_bcn(wi->info.format);
+}
+
+/* Decodes a block region of the shadow into the image, which is in a layout
+ * for transfer writes. */
+static bool
+bcn_gpu_decode(struct wrapper_command_buffer *wcb, struct wrapper_image *wi,
+               VkImageLayout layout, const VkImageSubresourceLayers *sub,
+               VkOffset3D off, VkExtent3D ext, const struct bcn_block_region *r)
+{
+   struct wrapper_device *device = wcb->device;
+   struct wrapper_bcn_shadow *s = wi->bcn_shadow;
+   if (!s || !bcn_gpu_can_decode(wi) || !bcn_gpu_ready(device))
+      return false;
+   uint32_t ts = bcn_decoded_texel_size(wi->info.format);
+   uint32_t row = r->nbx * 4 * ts, slice = row * r->nby * 4;
+   VkDeviceAddress dst;
+   struct wrapper_buffer *tmp = bcn_transient_buffer(wcb, (VkDeviceSize)slice * r->slices,
+                                                     VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &dst);
+   if (!tmp)
+      return false;
+
+   VkDeviceAddress src = s->address + shadow_offset(s, r->level, r->slice, r->by, r->bx);
+   struct wrapper_bcn_decode_pc pc = {
+      .src = { (uint32_t)src, (uint32_t)(src >> 32) },
+      .dst = { (uint32_t)dst, (uint32_t)(dst >> 32) },
+      .src_row_pitch = s->blocks_x[r->level] * s->block_bytes,
+      .src_slice_pitch = s->blocks_x[r->level] * s->blocks_y[r->level] * s->block_bytes,
+      .dst_row_pitch = row,
+      .dst_slice_pitch = slice,
+      .blocks_x = r->nbx,
+      .blocks_y = r->nby,
+      .format = bcn_decode_format_id(wi->info.format),
+   };
+   bcn_barrier(wcb);
+   device->dispatch_table.CmdBindPipeline(wcb->dispatch_handle,
+      VK_PIPELINE_BIND_POINT_COMPUTE, device->bcn_pipeline);
+   device->dispatch_table.CmdPushConstants(wcb->dispatch_handle, device->bcn_pipe_layout,
+      VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+   device->dispatch_table.CmdDispatch(wcb->dispatch_handle, (r->nbx + 7) / 8,
+      (r->nby + 7) / 8, r->slices);
+   bcn_barrier(wcb);
+   bcn_restore_compute(wcb);
+
+   VkBufferImageCopy copy = {
+      .bufferRowLength = r->nbx * 4,
+      .bufferImageHeight = r->nby * 4,
+      .imageSubresource = *sub,
+      .imageOffset = off,
+      .imageExtent = ext,
+   };
+   device->dispatch_table.CmdCopyBufferToImage(wcb->dispatch_handle, tmp->dispatch_handle,
+      wi->dispatch_handle, layout, 1, &copy);
+   return true;
+}
+
+/* GPU upload: the blocks are already in the shadow; decode them into the
+ * image. Returns how many leading regions it recorded; the CPU path takes the
+ * rest. */
+uint32_t
+wrapper_bcn_gpu_upload(struct wrapper_command_buffer *wcb, struct wrapper_image *wi,
+                       VkImageLayout layout, uint32_t count, const VkBufferImageCopy *regions)
+{
+   struct wrapper_bcn_shadow *s = wi->bcn_shadow;
+   uint32_t done = 0;
+   if (!s || !bcn_gpu_can_decode(wi) || !bcn_gpu_ready(wcb->device))
+      return 0;
+   for (; done < count; done++) {
+      const VkBufferImageCopy *c = &regions[done];
+      struct bcn_block_region r;
+      if (!bcn_region_from_copy(s, &c->imageSubresource, c->imageOffset, c->imageExtent, &r) ||
+          !bcn_gpu_decode(wcb, wi, layout, &c->imageSubresource, c->imageOffset,
+                          c->imageExtent, &r))
+         break;
+   }
+   return done;
 }

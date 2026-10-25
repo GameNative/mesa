@@ -647,8 +647,13 @@ get_decode_format_for_bcn(VkFormat bcn_format)
 static int
 bcn_astc_default(VkFormat format, int idx)
 {
+   static int gpu = -1;
+   if (gpu == -1)
+      gpu = getenv("WRAPPER_BCN_GPU") ? atoi(getenv("WRAPPER_BCN_GPU")) : 0;
    if (bcn_policy_block(idx) || astc_enabled() == 2)
       return 1;
+   if (gpu)
+      return 0;
    return (format == VK_FORMAT_BC1_RGB_UNORM_BLOCK ||
            format == VK_FORMAT_BC1_RGB_SRGB_BLOCK) && bcn_astc_edge(idx) == 4;
 }
@@ -1519,45 +1524,6 @@ bcn_cache_note_source(void *srcBuffer, int w, int h, int src_w,
    if (name && !bcn_cache_source_exists(name))
       bcn_cache_write_source(name, src, block_x, block_y, block_x_src, block_size);
    free(name);
-}
-
-/* Cache step of the GPU transcode path, keyed exactly as decompress_bcn_format.
- * Hit: returns the entry (bcn_upload_size bytes, caller frees). Miss: leaves the
- * .src sidecar and returns NULL; the GPU result is never read back. */
-void *
-bcn_cache_gpu_lookup(void *srcBuffer, int w, int h, int src_w, VkFormat format,
-                     int offset, size_t *size)
-{
-   if (!bcn_cache_enabled())
-      return NULL;
-   const char *dir = getenv("WRAPPER_CACHE_PATH") ? getenv("WRAPPER_CACHE_PATH")
-                                                   : WRAPPER_CACHE_DIR;
-   char *src = (char *)srcBuffer + offset;
-   int block_size = get_block_size(format);
-   int block_x = (w + 3) / 4;
-   int block_y = (h + 3) / 4;
-   int block_x_src = ((src_w > 0 ? src_w : w) + 3) / 4;
-   CREATE_FOLDER(dir, 0700);
-   char *name = bcn_cache_filename(dir, format, get_format_for_bcn(format), w, h,
-                                   src, block_x, block_y, block_x_src, block_size);
-   if (!name)
-      return NULL;
-   size_t sz = bcn_upload_size(format, w, h);
-   void *dst = malloc(sz);
-   int raw = 0;
-   if (dst && bcn_cache_read(name, dst, sz, &raw)) {
-      WRAPPER_LOG(bcn, "Restored texture %s from cache", name);
-      if (raw && w >= 8 && h >= 8 && !bcn_cache_source_exists(name))
-         bcn_cache_write_source(name, src, block_x, block_y, block_x_src, block_size);
-      free(name);
-      *size = sz;
-      return dst;
-   }
-   free(dst);
-   if (w >= 8 && h >= 8 && !bcn_cache_source_exists(name))
-      bcn_cache_write_source(name, src, block_x, block_y, block_x_src, block_size);
-   free(name);
-   return NULL;
 }
 
 /* SPIR-V scan, independent of the Mali passes: a shader that takes the size or

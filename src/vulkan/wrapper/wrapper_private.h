@@ -112,14 +112,13 @@ struct wrapper_device {
    VkImageView null_image_view;
    VkSampler null_sampler;
 
-   /* BCn->ASTC GPU transcode (compute), lazily initialized. */
+   /* BCn GPU decode (compute), lazily initialized. */
    simple_mtx_t bcn_gpu_mutex;
    int bcn_gpu_state;                    /* 0 uninit, 1 ready, -1 disabled */
+   bool bcn_bda;                         /* bufferDeviceAddress enabled for it */
    VkShaderModule bcn_shader;
-   VkDescriptorSetLayout bcn_set_layout;
    VkPipelineLayout bcn_pipe_layout;
    VkPipeline bcn_pipeline;
-   VkDeviceSize bcn_gpu_inflight;        /* transient GPU-transcode bytes not yet freed */
 
    /* Private queue and synchronous command buffer for host query reset. */
    simple_mtx_t query_reset_mutex;
@@ -147,10 +146,6 @@ struct wrapper_buffer {
    int is_mapped;
    VkDeviceMemory memory;
    struct wrapper_command_buffer *wcb;
-   /* For transient GPU-transcode buffers: a descriptor pool destroyed with it,
-    * and bytes to release from the device's in-flight counter when freed. */
-   VkDescriptorPool desc_pool;
-   VkDeviceSize bcn_inflight;
    VkExternalMemoryHandleTypeFlags handle_types;
 };
 
@@ -207,6 +202,14 @@ struct wrapper_push_pool {
    uint32_t remaining;             /* sets left before this pool is exhausted */
 };
 
+struct wrapper_push_record {
+   VkPipelineLayout layout;
+   VkShaderStageFlags stages;
+   uint32_t offset;
+   uint32_t size;
+   uint8_t data[256];
+};
+
 struct wrapper_command_buffer {
    struct vk_command_buffer vk;
 
@@ -224,6 +227,11 @@ struct wrapper_command_buffer {
    uint32_t vertex_strides[32];
    uint32_t vertex_strides_valid;
    struct list_head bcn_transients;
+   /* Compute pipeline and push constants the application set, put back after
+    * a BCn decode dispatch. */
+   VkPipeline compute_pipeline;
+   uint32_t push_count;
+   struct wrapper_push_record push[8];
 };
 
 VK_DEFINE_HANDLE_CASTS(wrapper_command_buffer, vk.base, VkCommandBuffer,
