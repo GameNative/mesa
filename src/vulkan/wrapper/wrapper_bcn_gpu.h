@@ -27,7 +27,7 @@ wrapper_bcn_gpu_upload(struct wrapper_command_buffer *wcb, struct wrapper_image 
                        const VkBufferImageCopy *regions);
 
 void
-wrapper_bcn_gpu_init(struct wrapper_device *device);
+wrapper_bcn_gpu_init(struct wrapper_device *device, uint32_t family);
 
 void
 wrapper_bcn_gpu_finish(struct wrapper_device *device);
