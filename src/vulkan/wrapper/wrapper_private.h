@@ -144,6 +144,13 @@ struct wrapper_device {
    VkPipeline bcn_pipe[BCN_SLOT_COUNT];
    uint32_t bcn_slot_group[BCN_SLOT_COUNT]; /* blocks per workgroup edge */
    uint32_t bcn_astc_block_only;           /* slots whose workgroup encoder failed */
+   bool bcn_cache_warm;                    /* the pipeline cache file had data */
+   VkQueue bcn_queue;                      /* where the worker runs the self-test */
+   uint32_t bcn_queue_family;
+   uint32_t bcn_queue_index;
+   bool bcn_queue_reserved;
+   bool bcn_queue_shares_query_reset;
+   simple_mtx_t bcn_queue_mutex;
    int bcn_slot_state[BCN_SLOT_COUNT];
    VkPipeline bcn_retired[BCN_SLOT_COUNT]; /* dropped by the self-test */
    struct bcn_hq *bcn_hq;                  /* background astcenc stage */
