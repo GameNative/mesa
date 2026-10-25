@@ -9,6 +9,7 @@
 #include "vk_physical_device_properties.h"
 #include "vk_util.h"
 #include "util/u_math.h"
+#include "util/u_debug.h"
 
 struct wrapper_promoted_ext {
    const char *name;
@@ -201,6 +202,10 @@ wrapper_core13_init_physical_device(struct wrapper_physical_device *pdevice)
    f->dynamicRendering = true;
    f->synchronization2 = true;
    f->maintenance4 = true;
+   if (debug_get_bool_option("WRAPPER_EMULATE_EXTENDED_DYNAMIC_STATE", true)) {
+      f->extendedDynamicState = true;
+      f->extendedDynamicState2 = true;
+   }
 
    uint32_t base = pdevice->properties2.properties.apiVersion;
    WRAPPER_LOG(info, "Lowering Vulkan 1.3 core to a %u.%u.%u base driver",

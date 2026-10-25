@@ -164,6 +164,12 @@ wrapper_append_required_extensions(const struct wrapper_device *device,
 }
 
 static inline bool
+wrapper_uses_variants(const struct wrapper_device *device)
+{
+   return device->emulate_dynamic_stride || device->emulate_eds || device->emulate_eds2;
+}
+
+static inline bool
 wrapper_lowers_core13(const struct wrapper_device *device)
 {
    return device->physical->emulate_vulkan13;
@@ -715,6 +721,9 @@ wrapper_CmdBindVertexBuffers2(VkCommandBuffer commandBuffer, uint32_t firstBindi
             device->dispatch_table.CmdBindVertexBuffers2EXT)
       device->dispatch_table.CmdBindVertexBuffers2EXT(wcb->dispatch_handle,
          firstBinding, bindingCount, pBuffers, pOffsets, pSizes, pStrides);
+   else if (bindingCount)
+      device->dispatch_table.CmdBindVertexBuffers(wcb->dispatch_handle,
+         firstBinding, bindingCount, pBuffers, pOffsets);
    free(bufs);
    free(offsets);
    free(sizes);
@@ -733,6 +742,8 @@ wrapper_CmdSetCullMode(VkCommandBuffer commandBuffer, VkCullModeFlags cullMode)
    else if (wrapper_lowers_core13(wcb->device) &&
             wcb->device->dispatch_table.CmdSetCullModeEXT)
       wcb->device->dispatch_table.CmdSetCullModeEXT(wcb->dispatch_handle, cullMode);
+   else if (wcb->device->emulate_eds)
+      wrapper_eds_set(wcb, WRAPPER_EDS_CULL, cullMode);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -744,6 +755,8 @@ wrapper_CmdSetFrontFace(VkCommandBuffer commandBuffer, VkFrontFace frontFace)
    else if (wrapper_lowers_core13(wcb->device) &&
             wcb->device->dispatch_table.CmdSetFrontFaceEXT)
       wcb->device->dispatch_table.CmdSetFrontFaceEXT(wcb->dispatch_handle, frontFace);
+   else if (wcb->device->emulate_eds)
+      wrapper_eds_set(wcb, WRAPPER_EDS_FRONT, frontFace);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -758,6 +771,8 @@ wrapper_CmdSetPrimitiveTopology(VkCommandBuffer commandBuffer,
             wcb->device->dispatch_table.CmdSetPrimitiveTopologyEXT)
       wcb->device->dispatch_table.CmdSetPrimitiveTopologyEXT(
          wcb->dispatch_handle, primitiveTopology);
+   else if (wcb->device->emulate_eds)
+      wrapper_eds_set(wcb, WRAPPER_EDS_TOPOLOGY, primitiveTopology);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -773,6 +788,11 @@ wrapper_CmdSetViewportWithCount(VkCommandBuffer commandBuffer,
             wcb->device->dispatch_table.CmdSetViewportWithCountEXT)
       wcb->device->dispatch_table.CmdSetViewportWithCountEXT(
          wcb->dispatch_handle, viewportCount, pViewports);
+   else if (wcb->device->emulate_eds && viewportCount) {
+      uint32_t count = MIN2(viewportCount, wcb->device->max_viewports);
+      wcb->device->dispatch_table.CmdSetViewport(wcb->dispatch_handle, 0, count, pViewports);
+      wrapper_eds_set(wcb, WRAPPER_EDS_VIEWPORTS, count);
+   }
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -788,6 +808,11 @@ wrapper_CmdSetScissorWithCount(VkCommandBuffer commandBuffer,
             wcb->device->dispatch_table.CmdSetScissorWithCountEXT)
       wcb->device->dispatch_table.CmdSetScissorWithCountEXT(
          wcb->dispatch_handle, scissorCount, pScissors);
+   else if (wcb->device->emulate_eds && scissorCount) {
+      uint32_t count = MIN2(scissorCount, wcb->device->max_viewports);
+      wcb->device->dispatch_table.CmdSetScissor(wcb->dispatch_handle, 0, count, pScissors);
+      wrapper_eds_set(wcb, WRAPPER_EDS_SCISSORS, count);
+   }
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -802,6 +827,8 @@ wrapper_CmdSetDepthTestEnable(VkCommandBuffer commandBuffer,
             wcb->device->dispatch_table.CmdSetDepthTestEnableEXT)
       wcb->device->dispatch_table.CmdSetDepthTestEnableEXT(
          wcb->dispatch_handle, depthTestEnable);
+   else if (wcb->device->emulate_eds)
+      wrapper_eds_set(wcb, WRAPPER_EDS_DEPTH_TEST, depthTestEnable);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -816,6 +843,8 @@ wrapper_CmdSetDepthWriteEnable(VkCommandBuffer commandBuffer,
             wcb->device->dispatch_table.CmdSetDepthWriteEnableEXT)
       wcb->device->dispatch_table.CmdSetDepthWriteEnableEXT(
          wcb->dispatch_handle, depthWriteEnable);
+   else if (wcb->device->emulate_eds)
+      wrapper_eds_set(wcb, WRAPPER_EDS_DEPTH_WRITE, depthWriteEnable);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -830,6 +859,8 @@ wrapper_CmdSetDepthCompareOp(VkCommandBuffer commandBuffer,
             wcb->device->dispatch_table.CmdSetDepthCompareOpEXT)
       wcb->device->dispatch_table.CmdSetDepthCompareOpEXT(
          wcb->dispatch_handle, depthCompareOp);
+   else if (wcb->device->emulate_eds)
+      wrapper_eds_set(wcb, WRAPPER_EDS_DEPTH_COMPARE, depthCompareOp);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -844,6 +875,8 @@ wrapper_CmdSetStencilTestEnable(VkCommandBuffer commandBuffer,
             wcb->device->dispatch_table.CmdSetStencilTestEnableEXT)
       wcb->device->dispatch_table.CmdSetStencilTestEnableEXT(
          wcb->dispatch_handle, stencilTestEnable);
+   else if (wcb->device->emulate_eds)
+      wrapper_eds_set(wcb, WRAPPER_EDS_STENCIL_TEST, stencilTestEnable);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -860,6 +893,20 @@ wrapper_CmdSetStencilOp(VkCommandBuffer commandBuffer,
             wcb->device->dispatch_table.CmdSetStencilOpEXT)
       wcb->device->dispatch_table.CmdSetStencilOpEXT(
          wcb->dispatch_handle, faceMask, failOp, passOp, depthFailOp, compareOp);
+   else if (wcb->device->emulate_eds) {
+      if (faceMask & VK_STENCIL_FACE_FRONT_BIT) {
+         wrapper_eds_set(wcb, WRAPPER_EDS_FRONT_FAIL, failOp);
+         wrapper_eds_set(wcb, WRAPPER_EDS_FRONT_PASS, passOp);
+         wrapper_eds_set(wcb, WRAPPER_EDS_FRONT_DEPTH_FAIL, depthFailOp);
+         wrapper_eds_set(wcb, WRAPPER_EDS_FRONT_COMPARE, compareOp);
+      }
+      if (faceMask & VK_STENCIL_FACE_BACK_BIT) {
+         wrapper_eds_set(wcb, WRAPPER_EDS_BACK_FAIL, failOp);
+         wrapper_eds_set(wcb, WRAPPER_EDS_BACK_PASS, passOp);
+         wrapper_eds_set(wcb, WRAPPER_EDS_BACK_DEPTH_FAIL, depthFailOp);
+         wrapper_eds_set(wcb, WRAPPER_EDS_BACK_COMPARE, compareOp);
+      }
+   }
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -874,6 +921,8 @@ wrapper_CmdSetRasterizerDiscardEnable(VkCommandBuffer commandBuffer,
             wcb->device->dispatch_table.CmdSetRasterizerDiscardEnableEXT)
       wcb->device->dispatch_table.CmdSetRasterizerDiscardEnableEXT(
          wcb->dispatch_handle, rasterizerDiscardEnable);
+   else if (wcb->device->emulate_eds2)
+      wrapper_eds_set(wcb, WRAPPER_EDS_RASTER_DISCARD, rasterizerDiscardEnable);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -888,6 +937,8 @@ wrapper_CmdSetDepthBiasEnable(VkCommandBuffer commandBuffer,
             wcb->device->dispatch_table.CmdSetDepthBiasEnableEXT)
       wcb->device->dispatch_table.CmdSetDepthBiasEnableEXT(
          wcb->dispatch_handle, depthBiasEnable);
+   else if (wcb->device->emulate_eds2)
+      wrapper_eds_set(wcb, WRAPPER_EDS_DEPTH_BIAS, depthBiasEnable);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -902,6 +953,8 @@ wrapper_CmdSetPrimitiveRestartEnable(VkCommandBuffer commandBuffer,
             wcb->device->dispatch_table.CmdSetPrimitiveRestartEnableEXT)
       wcb->device->dispatch_table.CmdSetPrimitiveRestartEnableEXT(
          wcb->dispatch_handle, primitiveRestartEnable);
+   else if (wcb->device->emulate_eds2)
+      wrapper_eds_set(wcb, WRAPPER_EDS_PRIM_RESTART, primitiveRestartEnable);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -1306,7 +1359,20 @@ if (pdf2 && pdf2->features.f) { \
       wrapper_create_info.enabledExtensionCount = wrapper_enable_extension_count;
    }
 
-   device->emulate_dynamic_stride = debug_get_bool_option("WRAPPER_EMULATE_DYNAMIC_STRIDE",
+   device->emulate_eds = physical_device->emulate_vulkan13 &&
+      !physical_device->base_supported_extensions.EXT_extended_dynamic_state &&
+      debug_get_bool_option("WRAPPER_EMULATE_EXTENDED_DYNAMIC_STATE", true);
+   device->emulate_eds2 = physical_device->emulate_vulkan13 &&
+      !physical_device->base_supported_extensions.EXT_extended_dynamic_state2 &&
+      debug_get_bool_option("WRAPPER_EMULATE_EXTENDED_DYNAMIC_STATE", true);
+   device->max_viewports =
+      MAX2(physical_device->properties2.properties.limits.maxViewports, 1);
+   if (device->emulate_eds || device->emulate_eds2)
+      WRAPPER_LOG(info, "Emulating extended dynamic state%s with pipeline variants",
+                  device->emulate_eds ? (device->emulate_eds2 ? " 1 and 2" : " 1") : " 2");
+
+   device->emulate_dynamic_stride = device->emulate_eds ||
+      debug_get_bool_option("WRAPPER_EMULATE_DYNAMIC_STRIDE",
       physical_device->driver_properties.driverID == VK_DRIVER_ID_ARM_PROPRIETARY &&
       VK_API_VERSION_MAJOR(physical_device->properties2.properties.driverVersion) < 44);
    if (device->emulate_dynamic_stride)
@@ -3458,7 +3524,7 @@ wrapper_destroy_lowered_modules(struct wrapper_device *device,
                                 VkShaderModule *modules, uint32_t count)
 {
    for (uint32_t i = 0; i < count; i++) {
-      if (device->emulate_dynamic_stride)
+      if (wrapper_uses_variants(device))
          wrapper_stride_forget_module(device, modules[i]);
       device->dispatch_table.DestroyShaderModule(device->dispatch_handle,
                                                  modules[i], NULL);
@@ -3722,7 +3788,7 @@ wrapper_DestroyPipeline(VkDevice _device, VkPipeline pipeline,
                                   (uint64_t)pipeline);
    simple_mtx_unlock(&device->resource_mutex);
 
-   if (device->emulate_dynamic_stride)
+   if (wrapper_uses_variants(device))
       wrapper_stride_destroy(device, pipeline);
    if ((device->emulate_vertex_divisor || device->emulate_zero_divisor))
       wrapper_divisor_destroy(device, pipeline);
@@ -4448,7 +4514,7 @@ wrapper_CreateShaderModule(VkDevice _device,
    VkResult result = device->dispatch_table.CreateShaderModule(
       device->dispatch_handle, &create_info, pAllocator, pShaderModule);
    if (result == VK_SUCCESS &&
-       (device->emulate_dynamic_stride || device->emulate_vertex_divisor))
+       (wrapper_uses_variants(device) || device->emulate_vertex_divisor))
       wrapper_stride_note_module(device, *pShaderModule, create_info.pCode,
                                  create_info.codeSize);
    free(lowered);
@@ -4460,7 +4526,7 @@ wrapper_DestroyShaderModule(VkDevice _device, VkShaderModule shaderModule,
                             const VkAllocationCallbacks *pAllocator)
 {
    VK_FROM_HANDLE(wrapper_device, device, _device);
-   if (device->emulate_dynamic_stride || device->emulate_vertex_divisor)
+   if (wrapper_uses_variants(device) || device->emulate_vertex_divisor)
       wrapper_stride_forget_module(device, shaderModule);
    device->dispatch_table.DestroyShaderModule(device->dispatch_handle, shaderModule,
                                               pAllocator);
@@ -4471,7 +4537,7 @@ wrapper_CmdBindPipeline(VkCommandBuffer commandBuffer,
                         VkPipelineBindPoint pipelineBindPoint, VkPipeline pipeline)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
-   if (wcb->device->emulate_dynamic_stride &&
+   if (wrapper_uses_variants(wcb->device) &&
        pipelineBindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS)
       wrapper_stride_bind(wcb, pipeline);
    if ((wcb->device->emulate_vertex_divisor || wcb->device->emulate_zero_divisor) &&

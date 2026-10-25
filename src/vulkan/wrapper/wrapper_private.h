@@ -87,6 +87,9 @@ struct wrapper_device {
    struct hash_table_u64 *stride_pipeline_table;
    struct hash_table_u64 *shader_code_table;
    bool emulate_dynamic_stride;
+   bool emulate_eds;
+   bool emulate_eds2;
+   uint32_t max_viewports;
    struct hash_table_u64 *divisor_pipeline_table;
    bool emulate_vertex_divisor;
    bool emulate_zero_divisor;
@@ -203,6 +206,31 @@ struct wrapper_fence {
  * a single command buffer recording. Pools live on the command buffer and are
  * reset (not freed) at Begin/Reset -- safe because a CB can't be re-recorded
  * while still executing -- and destroyed when the command buffer is freed. */
+enum wrapper_eds_field {
+   WRAPPER_EDS_CULL,
+   WRAPPER_EDS_FRONT,
+   WRAPPER_EDS_TOPOLOGY,
+   WRAPPER_EDS_DEPTH_TEST,
+   WRAPPER_EDS_DEPTH_WRITE,
+   WRAPPER_EDS_DEPTH_COMPARE,
+   WRAPPER_EDS_DEPTH_BOUNDS,
+   WRAPPER_EDS_STENCIL_TEST,
+   WRAPPER_EDS_FRONT_FAIL,
+   WRAPPER_EDS_FRONT_PASS,
+   WRAPPER_EDS_FRONT_DEPTH_FAIL,
+   WRAPPER_EDS_FRONT_COMPARE,
+   WRAPPER_EDS_BACK_FAIL,
+   WRAPPER_EDS_BACK_PASS,
+   WRAPPER_EDS_BACK_DEPTH_FAIL,
+   WRAPPER_EDS_BACK_COMPARE,
+   WRAPPER_EDS_RASTER_DISCARD,
+   WRAPPER_EDS_DEPTH_BIAS,
+   WRAPPER_EDS_PRIM_RESTART,
+   WRAPPER_EDS_VIEWPORTS,
+   WRAPPER_EDS_SCISSORS,
+   WRAPPER_EDS_COUNT,
+};
+
 struct wrapper_push_pool {
    struct wrapper_push_pool *next;
    VkDescriptorPool pool;
@@ -226,6 +254,8 @@ struct wrapper_command_buffer {
    VkPipeline stride_bound;
    uint32_t vertex_strides[32];
    uint32_t vertex_strides_valid;
+   uint32_t eds[WRAPPER_EDS_COUNT];
+   uint32_t eds_valid;
    const struct wrapper_divisor_pipeline *divisor_pipeline;
    VkBuffer vb_buffer[32];
    VkDeviceSize vb_offset[32];
@@ -355,6 +385,8 @@ void wrapper_stride_bind(struct wrapper_command_buffer *wcb, VkPipeline pipeline
 void wrapper_stride_set(struct wrapper_command_buffer *wcb, uint32_t first, uint32_t count,
                         const VkDeviceSize *strides);
 void wrapper_stride_flush(struct wrapper_command_buffer *wcb);
+void wrapper_eds_set(struct wrapper_command_buffer *wcb, enum wrapper_eds_field field,
+                     uint32_t value);
 void wrapper_stride_reset(struct wrapper_command_buffer *wcb);
 void wrapper_stride_finish(struct wrapper_device *device);
 
