@@ -425,6 +425,8 @@ VkResult enumerate_physical_device(struct vk_instance *_instance)
          pdevice->emulate_vertex_divisor =
             !pdevice->base_supported_extensions.EXT_vertex_attribute_divisor &&
             !pdevice->base_supported_extensions.KHR_vertex_attribute_divisor;
+         pdevice->emulate_zero_divisor = !pdevice->emulate_vertex_divisor &&
+            !pdevice->base_supported_features.vertexAttributeInstanceRateZeroDivisor;
          pdevice->vk.supported_extensions.EXT_vertex_attribute_divisor = true;
          pdevice->vk.supported_extensions.KHR_vertex_attribute_divisor = true;
          WRAPPER_LOG(info, "Disabling VK_EXT_calibrated_timestamps");
@@ -604,10 +606,7 @@ wrapper_GetPhysicalDeviceFeatures2(VkPhysicalDevice physicalDevice,
             VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT *vad =
                (VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT *)s;
             vad->vertexAttributeInstanceRateDivisor = VK_TRUE;
-            vad->vertexAttributeInstanceRateZeroDivisor =
-               pdevice->base_supported_features.vertexAttributeInstanceRateZeroDivisor ||
-               (!pdevice->base_supported_extensions.EXT_vertex_attribute_divisor &&
-                !pdevice->base_supported_extensions.KHR_vertex_attribute_divisor);
+            vad->vertexAttributeInstanceRateZeroDivisor = VK_TRUE;
          }
       }
    }

@@ -18,6 +18,8 @@ struct wrapper_divisor_lowering {
    VkPipelineShaderStageCreateInfo stages[8];
    VkPipelineVertexInputStateCreateInfo vi;
    VkVertexInputBindingDescription bindings[WRAPPER_DIVISOR_MAX_BINDINGS];
+   VkPipelineVertexInputDivisorStateCreateInfoKHR ds;
+   VkVertexInputBindingDivisorDescriptionKHR divisors[WRAPPER_DIVISOR_MAX_BINDINGS];
    struct wrapper_divisor_pipeline info;
 };
 
@@ -141,14 +143,23 @@ wrapper_divisor_lower(struct wrapper_device *device,
                       VkGraphicsPipelineCreateInfo *out)
 {
    *out = *in;
-   if (!device->emulate_vertex_divisor || !in->pVertexInputState ||
+   bool zero_only = !device->emulate_vertex_divisor;
+   if ((zero_only && !device->emulate_zero_divisor) || !in->pVertexInputState ||
        has_dynamic(in, VK_DYNAMIC_STATE_VERTEX_INPUT_EXT))
       return NULL;
 
    const VkPipelineVertexInputStateCreateInfo *vi = in->pVertexInputState;
    const VkPipelineVertexInputDivisorStateCreateInfoKHR *ds = find_divisor_state(vi);
-   if (!ds || vi->vertexBindingDescriptionCount > WRAPPER_DIVISOR_MAX_BINDINGS)
+   if (!ds || vi->vertexBindingDescriptionCount > WRAPPER_DIVISOR_MAX_BINDINGS ||
+       ds->vertexBindingDivisorCount > WRAPPER_DIVISOR_MAX_BINDINGS)
       return NULL;
+   if (zero_only) {
+      bool any_zero = false;
+      for (uint32_t i = 0; i < ds->vertexBindingDivisorCount; i++)
+         any_zero |= ds->pVertexBindingDivisors[i].divisor == 0;
+      if (!any_zero || vi->pNext != (const void *)ds)
+         return NULL;
+   }
 
    struct wrapper_divisor_lowering *l = calloc(1, sizeof(*l));
    if (!l)
@@ -163,6 +174,10 @@ wrapper_divisor_lower(struct wrapper_device *device,
 
    for (uint32_t i = 0; i < ds->vertexBindingDivisorCount; i++) {
       const VkVertexInputBindingDivisorDescriptionKHR *d = &ds->pVertexBindingDivisors[i];
+      if (zero_only && d->divisor != 0) {
+         l->divisors[l->ds.vertexBindingDivisorCount++] = *d;
+         continue;
+      }
       if (d->divisor == 1 || d->binding >= WRAPPER_DIVISOR_MAX_BINDINGS)
          continue;
       for (uint32_t b = 0; b < vi->vertexBindingDescriptionCount; b++) {
@@ -175,6 +190,12 @@ wrapper_divisor_lower(struct wrapper_device *device,
          l->bindings[b].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
          l->bindings[b].stride = 0;
       }
+   }
+   if (l->ds.vertexBindingDivisorCount) {
+      l->ds.sType = ds->sType;
+      l->ds.pNext = ds->pNext;
+      l->ds.pVertexBindingDivisors = l->divisors;
+      l->vi.pNext = &l->ds;
    }
    out->pVertexInputState = &l->vi;
 

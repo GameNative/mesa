@@ -700,7 +700,7 @@ wrapper_CmdBindVertexBuffers2(VkCommandBuffer commandBuffer, uint32_t firstBindi
       if (sizes)
          pSizes = sizes;
    }
-   if (device->emulate_vertex_divisor && pBuffers)
+   if ((device->emulate_vertex_divisor || device->emulate_zero_divisor) && pBuffers)
       wrapper_divisor_track(wcb, firstBinding, bindingCount, pBuffers, pOffsets, pSizes,
                             pStrides);
    if (device->emulate_dynamic_stride && pStrides) {
@@ -920,7 +920,7 @@ wrapper_CmdBindVertexBuffers(VkCommandBuffer commandBuffer, uint32_t firstBindin
          offsets[i] = pBuffers[i] ? pOffsets[i] : 0;
       }
    }
-   if (device->emulate_vertex_divisor && pBuffers)
+   if ((device->emulate_vertex_divisor || device->emulate_zero_divisor) && pBuffers)
       wrapper_divisor_track(wcb, firstBinding, bindingCount, bufs ? bufs : pBuffers,
                             offsets ? offsets : pOffsets, NULL, NULL);
    device->dispatch_table.CmdBindVertexBuffers(wcb->dispatch_handle, firstBinding,
@@ -1306,8 +1306,12 @@ if (pdf2 && pdf2->features.f) { \
 
    device->emulate_vertex_divisor = debug_get_bool_option("WRAPPER_EMULATE_VERTEX_DIVISOR",
       physical_device->emulate_vertex_divisor);
+   device->emulate_zero_divisor = !device->emulate_vertex_divisor &&
+      physical_device->emulate_zero_divisor;
    if (device->emulate_vertex_divisor)
       WRAPPER_LOG(info, "Emulating vertex attribute divisors");
+   else if (device->emulate_zero_divisor)
+      WRAPPER_LOG(info, "Emulating the zero vertex attribute divisor");
 
    device->cmdbuf_entry_barrier = debug_get_bool_option("WRAPPER_CMDBUF_ENTRY_BARRIER",
       physical_device->driver_properties.driverID == VK_DRIVER_ID_IMAGINATION_PROPRIETARY);
@@ -3616,7 +3620,7 @@ wrapper_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
 
    VkGraphicsPipelineCreateInfo *div_infos = NULL;
    void **div_lowerings = NULL;
-   if (device->emulate_vertex_divisor && createInfoCount) {
+   if ((device->emulate_vertex_divisor || device->emulate_zero_divisor) && createInfoCount) {
       div_infos = malloc(createInfoCount * sizeof(*div_infos));
       div_lowerings = calloc(createInfoCount, sizeof(*div_lowerings));
       if (div_infos && div_lowerings) {
@@ -3711,7 +3715,7 @@ wrapper_DestroyPipeline(VkDevice _device, VkPipeline pipeline,
 
    if (device->emulate_dynamic_stride)
       wrapper_stride_destroy(device, pipeline);
-   if (device->emulate_vertex_divisor)
+   if ((device->emulate_vertex_divisor || device->emulate_zero_divisor))
       wrapper_divisor_destroy(device, pipeline);
    device->dispatch_table.DestroyPipeline(device->dispatch_handle, pipeline,
                                            pAllocator);
@@ -4432,7 +4436,7 @@ wrapper_CmdBindPipeline(VkCommandBuffer commandBuffer,
    if (wcb->device->emulate_dynamic_stride &&
        pipelineBindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS)
       wrapper_stride_bind(wcb, pipeline);
-   if (wcb->device->emulate_vertex_divisor &&
+   if ((wcb->device->emulate_vertex_divisor || wcb->device->emulate_zero_divisor) &&
        pipelineBindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS)
       wrapper_divisor_bind(wcb, pipeline);
    wcb->device->dispatch_table.CmdBindPipeline(wcb->dispatch_handle, pipelineBindPoint,

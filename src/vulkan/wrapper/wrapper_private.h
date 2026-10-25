@@ -42,6 +42,7 @@ struct wrapper_physical_device {
    bool emulate_imageless_framebuffer;
    bool emulate_vulkan13;
    bool emulate_vertex_divisor;
+   bool emulate_zero_divisor;
    char *resource_type;
    VkPhysicalDevice dispatch_handle;
    VkPhysicalDeviceProperties2 properties2;
@@ -88,6 +89,7 @@ struct wrapper_device {
    bool emulate_dynamic_stride;
    struct hash_table_u64 *divisor_pipeline_table;
    bool emulate_vertex_divisor;
+   bool emulate_zero_divisor;
    struct hash_table_u64 *fence_table;
    struct wrapper_physical_device *physical;
    struct vk_device_dispatch_table dispatch_table;
