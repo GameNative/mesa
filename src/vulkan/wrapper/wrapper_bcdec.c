@@ -622,8 +622,20 @@ get_texel_size_for_format(VkFormat format)
 }
 
 int
+bcn_is_native(struct wrapper_physical_device *pdev, VkFormat format)
+{
+   if (pdev->emulate_bcn != 3 || format < VK_FORMAT_BC1_RGB_UNORM_BLOCK ||
+       format > VK_FORMAT_BC7_SRGB_BLOCK)
+      return 0;
+   return (pdev->native_bcn_mask >> (format - VK_FORMAT_BC1_RGB_UNORM_BLOCK)) & 1;
+}
+
+int
 is_emulated_bcn(struct wrapper_physical_device *pdev, VkFormat format)
 {
+   if (bcn_is_native(pdev, format))
+      return 0;
+
    switch(format) {
       case VK_FORMAT_BC1_RGB_UNORM_BLOCK:
       case VK_FORMAT_BC1_RGB_SRGB_BLOCK:
@@ -633,17 +645,6 @@ is_emulated_bcn(struct wrapper_physical_device *pdev, VkFormat format)
       case VK_FORMAT_BC2_UNORM_BLOCK:
       case VK_FORMAT_BC3_UNORM_BLOCK:
       case VK_FORMAT_BC3_SRGB_BLOCK:
-         if (pdev->emulate_bcn == 3 && 
-             pdev->driver_properties.driverID == VK_DRIVER_ID_SAMSUNG_PROPRIETARY)
-         {
-            return 0;
-         }
-         else if (pdev->emulate_bcn > 1) {
-            return 1;
-         } else {
-            return 0;
-         }
-         break;
       case VK_FORMAT_BC4_UNORM_BLOCK:
       case VK_FORMAT_BC4_SNORM_BLOCK:
       case VK_FORMAT_BC5_SNORM_BLOCK:
