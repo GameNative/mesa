@@ -2,6 +2,7 @@
 #include <fcntl.h>
 
 #include "wrapper_private.h"
+#include "wrapper_bcdec.h"
 #include "wrapper_log.h"
 #include "wrapper_entrypoints.h"
 #include "wrapper_trampolines.h"
@@ -183,6 +184,46 @@ wrapper_setup_coherent_memory_types(struct wrapper_physical_device *pdevice)
          }
       }
    }
+}
+
+/* Auto mode: a BC format the base driver can sample and copy into in optimal
+ * tiling is used natively even without textureCompressionBC (PowerVR exposes
+ * BC1-BC5 that way); the rest are emulated, on every driver alike. */
+static void
+wrapper_probe_native_bcn(struct wrapper_physical_device *pdevice)
+{
+   const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+      VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
+      VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+   char native[160] = "", emulated[160] = "", features[400] = "";
+
+   pdevice->native_bcn_mask = 0;
+   bcn_set_vendor(pdevice->properties2.properties.vendorID);
+   for (VkFormat f = VK_FORMAT_BC1_RGB_UNORM_BLOCK; f <= VK_FORMAT_BC7_SRGB_BLOCK; f++) {
+      uint32_t bit = 1u << (f - VK_FORMAT_BC1_RGB_UNORM_BLOCK);
+      VkFormatProperties props = { 0 };
+      VkImageFormatProperties ifp;
+      pdevice->dispatch_table.GetPhysicalDeviceFormatProperties(
+         pdevice->dispatch_handle, f, &props);
+      bool ok = (props.optimalTilingFeatures & need) == need &&
+         pdevice->dispatch_table.GetPhysicalDeviceImageFormatProperties(
+            pdevice->dispatch_handle, f, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
+            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, 0,
+            &ifp) == VK_SUCCESS;
+      if (ok)
+         pdevice->native_bcn_mask |= bit;
+      char *list = ok ? native : emulated;
+      size_t len = strlen(list);
+      snprintf(list + len, sizeof(native) - len, "%s%d", len ? "," : "", f);
+      len = strlen(features);
+      snprintf(features + len, sizeof(features) - len, "%s%d=0x%x", len ? " " : "", f,
+               props.optimalTilingFeatures);
+   }
+
+   WRAPPER_LOG(info, "BCn auto: native formats [%s], emulated [%s]", native, emulated);
+   wrapper_diag_append("[BCN] auto: native formats [%s], emulated [%s]\n",
+                       native, emulated);
+   wrapper_diag_append("[BCN] optimal tiling features: %s\n", features);
 }
 
 VkResult enumerate_physical_device(struct vk_instance *_instance)
@@ -526,6 +567,8 @@ VkResult enumerate_physical_device(struct vk_instance *_instance)
       }
 
       pdevice->emulate_bcn = wrapper_emulate_bcn;
+      if (wrapper_emulate_bcn == 3)
+         wrapper_probe_native_bcn(pdevice);
 
       if (wrapper_dmaheap_cached == -1)
          wrapper_dmaheap_cached = getenv("WRAPPER_DMAHEAP_CACHED") && atoi(getenv("WRAPPER_DMAHEAP_CACHED"));
@@ -914,12 +957,14 @@ wrapper_GetPhysicalDeviceImageFormatProperties(VkPhysicalDevice physicalDevice,
    case VK_FORMAT_BC6H_SFLOAT_BLOCK:
    case VK_FORMAT_BC7_UNORM_BLOCK:
    case VK_FORMAT_BC7_SRGB_BLOCK:
-      if (pdevice->driver_properties.driverID == VK_DRIVER_ID_SAMSUNG_PROPRIETARY &&
-          format <= 138 && pdevice->emulate_bcn == 3)
+      if (bcn_is_native(pdevice, format))
          break;
              
       if (pdevice->emulate_bcn < 1)
          break;
+
+      if (pdevice->emulate_bcn > 1 && tiling != VK_IMAGE_TILING_OPTIMAL)
+         return VK_ERROR_FORMAT_NOT_SUPPORTED;
       
       if (type & VK_IMAGE_TYPE_1D) {
          pImageFormatProperties->maxExtent.width = pdevice->properties2.properties.limits.maxImageDimension1D;
@@ -993,12 +1038,14 @@ wrapper_GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice physicalDevice,
    case VK_FORMAT_BC6H_SFLOAT_BLOCK:
    case VK_FORMAT_BC7_UNORM_BLOCK:
    case VK_FORMAT_BC7_SRGB_BLOCK:
-      if (pdevice->driver_properties.driverID == VK_DRIVER_ID_SAMSUNG_PROPRIETARY &&
-          pImageFormatInfo->format <= 138 && pdevice->emulate_bcn == 3)
+      if (bcn_is_native(pdevice, pImageFormatInfo->format))
          break;
          
       if (pdevice->emulate_bcn < 1)
          break;
+
+      if (pdevice->emulate_bcn > 1 && pImageFormatInfo->tiling != VK_IMAGE_TILING_OPTIMAL)
+         return VK_ERROR_FORMAT_NOT_SUPPORTED;
       
       if (pImageFormatInfo->type & VK_IMAGE_TYPE_1D) {
          pImageFormatProperties->imageFormatProperties.maxExtent.width = pdevice->properties2.properties.limits.maxImageDimension1D;
@@ -1074,11 +1121,11 @@ wrapper_GetPhysicalDeviceFormatProperties(VkPhysicalDevice physicalDevice,
    case VK_FORMAT_BC6H_SFLOAT_BLOCK:
    case VK_FORMAT_BC7_UNORM_BLOCK:
    case VK_FORMAT_BC7_SRGB_BLOCK:
-      if (pdevice->driver_properties.driverID == VK_DRIVER_ID_SAMSUNG_PROPRIETARY &&
-          format <= 138 && pdevice->emulate_bcn == 3)
+      if (bcn_is_native(pdevice, format))
          break;
          
       if (pdevice->emulate_bcn > 0) {
+         memset(pFormatProperties, 0, sizeof(*pFormatProperties));
          pFormatProperties->optimalTilingFeatures |= VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
          wrapper_diag_bcn_answer(2, "FormatProperties", format);
          return;
@@ -1119,8 +1166,7 @@ wrapper_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice,
    case VK_FORMAT_BC6H_SFLOAT_BLOCK:
    case VK_FORMAT_BC7_UNORM_BLOCK:
    case VK_FORMAT_BC7_SRGB_BLOCK:
-      if (pdevice->driver_properties.driverID == VK_DRIVER_ID_SAMSUNG_PROPRIETARY &&
-          format <= 138 && pdevice->emulate_bcn == 3)
+      if (bcn_is_native(pdevice, format))
          break;
 
       if (pdevice->emulate_bcn > 0) {

@@ -73,6 +73,43 @@ adrenotools_dep = declare_dependency(
   link_with: adrenotools_subproj.get_variable('adrenotools_lib'),
 )
 
+wrapper_astcenc_simd = host_machine.cpu_family() == 'aarch64' ? '-DASTCENC_NEON=1' : '-DASTCENC_NEON=0'
+
+libwrapper_astcenc = static_library(
+  'wrapper_astcenc',
+  files(
+  'astcenc/astcenc_averages_and_directions.cpp',
+  'astcenc/astcenc_block_sizes.cpp',
+  'astcenc/astcenc_color_quantize.cpp',
+  'astcenc/astcenc_color_unquantize.cpp',
+  'astcenc/astcenc_compress_symbolic.cpp',
+  'astcenc/astcenc_compute_variance.cpp',
+  'astcenc/astcenc_decompress_symbolic.cpp',
+  'astcenc/astcenc_diagnostic_trace.cpp',
+  'astcenc/astcenc_entry.cpp',
+  'astcenc/astcenc_find_best_partitioning.cpp',
+  'astcenc/astcenc_ideal_endpoints_and_weights.cpp',
+  'astcenc/astcenc_image.cpp',
+  'astcenc/astcenc_integer_sequence.cpp',
+  'astcenc/astcenc_mathlib.cpp',
+  'astcenc/astcenc_mathlib_softfloat.cpp',
+  'astcenc/astcenc_partition_tables.cpp',
+  'astcenc/astcenc_percentile_tables.cpp',
+  'astcenc/astcenc_pick_best_endpoint_format.cpp',
+  'astcenc/astcenc_quantization.cpp',
+  'astcenc/astcenc_symbolic_physical.cpp',
+  'astcenc/astcenc_weight_align.cpp',
+  'astcenc/astcenc_weight_quant_xfer_tables.cpp',
+  ),
+  cpp_args: [
+    wrapper_astcenc_simd, '-DASTCENC_SVE=0', '-DASTCENC_SSE=0', '-DASTCENC_AVX=0',
+    '-DASTCENC_POPCNT=0', '-DASTCENC_F16C=0', '-w',
+  ],
+  gnu_symbol_visibility: 'hidden',
+  pic: true,
+  override_options: ['cpp_std=c++17', 'werror=false'],
+)
+
 wrapper_files = files(
   'wrapper_device.c',
   'wrapper_dynamic_stride.c',
@@ -81,7 +118,10 @@ wrapper_files = files(
   'wrapper_instance.c',
   'graphicsenv_hook.cpp',
   'spirv_patcher.cpp',
+  'wrapper_astcenc.cpp',
   'wrapper_bcdec.c',
+  'wrapper_bcn_gpu.c',
+  'wrapper_bcn_hq.c',
   'wrapper_log.c',
   'wrapper_physical_device.c',
 )
@@ -102,6 +142,7 @@ libvulkan_wrapper = shared_library(
     inc_src,
   ],
   dependencies: [wrapper_deps, vulkan_wsi_deps],
+  link_with: libwrapper_astcenc,
   gnu_symbol_visibility: 'hidden',
   install: true,
 )

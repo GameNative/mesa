@@ -38,6 +38,7 @@ struct wrapper_physical_device {
 
    int dma_heap_fd;
    int emulate_bcn;
+   uint32_t native_bcn_mask;
    bool is_vkd3d;
    bool emulate_imageless_framebuffer;
    bool emulate_vulkan13;
@@ -68,6 +69,13 @@ struct wrapper_queue {
 
 VK_DEFINE_HANDLE_CASTS(wrapper_queue, vk.base, VkQueue,
                        VK_OBJECT_TYPE_QUEUE)
+
+enum {
+   BCN_SLOT_DECODE, BCN_SLOT_ASTC4, BCN_SLOT_ASTC6, BCN_SLOT_ASTC8, BCN_SLOT_HDR,
+   BCN_SLOT_ENC_BC15, BCN_SLOT_ENC_BC6H, BCN_SLOT_ENC_BC7, BCN_SLOT_COUNT
+};
+
+enum { BCN_NONE, BCN_QUEUED, BCN_BUILDING, BCN_BUILT, BCN_TESTED, BCN_FAILED };
 
 struct wrapper_device {
    struct vk_device vk;
@@ -116,14 +124,31 @@ struct wrapper_device {
    VkImageView null_image_view;
    VkSampler null_sampler;
 
-   /* BCn->ASTC GPU transcode (compute), lazily initialized. */
+   /* BC decode/encode and ASTC encode compute shaders, lazily initialized. */
    simple_mtx_t bcn_gpu_mutex;
-   int bcn_gpu_state;                    /* 0 uninit, 1 ready, -1 disabled */
-   VkShaderModule bcn_shader;
-   VkDescriptorSetLayout bcn_set_layout;
-   VkPipelineLayout bcn_pipe_layout;
-   VkPipeline bcn_pipeline;
-   VkDeviceSize bcn_gpu_inflight;        /* transient GPU-transcode bytes not yet freed */
+   bool bcn_bda;                         /* bufferDeviceAddress enabled for them */
+   int bcn_tool_state;                   /* 0 not started, 1 started, -1 off */
+   uint32_t bcn_tool_family;               /* queue family of the self-test */
+   pthread_t bcn_tool_thread;
+   bool bcn_tool_thread_live;
+   bool bcn_tool_stop;
+   pthread_mutex_t bcn_tool_lock;
+   pthread_cond_t bcn_tool_cond;
+   uint32_t bcn_tool_untested;             /* a pipeline was built since the last check */
+   VkPipelineCache bcn_pipeline_cache;
+   VkPipelineLayout bcn_tool_layout;
+   VkBuffer bcn_tables;                    /* ASTC encoder tables */
+   VkDeviceMemory bcn_tables_memory;
+   VkDeviceAddress bcn_tables_address;
+   VkShaderModule bcn_decode_module;
+   VkShaderModule bcn_encode_module;
+   VkShaderModule bcn_astc_module;
+   VkShaderModule bcn_astc_hdr_module;
+   VkPipeline bcn_pipe[BCN_SLOT_COUNT];
+   int bcn_slot_state[BCN_SLOT_COUNT];
+   VkPipeline bcn_retired[BCN_SLOT_COUNT]; /* dropped by the self-test */
+   struct bcn_hq *bcn_hq;                  /* background astcenc stage */
+   uint32_t bcn_hq_active;                 /* its jobs not yet copied or dropped */
 
    /* Private queue and synchronous command buffer for host query reset. */
    simple_mtx_t query_reset_mutex;
@@ -151,10 +176,7 @@ struct wrapper_buffer {
    int is_mapped;
    VkDeviceMemory memory;
    struct wrapper_command_buffer *wcb;
-   /* For transient GPU-transcode buffers: a descriptor pool destroyed with it,
-    * and bytes to release from the device's in-flight counter when freed. */
-   VkDescriptorPool desc_pool;
-   VkDeviceSize bcn_inflight;
+   VkImage bcn_image;                    /* transient BCn image freed with the command buffer */
    VkExternalMemoryHandleTypeFlags handle_types;
 };
 
@@ -182,6 +204,10 @@ struct wrapper_image {
    bool is_wsi_image;
    VkExternalMemoryHandleTypeFlags handle_types;
    uint32_t mip_drop;
+   uint32_t bcn_hq_jobs;                  /* background ASTC jobs for this image */
+   VkImageLayout bcn_layout;              /* last layout recorded while it has some */
+   struct wrapper_command_buffer *bcn_touch; /* last command buffer that moved it */
+   uint32_t bcn_owner;                    /* queue family owning it after a transfer, + 1 */
 };
 
 struct wrapper_image *
@@ -196,7 +222,6 @@ struct wrapper_fence {
 	struct wrapper_device *device;
 	struct list_head link;
 	VkFence dispatch_handle;
-	struct list_head staging_buffers_list;
 };
 
 /* One chunked descriptor pool used to service emulated push-descriptor sets for
@@ -208,6 +233,14 @@ struct wrapper_push_pool {
    VkDescriptorPool pool;
    VkDescriptorSetLayout layout;   /* the set layout this pool is sized for */
    uint32_t remaining;             /* sets left before this pool is exhausted */
+};
+
+struct wrapper_push_record {
+   VkPipelineLayout layout;
+   VkShaderStageFlags stages;
+   uint32_t offset;
+   uint32_t size;
+   uint8_t data[256];
 };
 
 struct wrapper_command_buffer {
@@ -234,6 +267,12 @@ struct wrapper_command_buffer {
    uint32_t vb_valid;
    uint32_t divisor_saved_strides[32];
    uint32_t divisor_saved_valid;
+   struct list_head bcn_transients;
+   /* Compute pipeline and push constants the application set, put back after
+    * a BCn shader dispatch. */
+   VkPipeline compute_pipeline;
+   uint32_t push_count;
+   struct wrapper_push_record push[8];
 };
 
 VK_DEFINE_HANDLE_CASTS(wrapper_command_buffer, vk.base, VkCommandBuffer,
