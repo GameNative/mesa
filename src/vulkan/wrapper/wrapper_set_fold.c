@@ -163,7 +163,7 @@ fold_group_build(struct wrapper_device *device, struct fold_group *g)
       return g->merged ? VK_SUCCESS : VK_ERROR_INITIALIZATION_FAILED;
    g->built = true;
 
-   uint32_t fixed = device->fold_max_pool_count ? device->fold_max_pool_count : 65536;
+   uint32_t fixed = MAX2(device->fold_max_pool_count, 262144);
    VkDescriptorSetLayoutCreateFlags flags = 0;
    uint32_t n = 0;
    uint64_t total = 0;
