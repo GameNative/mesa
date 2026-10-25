@@ -357,8 +357,10 @@ bcn_create_pipeline_spec(struct wrapper_device *device, const uint32_t *code, si
  * (wrapper_astc_encode), 1 a workgroup per block or 2x2 blocks with shared
  * memory sums (wrapper_astc_fast), 2 the same with subgroup sums for 4x4
  * where clustered subgroup arithmetic covers 16 invocations.
- * WRAPPER_BCN_ASTC_ENCODER=block|group|subgroup picks one; the default is
- * subgroup where it is available, else group. */
+ * WRAPPER_BCN_ASTC_ENCODER=group|subgroup picks one of the workgroup
+ * variants; the default is the block encoder, which measured faster on a
+ * Pixel 9 (Mali-G715): 4x4 loads 190 ms against 260 with subgroup sums, 6x6
+ * 120 ms against 1.6-2.2 s with shared memory sums. */
 static int
 bcn_astc_encoder(struct wrapper_device *device, int slot)
 {
@@ -376,15 +378,13 @@ bcn_astc_encoder(struct wrapper_device *device, int slot)
                 (sg.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) &&
                 (sg.supportedOperations & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT) &&
                 (sg.supportedOperations & VK_SUBGROUP_FEATURE_CLUSTERED_BIT);
-   int enc = sg_ok ? 2 : 1;
+   int enc = 0;
    if (device->bcn_astc_block_only & (1u << slot))
       e = "block";
-   if (e && !strcmp(e, "block"))
-      enc = 0;
-   else if (e && !strcmp(e, "group"))
+   if (e && !strcmp(e, "group"))
       enc = 1;
-   else if (e && !strcmp(e, "subgroup") && !sg_ok)
-      enc = 1;
+   else if (e && !strcmp(e, "subgroup"))
+      enc = sg_ok ? 2 : 1;
    wrapper_diag_append("[BCN] ASTC %s encoder: %s (subgroup size %u, operations 0x%x)\n",
                        slot == BCN_SLOT_ASTC4 ? "4x4" : "6x6",
                        enc == 2 ? "subgroup" : enc == 1 ? "group" : "block", sg.subgroupSize,
@@ -614,13 +614,14 @@ bcn_tools_start(struct wrapper_device *device)
    return device->bcn_tool_state > 0;
 }
 
-/* The pipeline of a slot once it has passed its self-test, or asked for;
- * with wait (readbacks and copies), as soon as it is built. */
+/* The pipeline of a slot once it is built (its self-test runs at the next
+ * submit, before the batch that uses it), or asked for; with wait
+ * (readbacks and copies), after its build. */
 static VkPipeline
 bcn_pipe(struct wrapper_device *device, int slot, bool wait)
 {
    int st = __atomic_load_n(&device->bcn_slot_state[slot], __ATOMIC_ACQUIRE);
-   if (st == BCN_TESTED || (wait && st == BCN_BUILT))
+   if (st == BCN_TESTED || st == BCN_BUILT)
       return device->bcn_pipe[slot];
    if (st == BCN_FAILED || !bcn_tools_start(device))
       return VK_NULL_HANDLE;
@@ -634,7 +635,7 @@ bcn_pipe(struct wrapper_device *device, int slot, bool wait)
       pthread_cond_wait(&device->bcn_tool_cond, &device->bcn_tool_lock);
    st = device->bcn_slot_state[slot];
    pthread_mutex_unlock(&device->bcn_tool_lock);
-   return st == BCN_TESTED || (wait && st == BCN_BUILT) ? device->bcn_pipe[slot] : VK_NULL_HANDLE;
+   return st == BCN_TESTED || st == BCN_BUILT ? device->bcn_pipe[slot] : VK_NULL_HANDLE;
 }
 
 static int
