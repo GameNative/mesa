@@ -41,6 +41,7 @@ struct wrapper_physical_device {
    bool is_vkd3d;
    bool emulate_imageless_framebuffer;
    bool emulate_vulkan13;
+   bool raises_push_constant_limit;
    bool emulate_vertex_divisor;
    bool emulate_zero_divisor;
    char *resource_type;
