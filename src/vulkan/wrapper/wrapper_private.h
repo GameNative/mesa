@@ -178,6 +178,8 @@ struct wrapper_image {
    bool is_wsi_image;
    VkExternalMemoryHandleTypeFlags handle_types;
    uint32_t mip_drop;
+   struct wrapper_bcn_shadow *bcn_shadow;
+   bool bcn_shadow_failed;
 };
 
 struct wrapper_image *

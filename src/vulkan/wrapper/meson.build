@@ -81,6 +81,7 @@ wrapper_files = files(
   'graphicsenv_hook.cpp',
   'spirv_patcher.cpp',
   'wrapper_bcdec.c',
+  'wrapper_bcn_gpu.c',
   'wrapper_log.c',
   'wrapper_physical_device.c',
 )

@@ -6,6 +6,7 @@
 #include "wrapper_private.h"
 #include "wrapper_log.h"
 #include "wrapper_bcdec.h"
+#include "wrapper_bcn_gpu.h"
 #include "wrapper_bcn_spv.h"
 #include "spirv_patcher.hpp"
 #include "wrapper_entrypoints.h"
@@ -1635,7 +1636,8 @@ wrapper_image_destroy(struct wrapper_device *device,
       __atomic_sub_fetch(&wrapper_capped_images, 1, __ATOMIC_RELAXED);
 
    simple_mtx_unlock(&device->resource_mutex);
-   
+
+   wrapper_bcn_shadow_free(device, wi);
    vk_object_free(&device->vk, &device->vk.alloc, wi);
 }
 
@@ -5195,6 +5197,7 @@ wrapper_CmdCopyBufferToImage(VkCommandBuffer commandBuffer,
       return;
    }
 
+   wrapper_bcn_shadow_upload(wcb, wi, srcBuffer, regionCount, pRegions);
    wrapper_bcn_do_copy(wcb, device, wb, dstImage, dstLayout, format,
       wi->mip_drop, regionCount, pRegions);
 }
@@ -5233,6 +5236,7 @@ wrapper_CmdCopyBufferToImage2(VkCommandBuffer commandBuffer,
       };
    }
 
+   wrapper_bcn_shadow_upload(wcb, wi, pInfo->srcBuffer, pInfo->regionCount, regions);
    wrapper_bcn_do_copy(wcb, device, wb, pInfo->dstImage, pInfo->dstImageLayout,
       format, wi->mip_drop, pInfo->regionCount, regions);
 }
@@ -5560,6 +5564,13 @@ wrapper_CmdCopyImageToBuffer(VkCommandBuffer commandBuffer, VkImage srcImage,
    VkBufferImageCopy stack[WRAPPER_CAP_STACK_ENTRIES];
    VkBufferImageCopy *capped = NULL;
 
+   if (!mip_drop && device->physical->emulate_bcn > 1) {
+      struct wrapper_image *wi = get_wrapper_image_from_handle(device, srcImage);
+      if (wi && is_emulated_bcn(device->physical, wi->info.format) &&
+          wrapper_bcn_shadow_readback(wcb, wi, dstBuffer, regionCount, pRegions))
+         return;
+   }
+
    if (mip_drop && (capped = wrapper_cap_alloc(stack, sizeof(*capped), regionCount))) {
       for (uint32_t i = 0; i < regionCount; i++) {
          capped[i] = pRegions[i];
@@ -5585,6 +5596,27 @@ wrapper_CmdCopyImageToBuffer2(VkCommandBuffer commandBuffer,
    VkCopyImageToBufferInfo2 capped_info;
    VkBufferImageCopy2 stack[WRAPPER_CAP_STACK_ENTRIES];
    VkBufferImageCopy2 *capped = NULL;
+
+   if (!mip_drop && device->physical->emulate_bcn > 1) {
+      struct wrapper_image *wi = get_wrapper_image_from_handle(device, pInfo->srcImage);
+      if (wi && is_emulated_bcn(device->physical, wi->info.format)) {
+         VkBufferImageCopy regions[pInfo->regionCount];
+         for (uint32_t i = 0; i < pInfo->regionCount; i++) {
+            const VkBufferImageCopy2 *r = &pInfo->pRegions[i];
+            regions[i] = (VkBufferImageCopy){
+               .bufferOffset = r->bufferOffset,
+               .bufferRowLength = r->bufferRowLength,
+               .bufferImageHeight = r->bufferImageHeight,
+               .imageSubresource = r->imageSubresource,
+               .imageOffset = r->imageOffset,
+               .imageExtent = r->imageExtent,
+            };
+         }
+         if (wrapper_bcn_shadow_readback(wcb, wi, pInfo->dstBuffer, pInfo->regionCount,
+                                         regions))
+            return;
+      }
+   }
 
    if (mip_drop && (capped = wrapper_cap_alloc(stack, sizeof(*capped), pInfo->regionCount))) {
       for (uint32_t i = 0; i < pInfo->regionCount; i++) {
