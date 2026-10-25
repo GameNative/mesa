@@ -418,7 +418,7 @@ void quantize_hdr_rgbo(vec3 c, float sc, uint q)
    const float cut[10] = float[](1024.0, 4096.0, 2048.0, 1024.0, 2048.0, 16384.0,
                                  8192.0, 16384.0, 32768.0, 16384.0);
    float r_base = col.r, g_base = col.r - col.g, b_base = col.r - col.b, s_base = col.a;
-   for (int mode = 0; mode < 5; mode++) {
+   [[dont_unroll]] for (int mode = 0; mode < 5; mode++) {
       if (g_base > cut[mode * 2] || b_base > cut[mode * 2] || s_base > cut[mode * 2 + 1])
          continue;
       int mode_enc = mode < 4 ? (mode | int(majcomp << 2)) : (int(majcomp) | 0xc);
@@ -647,13 +647,13 @@ void main()
       top = max(top, max(orig[i].r, max(orig[i].g, orig[i].b)));
    /* fits with and without the texels far below the brightest one raised:
     * a channel near zero spans most of the LNS range and pulls the line */
-   for (uint v = 0u; v < 2u; v++) {
+   [[dont_unroll]] for (uint v = 0u; v < 2u; v++) {
       float floor_lns = v == 0u ? 0.0 : top - FLOOR_STOPS * 2048.0;
       [[dont_unroll]] for (uint i = 0u; i < 16u; i++)
          tex[i] = max(orig[i], vec3(floor_lns));
       vec3 l0, l1;
       line_fit(l0, l1);
-      for (uint k = 0u; k < 3u; k++) {
+      [[dont_unroll]] for (uint k = 0u; k < 3u; k++) {
          uint mode = cands[k].x, wq = cands[k].y, cq = cands[k].z, wbits = cands[k].w;
          vec3 e0 = l0, e1 = l1;
          if (e0.r + e0.g + e0.b > e1.r + e1.g + e1.b) {
@@ -691,7 +691,7 @@ void main()
       }
       /* endpoint mode 7: one offset for all channels, more weight levels */
       const uvec4 ocands[2] = uvec4[](uvec4(595u, 11u, 19u, 80u), uvec4(579u, 10u, 20u, 74u));
-      for (uint k = 0u; k < 2u; k++) {
+      [[dont_unroll]] for (uint k = 0u; k < 2u; k++) {
          uint mode = ocands[k].x, wq = ocands[k].y, cq = ocands[k].z;
          float lmin = 1e9, lmax = -1e9;
          [[dont_unroll]] for (uint i = 0u; i < 16u; i++) {

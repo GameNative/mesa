@@ -298,7 +298,7 @@ void ideal_weights(uint plane, vec4 e0, vec4 e1)
 
 void refit(uint planes, inout vec4 e0, inout vec4 e1)
 {
-   for (uint c = 0u; c < 4u; c++) {
+   [[dont_unroll]] for (uint c = 0u; c < 4u; c++) {
       bool in1 = m1[c] > 0.0, in2 = planes == 2u && c == ccs;
       if (!in1 && !in2)
          continue;
