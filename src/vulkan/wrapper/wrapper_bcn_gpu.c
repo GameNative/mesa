@@ -223,18 +223,22 @@ bcn_transient_image(struct wrapper_command_buffer *wcb, VkFormat format, uint32_
 }
 
 static VkResult
-bcn_create_pipeline(struct wrapper_device *device, const uint32_t *code, size_t size,
-                    VkShaderModule *module, VkPipeline *pipeline)
+bcn_create_pipeline_spec(struct wrapper_device *device, const uint32_t *code, size_t size,
+                         VkShaderModule *module, VkPipeline *pipeline, uint32_t edge)
 {
    VkShaderModuleCreateInfo smci = {
       .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
       .codeSize = size,
       .pCode = code,
    };
-   VkResult r = device->dispatch_table.CreateShaderModule(device->dispatch_handle, &smci,
-                                                          NULL, module);
+   VkResult r = VK_SUCCESS;
+   if (!*module)
+      r = device->dispatch_table.CreateShaderModule(device->dispatch_handle, &smci, NULL,
+                                                    module);
    if (r != VK_SUCCESS)
       return r;
+   VkSpecializationMapEntry entry = { 0, 0, sizeof(uint32_t) };
+   VkSpecializationInfo spec = { 1, &entry, sizeof(uint32_t), &edge };
    VkComputePipelineCreateInfo cpci = {
       .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
       .stage = {
@@ -242,6 +246,7 @@ bcn_create_pipeline(struct wrapper_device *device, const uint32_t *code, size_t 
          .stage = VK_SHADER_STAGE_COMPUTE_BIT,
          .module = *module,
          .pName = "main",
+         .pSpecializationInfo = edge ? &spec : NULL,
       },
       .layout = device->bcn_tool_layout,
    };
@@ -250,6 +255,13 @@ bcn_create_pipeline(struct wrapper_device *device, const uint32_t *code, size_t 
    if (r != VK_SUCCESS)
       *pipeline = VK_NULL_HANDLE;
    return r;
+}
+
+static VkResult
+bcn_create_pipeline(struct wrapper_device *device, const uint32_t *code, size_t size,
+                    VkShaderModule *module, VkPipeline *pipeline)
+{
+   return bcn_create_pipeline_spec(device, code, size, module, pipeline, 0);
 }
 
 struct bcn_selftest_buf {
@@ -384,8 +396,8 @@ bcn_selftest(struct wrapper_device *device, uint32_t family, char *report, size_
          .src_row_pitch = 16, .src_slice_pitch = 64, .dst_row_pitch = 16, .dst_slice_pitch = 16,
          .blocks_x = 1, .blocks_y = 1, .format = 4, .flags = 0, .width = 4, .height = 4,
       };
-      if (device->bcn_decode_pipeline && device->bcn_astc_pipeline)
-         bcn_selftest_push(device, cb, device->bcn_astc_pipeline, &ac);
+      if (device->bcn_decode_pipeline && device->bcn_astc_pipeline[0])
+         bcn_selftest_push(device, cb, device->bcn_astc_pipeline[0], &ac);
       struct bcn_pc ec = ac;
       ec.dst[0] = (uint32_t)bc.address;
       ec.dst[1] = (uint32_t)(bc.address >> 32);
@@ -430,13 +442,14 @@ bcn_selftest(struct wrapper_device *device, uint32_t family, char *report, size_
    if (!dec_ok || (force && strstr(force, "decode")))
       bcn_disable_pipeline(device, &device->bcn_decode_pipeline);
    if (!astc_ok || (force && strstr(force, "astc")))
-      bcn_disable_pipeline(device, &device->bcn_astc_pipeline);
+      for (int i = 0; i < 3; i++)
+         bcn_disable_pipeline(device, &device->bcn_astc_pipeline[i]);
    if (!bc_ok || (force && strstr(force, "bc")))
       bcn_disable_pipeline(device, &device->bcn_encode_pipeline);
    const uint8_t *g = ran ? rgba.map : NULL;
    snprintf(report, size, "self-test ran=%d decode=%s astc=%s bc=%s first=%02x%02x%02x%02x",
             ran, device->bcn_decode_pipeline ? "ok" : "off",
-            device->bcn_astc_pipeline ? "ok" : "off", device->bcn_encode_pipeline ? "ok" : "off",
+            device->bcn_astc_pipeline[0] ? "ok" : "off", device->bcn_encode_pipeline ? "ok" : "off",
             g ? g[0] : 0, g ? g[1] : 0, g ? g[2] : 0, g ? g[3] : 0);
 
    if (fence)
@@ -482,8 +495,13 @@ wrapper_bcn_gpu_init(struct wrapper_device *device, uint32_t family)
                                 &device->bcn_decode_module, &device->bcn_decode_pipeline);
       enc = bcn_create_pipeline(device, wrapper_bcn_encode_spv, sizeof(wrapper_bcn_encode_spv),
                                 &device->bcn_encode_module, &device->bcn_encode_pipeline);
-      astc = bcn_create_pipeline(device, wrapper_astc_encode_spv, sizeof(wrapper_astc_encode_spv),
-                                 &device->bcn_astc_module, &device->bcn_astc_pipeline);
+      for (uint32_t i = 0; i < 3; i++) {
+         VkResult r = bcn_create_pipeline_spec(device, wrapper_astc_encode_spv,
+            sizeof(wrapper_astc_encode_spv), &device->bcn_astc_module,
+            &device->bcn_astc_pipeline[i], 4 + 2 * i);
+         if (i == 0 || r != VK_SUCCESS)
+            astc = r;
+      }
    }
    char report[160] = "self-test not run";
    if (layout == VK_SUCCESS && family != UINT32_MAX)
@@ -511,8 +529,9 @@ wrapper_bcn_gpu_finish(struct wrapper_device *device)
       device->dispatch_table.DestroyPipeline(d, device->bcn_decode_pipeline, NULL);
    if (device->bcn_encode_pipeline)
       device->dispatch_table.DestroyPipeline(d, device->bcn_encode_pipeline, NULL);
-   if (device->bcn_astc_pipeline)
-      device->dispatch_table.DestroyPipeline(d, device->bcn_astc_pipeline, NULL);
+   for (int i = 0; i < 3; i++)
+      if (device->bcn_astc_pipeline[i])
+         device->dispatch_table.DestroyPipeline(d, device->bcn_astc_pipeline[i], NULL);
    if (device->bcn_astc_module)
       device->dispatch_table.DestroyShaderModule(d, device->bcn_astc_module, NULL);
    if (device->bcn_decode_module)
@@ -892,7 +911,7 @@ bcn_gpu_upload_region(struct wrapper_command_buffer *wcb, struct wrapper_image *
    uint32_t m = c->imageSubresource.mipLevel;
    uint32_t lw = MAX2(1u, wi->info.extent.width >> m), lh = MAX2(1u, wi->info.extent.height >> m);
    if (!w || !h || !bcn_tools_ready(device) || !device->bcn_decode_pipeline ||
-       (astc && !device->bcn_astc_pipeline))
+       (astc && !device->bcn_astc_pipeline[astc == 4 ? 0 : astc == 6 ? 1 : 2]))
       return false;
    bool merge = astc && wrapper_bcn_gpu_misaligned(wi, c);
    /* the rectangle written: the region, or the ASTC blocks covering it */
@@ -1069,7 +1088,8 @@ bcn_gpu_upload_region(struct wrapper_command_buffer *wcb, struct wrapper_image *
          .width = w,
          .height = h,
       };
-      bcn_dispatch(wcb, device->bcn_astc_pipeline, &ac, layers);
+      bcn_dispatch(wcb, device->bcn_astc_pipeline[astc == 4 ? 0 : astc == 6 ? 1 : 2], &ac,
+                   layers);
       copy.bufferRowLength = abx * astc;
       copy.bufferImageHeight = aby * astc;
       from = out->dispatch_handle;
