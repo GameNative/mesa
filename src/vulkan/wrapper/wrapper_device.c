@@ -2399,7 +2399,20 @@ wrapper_GetDeviceImageSubresourceLayoutKHR(VkDevice _device,
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
 wrapper_GetDeviceProcAddr(VkDevice _device, const char* pName) {
    VK_FROM_HANDLE(wrapper_device, device, _device);
-   return vk_device_get_proc_addr(&device->vk, pName);
+   PFN_vkVoidFunction func = vk_device_get_proc_addr(&device->vk, pName);
+   if (func || !pName)
+      return func;
+
+   static const char *const suffixes[] = { "KHR", "EXT" };
+   for (unsigned i = 0; i < ARRAY_SIZE(suffixes); i++) {
+      char alias[256];
+      if (snprintf(alias, sizeof(alias), "%s%s", pName, suffixes[i]) >= (int)sizeof(alias))
+         continue;
+      func = vk_device_get_proc_addr(&device->vk, alias);
+      if (func)
+         return func;
+   }
+   return NULL;
 }
 
 /* ---- VK_KHR_push_descriptor emulation -------------------------------------
