@@ -4786,10 +4786,14 @@ wrapper_CreateShaderModule(VkDevice _device,
    uint32_t *lowered = NULL;
    size_t lowered_words = 0;
 
+   bool lower_demote = device->physical->emulate_vulkan13 &&
+      !device->physical->base_supported_features.shaderDemoteToHelperInvocation;
    if (create_info.codeSize >= 20 &&
-       create_info.pCode[1] > wrapper_max_spirv_version(device->physical)) {
+       (create_info.pCode[1] > wrapper_max_spirv_version(device->physical) || lower_demote)) {
       uint32_t flags = device->physical->base_supported_features.shaderZeroInitializeWorkgroupMemory
          ? 0 : WRAPPER_SPIRV_STRIP_WORKGROUP_INIT;
+      if (lower_demote)
+         flags |= WRAPPER_SPIRV_LOWER_DEMOTE;
       enum wrapper_spirv_lower_result r = wrapper_spirv_lower_to_1_3(
          create_info.pCode, create_info.codeSize / 4, flags, &lowered, &lowered_words);
       if (r == WRAPPER_SPIRV_LOWERED) {

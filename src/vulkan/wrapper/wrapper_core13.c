@@ -203,6 +203,7 @@ wrapper_core13_init_physical_device(struct wrapper_physical_device *pdevice)
    f->synchronization2 = true;
    f->maintenance4 = true;
    f->shaderZeroInitializeWorkgroupMemory = true;
+   f->shaderDemoteToHelperInvocation = true;
    f->descriptorIndexing |= e->EXT_descriptor_indexing;
    f->samplerMirrorClampToEdge |= e->KHR_sampler_mirror_clamp_to_edge;
    f->drawIndirectCount |= e->KHR_draw_indirect_count;

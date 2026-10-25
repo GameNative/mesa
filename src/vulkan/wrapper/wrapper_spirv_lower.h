@@ -15,6 +15,7 @@ enum wrapper_spirv_lower_result {
 };
 
 #define WRAPPER_SPIRV_STRIP_WORKGROUP_INIT (1u << 0)
+#define WRAPPER_SPIRV_LOWER_DEMOTE (1u << 1)
 
 enum wrapper_spirv_lower_result
 wrapper_spirv_lower_to_1_3(const uint32_t *in, size_t words, uint32_t flags,

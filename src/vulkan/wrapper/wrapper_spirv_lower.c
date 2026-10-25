@@ -22,7 +22,12 @@ enum {
    OP_TYPE_ARRAY = 28,
    OP_TYPE_RUNTIME_ARRAY = 29,
    OP_TYPE_STRUCT = 30,
+   OP_TYPE_BOOL = 20,
    OP_TYPE_POINTER = 32,
+   OP_CONSTANT_FALSE = 42,
+   OP_LABEL = 248,
+   OP_DEMOTE_TO_HELPER = 5380,
+   OP_IS_HELPER = 5381,
    OP_CONSTANT = 43,
    OP_VARIABLE = 59,
    OP_LOAD = 61,
@@ -277,7 +282,20 @@ enum wrapper_spirv_lower_result
 wrapper_spirv_lower_to_1_3(const uint32_t *in, size_t words, uint32_t flags,
                            uint32_t **out_code, size_t *out_words)
 {
-   if (words < 5 || in[0] != SPV_MAGIC || in[1] <= SPV_1_3)
+   if (words < 5 || in[0] != SPV_MAGIC)
+      return WRAPPER_SPIRV_UNCHANGED;
+   bool lower_demote = false;
+   if (flags & WRAPPER_SPIRV_LOWER_DEMOTE) {
+      for (size_t i = 5; i < words && (in[i] >> 16);) {
+         uint32_t op = in[i] & 0xffff;
+         if (op == OP_CAPABILITY && in[i + 1] == CAP_DEMOTE_TO_HELPER)
+            lower_demote = true;
+         if (op != OP_CAPABILITY && op != OP_EXTENSION)
+            break;
+         i += in[i] >> 16;
+      }
+   }
+   if (in[1] <= SPV_1_3 && !lower_demote)
       return WRAPPER_SPIRV_UNCHANGED;
 
    struct spv_info info = {
@@ -292,6 +310,7 @@ wrapper_spirv_lower_to_1_3(const uint32_t *in, size_t words, uint32_t flags,
    bool need[EXT_COUNT] = { false };
    bool have[EXT_COUNT] = { false };
    bool have_device_scope = false;
+   uint32_t bool_type = 0, false_id = 0;
    bool ok = info.storage && info.type_op && info.def;
 
    for (size_t i = 5; ok && i < words;) {
@@ -332,6 +351,9 @@ wrapper_spirv_lower_to_1_3(const uint32_t *in, size_t words, uint32_t flags,
          if (n > 3 && w[2] < info.bound)
             info.def[w[2]] = (uint32_t)i;
          break;
+      case OP_TYPE_BOOL:
+         bool_type = w[1];
+         break;
       case OP_VARIABLE:
          if (n > 3 && w[2] < info.bound)
             info.storage[w[2]] = (uint8_t)(w[3] + 1);
@@ -356,7 +378,12 @@ wrapper_spirv_lower_to_1_3(const uint32_t *in, size_t words, uint32_t flags,
       ok = false;
    if (ok) {
       memcpy(b.d, in, 5 * sizeof(uint32_t));
-      b.d[1] = SPV_1_3;
+      b.d[1] = in[1] < SPV_1_3 ? in[1] : SPV_1_3;
+   }
+   if (lower_demote) {
+      need[EXT_DEMOTE] = false;
+      if (bool_type)
+         false_id = info.next_id++;
    }
 
    bool emitted_viewport_layer = false;
@@ -378,8 +405,33 @@ wrapper_spirv_lower_to_1_3(const uint32_t *in, size_t words, uint32_t flags,
       case OP_EXTENSION:
          if (string_equals(&w[1], n - 1, "SPV_KHR_terminate_invocation"))
             continue;
+         if (lower_demote && string_equals(&w[1], n - 1, ext_names[EXT_DEMOTE]))
+            continue;
+         break;
+      case OP_TYPE_BOOL:
+         buf_put(&b, w, n);
+         if (false_id) {
+            uint32_t c[3] = { (3u << 16) | OP_CONSTANT_FALSE, bool_type, false_id };
+            buf_put(&b, c, 3);
+         }
+         continue;
+      case OP_DEMOTE_TO_HELPER:
+         if (lower_demote) {
+            uint32_t k[3] = { (1u << 16) | OP_KILL, (2u << 16) | OP_LABEL, info.next_id++ };
+            buf_put(&b, k, 3);
+            continue;
+         }
+         break;
+      case OP_IS_HELPER:
+         if (lower_demote && false_id && n == 3) {
+            uint32_t c[4] = { (4u << 16) | OP_COPY_OBJECT, w[1], w[2], false_id };
+            buf_put(&b, c, 4);
+            continue;
+         }
          break;
       case OP_CAPABILITY:
+         if (lower_demote && w[1] == CAP_DEMOTE_TO_HELPER)
+            continue;
          if (w[1] == CAP_VULKAN_MEMORY_MODEL && !have_device_scope) {
             uint32_t c[4] = { (2u << 16) | OP_CAPABILITY, CAP_VULKAN_MEMORY_MODEL,
                               (2u << 16) | OP_CAPABILITY, CAP_VULKAN_MEMORY_MODEL_DEVICE_SCOPE };
