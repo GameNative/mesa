@@ -254,9 +254,8 @@ get_block_size(VkFormat format)
     }
 }
 
-/* BC4/BC5 into an RGBA scratch with the channel layout the shaders expect
- * without a view swizzle: BC4 replicates its value over RGB (A=255), BC5 keeps
- * R/G from the block with B=0, A=255. */
+/* BC4/BC5 into an RGBA scratch with the layout D3D and GL sample them with:
+ * BC4 as (r, 0, 0, 1), BC5 as (r, g, 0, 1). */
 static void
 bcn_decode_rg_rgba(VkFormat format, const char *src, unsigned char *dst, int stride)
 {
@@ -278,7 +277,8 @@ bcn_decode_rg_rgba(VkFormat format, const char *src, unsigned char *dst, int str
       for (int y = 0; y < 4; y++) {
          for (int x = 0; x < 4; x++) {
             unsigned char *p = dst + y * stride + x * 4;
-            p[0] = p[1] = p[2] = tmp[y * 4 + x];
+            p[0] = tmp[y * 4 + x];
+            p[1] = p[2] = 0;
             p[3] = 255;
          }
       }
@@ -538,8 +538,9 @@ get_decode_format_for_bcn(VkFormat bcn_format)
    }
 }
 
-/* Storage (image) format. For BC1/2/3/4/5/7 this is ASTC 4x4 (kept compressed);
- * the SNORM BC4/5 variants and BC6H stay uncompressed (decoded). */
+/* Storage (image) format. For BC1/2/3/5/7 this is ASTC (kept compressed);
+ * BC4 stays R8 (as small as ASTC 4x4 and exact) unless the policy asks for
+ * bc4=4x4, and the SNORM BC4/5 variants and BC6H stay uncompressed. */
 VkFormat
 get_format_for_bcn(VkFormat bcn_format)
 {
@@ -561,7 +562,9 @@ get_format_for_bcn(VkFormat bcn_format)
       case VK_FORMAT_BC7_UNORM_BLOCK:
          idx = BCN_POL_BC7; break;
       case VK_FORMAT_BC4_UNORM_BLOCK:
-         idx = BCN_POL_BC4; break;
+         if (bcn_policy_block(BCN_POL_BC4))
+            idx = BCN_POL_BC4;
+         break;
       case VK_FORMAT_BC5_UNORM_BLOCK:
          idx = BCN_POL_BC5; break;
       case VK_FORMAT_BC6H_UFLOAT_BLOCK:
