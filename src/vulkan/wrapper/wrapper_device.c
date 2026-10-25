@@ -7,7 +7,6 @@
 #include "wrapper_log.h"
 #include "wrapper_bcdec.h"
 #include "wrapper_bcn_gpu.h"
-#include "wrapper_bcn_spv.h"
 #include "spirv_patcher.hpp"
 #include "wrapper_entrypoints.h"
 #include "wrapper_trampolines.h"
@@ -1103,7 +1102,7 @@ wrapper_emit_diag(struct wrapper_physical_device *pdev,
      is_astc_6x6(get_format_for_bcn(VK_FORMAT_BC1_RGB_UNORM_BLOCK)) ? "6x6" :
      is_astc_8x8(get_format_for_bcn(VK_FORMAT_BC1_RGB_UNORM_BLOCK)) ? "8x8" :
      is_astc_4x4(get_format_for_bcn(VK_FORMAT_BC1_RGB_UNORM_BLOCK)) ? "4x4" : "decode",
-     (getenv("WRAPPER_BCN_GPU") && atoi(getenv("WRAPPER_BCN_GPU"))) ? "GPU" : "CPU",
+     wrapper_bcn_gpu_path() ? "GPU" : "CPU",
      (!getenv("WRAPPER_USE_BCN_CACHE") || atoi(getenv("WRAPPER_USE_BCN_CACHE"))) ? "on" : "off",
      bcn_upload_enabled() ? "on" : "off");
    D("  format diag                   : wrapper-fmtdiag-1\n");
@@ -1178,7 +1177,6 @@ wrapper_CreateDevice(VkPhysicalDevice physicalDevice,
    simple_mtx_init(&device->resource_mutex, mtx_plain);
    simple_mtx_init(&device->bcn_gpu_mutex, mtx_plain);
    simple_mtx_init(&device->query_reset_mutex, mtx_plain);
-   device->bcn_gpu_state = 0;
    device->physical = physical_device;
 
    vk_device_dispatch_table_from_entrypoints(
@@ -2774,14 +2772,6 @@ wrapper_bcn_transients_free(struct wrapper_command_buffer *wcb)
 {
    struct wrapper_device *device = wcb->device;
    list_for_each_entry_safe(struct wrapper_buffer, wb, &wcb->bcn_transients, link) {
-      if (wb->desc_pool)
-         device->dispatch_table.DestroyDescriptorPool(device->dispatch_handle,
-            wb->desc_pool, NULL);
-      if (wb->bcn_inflight) {
-         simple_mtx_lock(&device->bcn_gpu_mutex);
-         device->bcn_gpu_inflight -= wb->bcn_inflight;
-         simple_mtx_unlock(&device->bcn_gpu_mutex);
-      }
       if (wb->dispatch_handle)
          device->dispatch_table.DestroyBuffer(device->dispatch_handle,
             wb->dispatch_handle, NULL);
@@ -4085,324 +4075,6 @@ wrapper_AllocateCommandBuffers(VkDevice _device,
    return result;
 }
 
-struct wrapper_bcn_pc {
-   uint32_t block_x, block_x_src, block_y, src_word_off, format, has_alpha;
-   uint32_t astc8, bc_bx, bc_by;
-};
-
-/* Shader format id for a BC format, or -1 if the GPU shader can't decode it
- * (those fall back to the CPU path). The shader now produces ASTC 4x4 OR 8x8
- * (selected per-dispatch via the astc8 push constant), so both are on the GPU. */
-static int
-wrapper_bcn_gpu_format_id(VkFormat format)
-{
-   switch (format) {
-   case VK_FORMAT_BC1_RGB_UNORM_BLOCK:
-   case VK_FORMAT_BC1_RGB_SRGB_BLOCK:
-      if (is_astc_6x6(get_format_for_bcn(format)))
-         return -1; /* BC1 as ASTC 6x6: CPU only */
-      return 0; /* BC1: opaque, single-plane RGB */
-   case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
-   case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
-      return -1; /* The GPU BC1 path drops alpha; use the CPU RGBA encoder. */
-   case VK_FORMAT_BC7_UNORM_BLOCK:
-   case VK_FORMAT_BC7_SRGB_BLOCK:
-      return 1; /* BC7: alpha, dual-plane */
-   default:
-      return -1;
-   }
-}
-
-static void
-wrapper_bcn_gpu_init(struct wrapper_device *device)
-{
-   VkResult r;
-   VkShaderModuleCreateInfo smci = {
-      .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-      .codeSize = sizeof(wrapper_bcn_transcode_spv),
-      .pCode = wrapper_bcn_transcode_spv,
-   };
-   r = device->dispatch_table.CreateShaderModule(device->dispatch_handle,
-      &smci, NULL, &device->bcn_shader);
-   if (r != VK_SUCCESS) { device->bcn_gpu_state = -1; return; }
-
-   VkDescriptorSetLayoutBinding binds[2] = {
-      { .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-        .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT },
-      { .binding = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-        .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT },
-   };
-   VkDescriptorSetLayoutCreateInfo dslci = {
-      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-      .bindingCount = 2, .pBindings = binds,
-   };
-   r = device->dispatch_table.CreateDescriptorSetLayout(device->dispatch_handle,
-      &dslci, NULL, &device->bcn_set_layout);
-   if (r != VK_SUCCESS) { device->bcn_gpu_state = -1; return; }
-
-   VkPushConstantRange pcr = {
-      .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
-      .offset = 0, .size = sizeof(struct wrapper_bcn_pc),
-   };
-   VkPipelineLayoutCreateInfo plci = {
-      .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-      .setLayoutCount = 1, .pSetLayouts = &device->bcn_set_layout,
-      .pushConstantRangeCount = 1, .pPushConstantRanges = &pcr,
-   };
-   r = device->dispatch_table.CreatePipelineLayout(device->dispatch_handle,
-      &plci, NULL, &device->bcn_pipe_layout);
-   if (r != VK_SUCCESS) { device->bcn_gpu_state = -1; return; }
-
-   VkComputePipelineCreateInfo cpci = {
-      .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-      .stage = {
-         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-         .stage = VK_SHADER_STAGE_COMPUTE_BIT,
-         .module = device->bcn_shader, .pName = "main",
-      },
-      .layout = device->bcn_pipe_layout,
-   };
-   r = device->dispatch_table.CreateComputePipelines(device->dispatch_handle,
-      VK_NULL_HANDLE, 1, &cpci, NULL, &device->bcn_pipeline);
-   if (r != VK_SUCCESS) { device->bcn_gpu_state = -1; return; }
-
-   device->bcn_gpu_state = 1;
-}
-
-static bool
-wrapper_bcn_gpu_ready(struct wrapper_device *device)
-{
-   /* Default OFF. The GPU compute transcode is correct in isolation (its BC7
-    * decode is bit-identical to bcdec and the ASTC encode matches the CPU
-    * encoder), but running compute dispatches inline during Hades's launch
-    * screen corrupts that screen's rendering (it renders black), and the boot
-    * is package-load-bound so the GPU path saves no meaningful time. The CPU
-    * encoder is correct everywhere; opt into the GPU path with WRAPPER_BCN_GPU=1. */
-   static int env = -1;
-   if (env == -1)
-      env = getenv("WRAPPER_BCN_GPU") ? atoi(getenv("WRAPPER_BCN_GPU")) : 0;
-   if (!env)
-      return false;
-
-   simple_mtx_lock(&device->bcn_gpu_mutex);
-   if (device->bcn_gpu_state == 0)
-      wrapper_bcn_gpu_init(device);
-   bool ready = device->bcn_gpu_state == 1;
-   simple_mtx_unlock(&device->bcn_gpu_mutex);
-   return ready;
-}
-
-static struct wrapper_buffer *
-wrapper_bcn_make_buffer(struct wrapper_device *device, VkDeviceSize size,
-   VkBufferUsageFlags usage)
-{
-   struct wrapper_buffer *b = vk_object_zalloc(&device->vk, &device->vk.alloc,
-      sizeof(struct wrapper_buffer), VK_OBJECT_TYPE_BUFFER);
-   if (!b) return NULL;
-   b->device = device;
-
-   VkBufferCreateInfo bci = {
-      .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-      .size = size, .usage = usage, .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-   };
-   if (device->dispatch_table.CreateBuffer(device->dispatch_handle, &bci, NULL,
-         &b->dispatch_handle) != VK_SUCCESS) {
-      vk_object_free(&device->vk, &device->vk.alloc, b);
-      return NULL;
-   }
-   VkMemoryRequirements mr;
-   device->dispatch_table.GetBufferMemoryRequirements(device->dispatch_handle,
-      b->dispatch_handle, &mr);
-   VkMemoryAllocateInfo ai = {
-      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-      .allocationSize = mr.size,
-      .memoryTypeIndex = wrapper_select_device_memory_type(device,
-         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT),
-   };
-   if (device->dispatch_table.AllocateMemory(device->dispatch_handle, &ai, NULL,
-         &b->memory) != VK_SUCCESS) {
-      device->dispatch_table.DestroyBuffer(device->dispatch_handle,
-         b->dispatch_handle, NULL);
-      vk_object_free(&device->vk, &device->vk.alloc, b);
-      return NULL;
-   }
-   device->dispatch_table.BindBufferMemory(device->dispatch_handle,
-      b->dispatch_handle, b->memory, 0);
-   b->size = size;
-   return b;
-}
-
-/* Destroy an untracked transcode buffer (error-path cleanup). */
-static void
-wrapper_bcn_free_buffer(struct wrapper_device *device, struct wrapper_buffer *b)
-{
-   if (!b) return;
-   device->dispatch_table.DestroyBuffer(device->dispatch_handle, b->dispatch_handle, NULL);
-   device->dispatch_table.FreeMemory(device->dispatch_handle, b->memory, NULL);
-   vk_object_free(&device->vk, &device->vk.alloc, b);
-}
-
-/* GPU transcode: BC source buffer -> compute -> ASTC buffer -> copy to image.
- * Returns false (with nothing recorded for the failing region) to fall back to
- * the CPU path. Injected into the app's command buffer; state it binds (compute
- * pipeline/descriptors) is rebound by the app before its own next dispatch. */
-static bool
-wrapper_bcn_gpu_copy(struct wrapper_command_buffer *wcb,
-                     struct wrapper_device *device, struct wrapper_buffer *wb,
-                     VkImage dstImage, VkImageLayout dstLayout, VkFormat format,
-                     int fmt_id, uint32_t regionCount,
-                     const VkBufferImageCopy *pRegions)
-{
-   int block_size = (fmt_id == 0) ? 8 : 16;   /* BC1=8, BC7=16 bytes/block */
-   uint32_t has_alpha = (fmt_id == 0) ? 0 : 1; /* BC1 opaque, BC7 alpha */
-   int astc8 = is_astc_8x8(get_format_for_bcn(format)) ? 1 : 0;
-   /* In-flight transient ceiling; beyond it, uploads fall back to CPU. Tunable
-    * per device RAM via WRAPPER_BCN_GPU_CAP_MB (default 128 MB). */
-   static VkDeviceSize CAP = 0;
-   if (CAP == 0) {
-      int mb = getenv("WRAPPER_BCN_GPU_CAP_MB") ? atoi(getenv("WRAPPER_BCN_GPU_CAP_MB")) : 128;
-      if (mb < 16) mb = 16;
-      CAP = (VkDeviceSize)mb * 1024 * 1024;
-   }
-
-   for (uint32_t i = 0; i < regionCount; i++) {
-      VkBufferImageCopy region = pRegions[i];
-      int w = region.imageExtent.width;
-      int h = region.imageExtent.height;
-      VkDeviceSize offset = region.bufferOffset;
-      if (offset % 4 != 0)
-         return false; /* CmdCopyBuffer needs 4-aligned offsets; fall back to CPU */
-      int src_w = region.bufferRowLength ? (int)region.bufferRowLength : w;
-      /* BC-block extents of the real texture, and the source row stride. */
-      int bc_bx = (w + 3) / 4;
-      int bc_by = (h + 3) / 4;
-      int block_x_src = (src_w + 3) / 4;
-      /* Destination ASTC block grid: 8x8 blocks pack 2x2 BC blocks each. */
-      int block_x = astc8 ? (w + 7) / 8 : bc_bx;
-      int block_y = astc8 ? (h + 7) / 8 : bc_by;
-      VkDeviceSize src_size = (VkDeviceSize)block_x_src * bc_by * block_size;
-      VkDeviceSize dst_size = (VkDeviceSize)block_x * block_y * 16;
-      VkDeviceSize total = src_size + dst_size;
-
-      /* Bound the transient GPU memory: if we'd exceed the ceiling, fall back to
-       * the CPU path for this upload rather than risk exhausting device memory. */
-      simple_mtx_lock(&device->bcn_gpu_mutex);
-      if (device->bcn_gpu_inflight + total > CAP) {
-         simple_mtx_unlock(&device->bcn_gpu_mutex);
-         return false;
-      }
-      device->bcn_gpu_inflight += total;
-      simple_mtx_unlock(&device->bcn_gpu_mutex);
-
-      struct wrapper_buffer *srcb = wrapper_bcn_make_buffer(device, src_size,
-         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-      struct wrapper_buffer *dstb = wrapper_bcn_make_buffer(device, dst_size,
-         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-      if (!srcb || !dstb) {
-         wrapper_bcn_free_buffer(device, srcb);
-         wrapper_bcn_free_buffer(device, dstb);
-         simple_mtx_lock(&device->bcn_gpu_mutex);
-         device->bcn_gpu_inflight -= total;
-         simple_mtx_unlock(&device->bcn_gpu_mutex);
-         return false;
-      }
-      srcb->bcn_inflight = src_size;
-      dstb->bcn_inflight = dst_size;
-
-      VkDescriptorPoolSize psz = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 };
-      VkDescriptorPoolCreateInfo dpci = {
-         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-         .maxSets = 1, .poolSizeCount = 1, .pPoolSizes = &psz,
-      };
-      VkDescriptorPool pool;
-      VkDescriptorSet set;
-      VkDescriptorSetAllocateInfo dsai = {
-         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-         .descriptorSetCount = 1, .pSetLayouts = &device->bcn_set_layout,
-      };
-      if (device->dispatch_table.CreateDescriptorPool(device->dispatch_handle,
-            &dpci, NULL, &pool) != VK_SUCCESS) {
-         wrapper_bcn_free_buffer(device, srcb);
-         wrapper_bcn_free_buffer(device, dstb);
-         simple_mtx_lock(&device->bcn_gpu_mutex);
-         device->bcn_gpu_inflight -= total;
-         simple_mtx_unlock(&device->bcn_gpu_mutex);
-         return false;
-      }
-      dsai.descriptorPool = pool;
-      if (device->dispatch_table.AllocateDescriptorSets(device->dispatch_handle,
-            &dsai, &set) != VK_SUCCESS) {
-         device->dispatch_table.DestroyDescriptorPool(device->dispatch_handle, pool, NULL);
-         wrapper_bcn_free_buffer(device, srcb);
-         wrapper_bcn_free_buffer(device, dstb);
-         simple_mtx_lock(&device->bcn_gpu_mutex);
-         device->bcn_gpu_inflight -= total;
-         simple_mtx_unlock(&device->bcn_gpu_mutex);
-         return false;
-      }
-      VkDescriptorBufferInfo bi0 = { srcb->dispatch_handle, 0, src_size };
-      VkDescriptorBufferInfo bi1 = { dstb->dispatch_handle, 0, dst_size };
-      VkWriteDescriptorSet writes[2] = {
-         { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set,
-           .dstBinding = 0, .descriptorCount = 1,
-           .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi0 },
-         { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set,
-           .dstBinding = 1, .descriptorCount = 1,
-           .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi1 },
-      };
-      device->dispatch_table.UpdateDescriptorSets(device->dispatch_handle, 2, writes, 0, NULL);
-
-      VkBufferCopy bcopy = { .srcOffset = offset, .dstOffset = 0, .size = src_size };
-      device->dispatch_table.CmdCopyBuffer(wcb->dispatch_handle,
-         wb->dispatch_handle, srcb->dispatch_handle, 1, &bcopy);
-
-      VkMemoryBarrier mb1 = {
-         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-         .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-         .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-      };
-      device->dispatch_table.CmdPipelineBarrier(wcb->dispatch_handle,
-         VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-         0, 1, &mb1, 0, NULL, 0, NULL);
-
-      device->dispatch_table.CmdBindPipeline(wcb->dispatch_handle,
-         VK_PIPELINE_BIND_POINT_COMPUTE, device->bcn_pipeline);
-      device->dispatch_table.CmdBindDescriptorSets(wcb->dispatch_handle,
-         VK_PIPELINE_BIND_POINT_COMPUTE, device->bcn_pipe_layout, 0, 1, &set, 0, NULL);
-      struct wrapper_bcn_pc pc = {
-         .block_x = block_x, .block_x_src = block_x_src, .block_y = block_y,
-         .src_word_off = 0, .format = fmt_id, .has_alpha = has_alpha,
-         .astc8 = astc8, .bc_bx = bc_bx, .bc_by = bc_by,
-      };
-      device->dispatch_table.CmdPushConstants(wcb->dispatch_handle,
-         device->bcn_pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-      device->dispatch_table.CmdDispatch(wcb->dispatch_handle,
-         (block_x + 7) / 8, (block_y + 7) / 8, 1);
-
-      VkMemoryBarrier mb2 = {
-         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-         .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-         .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-      };
-      device->dispatch_table.CmdPipelineBarrier(wcb->dispatch_handle,
-         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-         0, 1, &mb2, 0, NULL, 0, NULL);
-
-      region.bufferOffset = 0;
-      region.bufferRowLength = 0;
-      region.bufferImageHeight = 0;
-      device->dispatch_table.CmdCopyBufferToImage(wcb->dispatch_handle,
-         dstb->dispatch_handle, dstImage, dstLayout, 1, &region);
-
-      srcb->wcb = wcb;
-      dstb->wcb = wcb;
-      dstb->desc_pool = pool;
-      list_addtail(&srcb->link, &wcb->bcn_transients);
-      list_addtail(&dstb->link, &wcb->bcn_transients);
-   }
-   return true;
-}
-
 /* Dropped (capped) mips skip the transcode but still leave their .src. */
 static void
 wrapper_bcn_note_dropped(struct wrapper_device *device, struct wrapper_buffer *wb,
@@ -4646,95 +4318,20 @@ wrapper_bcn_cpu_copy_regions(struct wrapper_command_buffer *wcb,
    simple_mtx_unlock(&device->resource_mutex);
 }
 
-/* GPU path, per region: a cache entry (server or earlier CPU encode) is staged
- * like a CPU upload and the transcode is skipped; a miss leaves its .src and
- * goes to the GPU, then to the CPU if the GPU cannot take it. */
-static void
-wrapper_bcn_gpu_copy_regions(struct wrapper_command_buffer *wcb,
-                             struct wrapper_device *device,
-                             struct wrapper_buffer *wb, VkImage dstImage,
-                             VkImageLayout dstLayout, VkFormat format, int fmt_id,
-                             uint32_t regionCount, const VkBufferImageCopy *pRegions)
-{
-   bool *miss = calloc(regionCount, sizeof(bool));
-   if (!miss)
-      return;
-
-   if (bcn_cache_enabled()) {
-      simple_mtx_lock(&device->resource_mutex);
-      bool was_mapped = wb->is_mapped;
-      if (!was_mapped &&
-          device->dispatch_table.MapMemory(device->dispatch_handle, wb->memory,
-             wb->offset, wb->size, 0, &wb->mapped_address) != VK_SUCCESS) {
-         simple_mtx_unlock(&device->resource_mutex);
-         for (uint32_t i = 0; i < regionCount; i++)
-            miss[i] = true;
-      } else {
-         wb->is_mapped = 1;
-         for (uint32_t i = 0; i < regionCount; i++) {
-            const VkBufferImageCopy *r = &pRegions[i];
-            int w = r->imageExtent.width;
-            size_t size = 0;
-            void *entry = bcn_cache_gpu_lookup(wb->mapped_address, w,
-               r->imageExtent.height, r->bufferRowLength ? (int)r->bufferRowLength : w,
-               format, (int)r->bufferOffset, &size);
-            struct wrapper_buffer *staging_wb =
-               entry ? wrapper_bcn_staging_create(device, size) : NULL;
-            if (staging_wb) {
-               memcpy(staging_wb->mapped_address, entry, size);
-               wrapper_bcn_staging_submit(wcb, device, staging_wb, dstImage,
-                                          dstLayout, *r);
-            } else {
-               miss[i] = true;
-            }
-            free(entry);
-         }
-         if (!was_mapped) {
-            device->dispatch_table.UnmapMemory(device->dispatch_handle, wb->memory);
-            wb->is_mapped = 0;
-         }
-         simple_mtx_unlock(&device->resource_mutex);
-      }
-   } else {
-      for (uint32_t i = 0; i < regionCount; i++)
-         miss[i] = true;
-   }
-
-   for (uint32_t i = 0; i < regionCount; i++) {
-      if (!miss[i] ||
-          wrapper_bcn_gpu_copy(wcb, device, wb, dstImage, dstLayout, format,
-                               fmt_id, 1, &pRegions[i]))
-         continue;
-      wrapper_bcn_cpu_copy_regions(wcb, device, wb, dstImage, dstLayout, format,
-                                   1, &pRegions[i]);
-   }
-   free(miss);
-}
-
 static void
 wrapper_bcn_do_copy_regions(struct wrapper_command_buffer *wcb,
                     struct wrapper_device *device,
                     struct wrapper_buffer *wb,
-                    VkImage dstImage,
+                    struct wrapper_image *wi,
                     VkImageLayout dstLayout,
-                    VkFormat format,
                     uint32_t regionCount,
                     const VkBufferImageCopy *pRegions)
 {
-   int fmt_id = wrapper_bcn_gpu_format_id(format);
-   if (fmt_id >= 0 && wrapper_bcn_gpu_ready(device)) {
-      for (uint32_t i = 0; i < regionCount; i++) {
-         if (wrapper_bcn_region_slices(&pRegions[i]) == 1)
-            wrapper_bcn_gpu_copy_regions(wcb, device, wb, dstImage, dstLayout,
-                                         format, fmt_id, 1, &pRegions[i]);
-         else
-            wrapper_bcn_cpu_copy_regions(wcb, device, wb, dstImage, dstLayout,
-                                         format, 1, &pRegions[i]);
-      }
-      return;
-   }
-   wrapper_bcn_cpu_copy_regions(wcb, device, wb, dstImage, dstLayout, format,
-                                regionCount, pRegions);
+   uint32_t done = wrapper_bcn_gpu_path() ?
+      wrapper_bcn_gpu_upload(wcb, wi, wb->dispatch_handle, dstLayout, regionCount, pRegions) : 0;
+   if (done < regionCount)
+      wrapper_bcn_cpu_copy_regions(wcb, device, wb, wi->dispatch_handle, dstLayout,
+                                   wi->info.format, regionCount - done, pRegions + done);
 }
 
 /* Capped images: dropped mips leave only their .src, the rest move down,
@@ -4743,15 +4340,15 @@ static void
 wrapper_bcn_do_copy(struct wrapper_command_buffer *wcb,
                     struct wrapper_device *device,
                     struct wrapper_buffer *wb,
-                    VkImage dstImage,
+                    struct wrapper_image *wi,
                     VkImageLayout dstLayout,
-                    VkFormat format,
-                    uint32_t mip_drop,
                     uint32_t regionCount,
                     const VkBufferImageCopy *pRegions)
 {
+   uint32_t mip_drop = wi->mip_drop;
+   VkFormat format = wi->info.format;
    if (!mip_drop) {
-      wrapper_bcn_do_copy_regions(wcb, device, wb, dstImage, dstLayout, format,
+      wrapper_bcn_do_copy_regions(wcb, device, wb, wi, dstLayout,
          regionCount, pRegions);
       return;
    }
@@ -4763,7 +4360,7 @@ wrapper_bcn_do_copy(struct wrapper_command_buffer *wcb,
       uint32_t kept = bcn_cap_copy_regions(mip_drop, pRegions + i, chunk, capped);
       dropped |= kept != chunk;
       if (kept)
-         wrapper_bcn_do_copy_regions(wcb, device, wb, dstImage, dstLayout, format,
+         wrapper_bcn_cpu_copy_regions(wcb, device, wb, wi->dispatch_handle, dstLayout, format,
             kept, capped);
    }
    if (dropped)
@@ -4844,8 +4441,7 @@ wrapper_CmdCopyBufferToImage(VkCommandBuffer commandBuffer,
       return;
    }
 
-   wrapper_bcn_do_copy(wcb, device, wb, dstImage, dstLayout, format,
-      wi->mip_drop, regionCount, pRegions);
+   wrapper_bcn_do_copy(wcb, device, wb, wi, dstLayout, regionCount, pRegions);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -4882,8 +4478,8 @@ wrapper_CmdCopyBufferToImage2(VkCommandBuffer commandBuffer,
       };
    }
 
-   wrapper_bcn_do_copy(wcb, device, wb, pInfo->dstImage, pInfo->dstImageLayout,
-      format, wi->mip_drop, pInfo->regionCount, regions);
+   wrapper_bcn_do_copy(wcb, device, wb, wi, pInfo->dstImageLayout,
+      pInfo->regionCount, regions);
 }
 
 VKAPI_ATTR void VKAPI_CALL 
