@@ -46,6 +46,7 @@ struct wrapper_physical_device {
    VkPhysicalDeviceProperties2 properties2;
    VkPhysicalDeviceDriverProperties driver_properties;
    VkPhysicalDeviceMemoryProperties memory_properties;
+   uint32_t coherent_memory_type[VK_MAX_MEMORY_TYPES];
    struct wsi_device wsi_device;
    struct wrapper_instance *instance;
    struct vk_features base_supported_features;

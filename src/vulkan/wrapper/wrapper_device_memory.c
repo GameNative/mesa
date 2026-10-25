@@ -515,6 +515,15 @@ wrapper_AllocateMemory(VkDevice _device,
    VK_FROM_HANDLE(wrapper_device, device, _device);
    struct wrapper_device_memory *mem;
    VkResult result;
+   VkMemoryAllocateInfo coherent_allocate_info;
+
+   if (device->physical->coherent_memory_type[pAllocateInfo->memoryTypeIndex] !=
+       pAllocateInfo->memoryTypeIndex) {
+      coherent_allocate_info = *pAllocateInfo;
+      coherent_allocate_info.memoryTypeIndex =
+         device->physical->coherent_memory_type[pAllocateInfo->memoryTypeIndex];
+      pAllocateInfo = &coherent_allocate_info;
+   }
 
    VkMemoryPropertyFlags property_flags =
       device->physical->memory_properties.memoryTypes[

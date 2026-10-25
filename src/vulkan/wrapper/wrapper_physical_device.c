@@ -142,6 +142,41 @@ wrapper_wsi_proc_addr(VkPhysicalDevice physicalDevice, const char *pName)
    return vk_instance_get_proc_addr_unchecked(pdevice->instance, pName);
 }
 
+static void
+wrapper_setup_coherent_memory_types(struct wrapper_physical_device *pdevice)
+{
+   const VkPhysicalDeviceMemoryProperties *props = &pdevice->memory_properties;
+   const char *engine = pdevice->instance->vk.app_info.engine_name;
+   const VkMemoryPropertyFlags host =
+      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+   bool remap = engine && strstr(engine, "vkd3d") &&
+      pdevice->instance->vk.app_info.engine_version < VK_MAKE_VERSION(3, 0, 0);
+
+   for (uint32_t i = 0; i < VK_MAX_MEMORY_TYPES; i++)
+      pdevice->coherent_memory_type[i] = i;
+
+   if (!remap)
+      return;
+
+   for (uint32_t i = 0; i < props->memoryTypeCount; i++) {
+      VkMemoryPropertyFlags flags = props->memoryTypes[i].propertyFlags;
+      if ((flags & host) != VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
+         continue;
+      for (uint32_t j = 0; j < props->memoryTypeCount; j++) {
+         VkMemoryPropertyFlags other = props->memoryTypes[j].propertyFlags;
+         if (props->memoryTypes[j].heapIndex == props->memoryTypes[i].heapIndex &&
+             (other & host) == host &&
+             (other & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) ==
+                (flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
+             !(other & VK_MEMORY_PROPERTY_PROTECTED_BIT)) {
+            WRAPPER_LOG(info, "Backing non-coherent memory type %u with coherent type %u", i, j);
+            pdevice->coherent_memory_type[i] = j;
+            break;
+         }
+      }
+   }
+}
+
 VkResult enumerate_physical_device(struct vk_instance *_instance)
 {
    struct wrapper_instance *instance = (struct wrapper_instance *)_instance;
@@ -297,6 +332,7 @@ VkResult enumerate_physical_device(struct vk_instance *_instance)
          
       pdevice->dispatch_table.GetPhysicalDeviceMemoryProperties(
          pdevice->dispatch_handle, &pdevice->memory_properties);
+      wrapper_setup_coherent_memory_types(pdevice);
 
      WRAPPER_LOG(info, "GPU Name: %s", pdevice->properties2.properties.deviceName);
      WRAPPER_LOG(info, "Driver Version: %s", get_driver_version(pdevice->properties2.properties.driverVersion));
@@ -1081,6 +1117,16 @@ wrapper_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice,
    }
 }
 
+static void
+wrapper_report_coherent_memory_types(struct wrapper_physical_device *pdevice,
+                                     VkPhysicalDeviceMemoryProperties *props)
+{
+   for (uint32_t i = 0; i < props->memoryTypeCount; i++) {
+      if (pdevice->coherent_memory_type[i] != i)
+         props->memoryTypes[i].propertyFlags |= VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+   }
+}
+
 VKAPI_ATTR void VKAPI_CALL
 wrapper_GetPhysicalDeviceMemoryProperties(VkPhysicalDevice physicalDevice,
 										  VkPhysicalDeviceMemoryProperties *pMemoryProperties)
@@ -1097,6 +1143,8 @@ wrapper_GetPhysicalDeviceMemoryProperties(VkPhysicalDevice physicalDevice,
 
    if (wrapper_vmem_max_size > 0)
       pMemoryProperties->memoryHeaps[0].size = (VkDeviceSize)wrapper_vmem_max_size * 1048576;   
+
+   wrapper_report_coherent_memory_types(pdevice, pMemoryProperties);
 }
 
 VKAPI_ATTR void VKAPI_CALL                                                                                      
@@ -1115,4 +1163,6 @@ wrapper_GetPhysicalDeviceMemoryProperties2(VkPhysicalDevice physicalDevice,
 
    if (wrapper_vmem_max_size > 0)
       pMemoryProperties->memoryProperties.memoryHeaps[0].size = (VkDeviceSize)wrapper_vmem_max_size * 1048576;
+
+   wrapper_report_coherent_memory_types(pdevice, &pMemoryProperties->memoryProperties);
 }
