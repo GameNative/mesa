@@ -17,9 +17,9 @@
 #include "bcdec.h"
 #include "wrapper_astc.h"
 
-/* Transcode BCn to ASTC 4x4 (Mali-native, stays compressed) instead of
- * decoding to RGBA8 (4-8x larger). Default on; WRAPPER_BCN_ASTC=0 falls back
- * to the RGBA decode path. */
+/* WRAPPER_BCN_ASTC: 0 decodes every format (RGBA8/R8/RG8/RGBA16F), 1 (default)
+ * transcodes to ASTC the formats bcn_astc_default() allows, 2 transcodes every
+ * format to ASTC. */
 static int
 astc_enabled(void)
 {
@@ -638,6 +638,21 @@ get_decode_format_for_bcn(VkFormat bcn_format)
    }
 }
 
+/* Whether a format goes to ASTC without a policy entry naming it. ASTC is
+ * lossy, so by default only formats it reproduces closely enough take it:
+ * opaque BC1 at 4x4. BC1 with punch-through alpha, BC2, BC3, BC5 and BC7 hold
+ * blocks ASTC 4x4 cannot represent within the quality bar and are decoded
+ * exactly unless the policy asks for ASTC; WRAPPER_BCN_ASTC=2 sends every
+ * format to ASTC as before. */
+static int
+bcn_astc_default(VkFormat format, int idx)
+{
+   if (bcn_policy_block(idx) || astc_enabled() == 2)
+      return 1;
+   return (format == VK_FORMAT_BC1_RGB_UNORM_BLOCK ||
+           format == VK_FORMAT_BC1_RGB_SRGB_BLOCK) && bcn_astc_edge(idx) == 4;
+}
+
 /* Storage (image) format. For BC1/2/3/5/7 this is ASTC (kept compressed);
  * BC4 stays R8 (as small as ASTC 4x4 and exact) unless the policy asks for
  * bc4=4x4, and the SNORM BC4/5 variants and BC6H stay uncompressed. */
@@ -675,7 +690,7 @@ get_format_for_bcn(VkFormat bcn_format)
       default:
          break;
       }
-      if (idx >= 0) {
+      if (idx >= 0 && bcn_astc_default(bcn_format, idx)) {
          int srgb = get_decode_format_for_bcn(bcn_format) == VK_FORMAT_R8G8B8A8_SRGB;
          int b = bcn_astc_edge(idx);
          if (b == 6)

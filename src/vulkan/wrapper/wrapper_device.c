@@ -4442,24 +4442,19 @@ struct wrapper_bcn_pc {
    uint32_t astc8, bc_bx, bc_by;
 };
 
-/* Shader format id for a BC format, or -1 if the GPU shader can't decode it
- * (those fall back to the CPU path). The shader now produces ASTC 4x4 OR 8x8
- * (selected per-dispatch via the astc8 push constant), so both are on the GPU. */
+/* Shader format id for a BC format, or -1 for the CPU path. The shader encodes
+ * BC7 to ASTC 4x4 or 8x8 when the policy stores BC7 as ASTC. BC1 stays on the
+ * CPU, whose encoder maps BC1's palette onto ASTC weights directly; the
+ * shader's single-line encoder is visibly lossier on it. */
 static int
 wrapper_bcn_gpu_format_id(VkFormat format)
 {
    switch (format) {
-   case VK_FORMAT_BC1_RGB_UNORM_BLOCK:
-   case VK_FORMAT_BC1_RGB_SRGB_BLOCK:
-      if (is_astc_6x6(get_format_for_bcn(format)))
-         return -1; /* BC1 as ASTC 6x6: CPU only */
-      return 0; /* BC1: opaque, single-plane RGB */
-   case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
-   case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
-      return -1; /* The GPU BC1 path drops alpha; use the CPU RGBA encoder. */
    case VK_FORMAT_BC7_UNORM_BLOCK:
-   case VK_FORMAT_BC7_SRGB_BLOCK:
-      return 1; /* BC7: alpha, dual-plane */
+   case VK_FORMAT_BC7_SRGB_BLOCK: {
+      VkFormat img = get_format_for_bcn(format);
+      return is_astc_4x4(img) || is_astc_8x8(img) ? 1 : -1;
+   }
    default:
       return -1;
    }
