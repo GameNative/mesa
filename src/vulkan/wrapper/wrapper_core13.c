@@ -215,6 +215,43 @@ wrapper_core13_init_physical_device(struct wrapper_physical_device *pdevice)
 #undef QUERY_IF
 
 static void
+wrapper_fill_one(struct vk_physical_device *source, VkBaseOutStructure *s)
+{
+   VkPhysicalDeviceProperties2 scratch = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+      .pNext = s,
+   };
+   void *next = s->pNext;
+   s->pNext = NULL;
+   vk_common_GetPhysicalDeviceProperties2(vk_physical_device_to_handle(source), &scratch);
+   s->pNext = next;
+}
+
+void
+wrapper_core13_fill_properties(struct wrapper_physical_device *pdevice,
+                               VkPhysicalDeviceProperties2 *props)
+{
+   uint32_t base = pdevice->properties2.properties.apiVersion;
+   vk_foreach_struct(s, props->pNext) {
+      switch (s->sType) {
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES:
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES:
+         if (base < VK_API_VERSION_1_2)
+            wrapper_fill_one(&pdevice->vk, s);
+         break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES:
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_PROPERTIES:
+         if (!pdevice->base_supported_extensions.KHR_maintenance4 ||
+             s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES)
+            wrapper_fill_one(&pdevice->vk, s);
+         break;
+      default:
+         break;
+      }
+   }
+}
+
+static void
 wrapper_add_extension(const char **exts, uint32_t *count, const char *name)
 {
    for (uint32_t i = 0; i < *count; i++)

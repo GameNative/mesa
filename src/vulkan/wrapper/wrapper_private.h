@@ -328,6 +328,8 @@ void wrapper_diag_append(const char *fmt, ...);
 bool wrapper_core13_wanted(const struct wrapper_physical_device *pdevice,
                            const char *engine_name);
 void wrapper_core13_init_physical_device(struct wrapper_physical_device *pdevice);
+void wrapper_core13_fill_properties(struct wrapper_physical_device *pdevice,
+                                    VkPhysicalDeviceProperties2 *props);
 void *wrapper_core13_lower_device_create(struct wrapper_device *device,
                                          VkDeviceCreateInfo *info,
                                          const char **exts, uint32_t *ext_count);

@@ -725,6 +725,9 @@ wrapper_GetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice,
        pProperties->properties.limits.maxPushConstantsSize < 256)
       pProperties->properties.limits.maxPushConstantsSize = 256;
 
+   if (pdevice->emulate_vulkan13)
+      wrapper_core13_fill_properties(pdevice, pProperties);
+
    vk_foreach_struct(prop, pProperties->pNext) {
       switch (prop->sType) {
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_PROPERTIES_EXT:
