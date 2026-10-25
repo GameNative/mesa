@@ -601,7 +601,10 @@ wrapper_GetPhysicalDeviceFeatures2(VkPhysicalDevice physicalDevice,
             VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT *vad =
                (VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT *)s;
             vad->vertexAttributeInstanceRateDivisor = VK_TRUE;
-            vad->vertexAttributeInstanceRateZeroDivisor = VK_TRUE;
+            vad->vertexAttributeInstanceRateZeroDivisor =
+               pdevice->base_supported_features.vertexAttributeInstanceRateZeroDivisor ||
+               (!pdevice->base_supported_extensions.EXT_vertex_attribute_divisor &&
+                !pdevice->base_supported_extensions.KHR_vertex_attribute_divisor);
          }
       }
    }
