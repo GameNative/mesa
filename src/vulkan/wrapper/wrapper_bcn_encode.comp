@@ -5,8 +5,10 @@
  * BCn encode, one invocation per 4x4 block, for reading back an emulated BC
  * image: texels in (RGBA8 or RGBA8_SNORM, 4 bytes, or RGBA16F, 8 bytes, rows
  * of src_row_pitch bytes, edge texels replicated past width/height), BC
- * blocks out. BC1-BC5 fit a line through the block, BC6H uses mode 11 and
- * BC7 mode 6; endpoints are refined once by least squares.
+ * blocks out. BC1-BC5 fit a line through the block, BC6H uses mode 11; BC7
+ * tries mode 6, modes 1 and 3 on the two partitions that fit the block best
+ * when it is opaque, and mode 5 when it is not, and keeps the smallest
+ * error. Endpoints are refined once by least squares.
  *
  * format: 0 BC1, 1 BC1 without alpha, 2 BC2, 3 BC3, 4 BC4, 5 BC4 SNORM,
  *         6 BC5, 7 BC5 SNORM, 8 BC6H UF16, 9 BC6H SF16, 10 BC7
@@ -30,7 +32,46 @@ layout(push_constant) uniform PC {
    uint height;
 } pc;
 
+const int w2[4] = int[](0, 21, 43, 64);
+const int w3[8] = int[](0, 9, 18, 27, 37, 46, 55, 64);
 const int w4[16] = int[](0, 4, 9, 13, 17, 21, 26, 30, 34, 38, 43, 47, 51, 55, 60, 64);
+const uint bc7_part[128] = uint[](
+   0x50505050u, 0x40404040u, 0x54545454u, 0x54505040u, 0x50404000u, 0x55545450u, 0x55545040u, 0x54504000u,
+   0x50400000u, 0x55555450u, 0x55544000u, 0x54400000u, 0x55555440u, 0x55550000u, 0x55555500u, 0x55000000u,
+   0x55150100u, 0x00004054u, 0x15010000u, 0x00405054u, 0x00004050u, 0x15050100u, 0x05010000u, 0x40505054u,
+   0x00404050u, 0x05010100u, 0x14141414u, 0x05141450u, 0x01155440u, 0x00555500u, 0x15014054u, 0x05414150u,
+   0x44444444u, 0x55005500u, 0x11441144u, 0x05055050u, 0x05500550u, 0x11114444u, 0x41144114u, 0x44111144u,
+   0x15055054u, 0x01055040u, 0x05041050u, 0x05455150u, 0x14414114u, 0x50050550u, 0x41411414u, 0x00141400u,
+   0x00041504u, 0x00105410u, 0x10541000u, 0x04150400u, 0x50410514u, 0x41051450u, 0x05415014u, 0x14054150u,
+   0x41050514u, 0x41505014u, 0x40011554u, 0x54150140u, 0x50505500u, 0x00555050u, 0x15151010u, 0x54540404u,
+   0xaa685050u, 0x6a5a5040u, 0x5a5a4200u, 0x5450a0a8u, 0xa5a50000u, 0xa0a05050u, 0x5555a0a0u, 0x5a5a5050u,
+   0xaa550000u, 0xaa555500u, 0xaaaa5500u, 0x90909090u, 0x94949494u, 0xa4a4a4a4u, 0xa9a59450u, 0x2a0a4250u,
+   0xa5945040u, 0x0a425054u, 0xa5a5a500u, 0x55a0a0a0u, 0xa8a85454u, 0x6a6a4040u, 0xa4a45000u, 0x1a1a0500u,
+   0x0050a4a4u, 0xaaa59090u, 0x14696914u, 0x69691400u, 0xa08585a0u, 0xaa821414u, 0x50a4a450u, 0x6a5a0200u,
+   0xa9a58000u, 0x5090a0a8u, 0xa8a09050u, 0x24242424u, 0x00aa5500u, 0x24924924u, 0x24499224u, 0x50a50a50u,
+   0x500aa550u, 0xaaaa4444u, 0x66660000u, 0xa5a0a5a0u, 0x50a050a0u, 0x69286928u, 0x44aaaa44u, 0x66666600u,
+   0xaa444444u, 0x54a854a8u, 0x95809580u, 0x96969600u, 0xa85454a8u, 0x80959580u, 0xaa141414u, 0x96960000u,
+   0xaaaa1414u, 0xa05050a0u, 0xa0a5a5a0u, 0x96000000u, 0x40804080u, 0xa9a8a9a8u, 0xaaaaaa44u, 0x2a4a5254u
+);
+const uint bc7_fix[128] = uint[](
+   0x8001u, 0x8001u, 0x8001u, 0x8001u, 0x8001u, 0x8001u, 0x8001u, 0x8001u,
+   0x8001u, 0x8001u, 0x8001u, 0x8001u, 0x8001u, 0x8001u, 0x8001u, 0x8001u,
+   0x8001u, 0x0005u, 0x0101u, 0x0005u, 0x0005u, 0x0101u, 0x0101u, 0x8001u,
+   0x0005u, 0x0101u, 0x0005u, 0x0005u, 0x0101u, 0x0101u, 0x0005u, 0x0005u,
+   0x8001u, 0x8001u, 0x0041u, 0x0101u, 0x0005u, 0x0101u, 0x8001u, 0x8001u,
+   0x0005u, 0x0101u, 0x0005u, 0x0005u, 0x0005u, 0x8001u, 0x8001u, 0x0041u,
+   0x0041u, 0x0005u, 0x0041u, 0x0101u, 0x8001u, 0x8001u, 0x0005u, 0x0005u,
+   0x8001u, 0x8001u, 0x8001u, 0x8001u, 0x8001u, 0x0005u, 0x0005u, 0x8001u,
+   0x8009u, 0x0109u, 0x8101u, 0x8009u, 0x8101u, 0x8009u, 0x8009u, 0x8101u,
+   0x8101u, 0x8101u, 0x8041u, 0x8041u, 0x8041u, 0x8021u, 0x8009u, 0x0109u,
+   0x8009u, 0x0109u, 0x8101u, 0x8009u, 0x8009u, 0x0109u, 0x8041u, 0x0501u,
+   0x0029u, 0x8101u, 0x0141u, 0x0441u, 0x8101u, 0x8021u, 0x8401u, 0x8101u,
+   0x8101u, 0x8009u, 0x8009u, 0x0421u, 0x0441u, 0x0501u, 0x0301u, 0x8401u,
+   0x8041u, 0x8009u, 0x8101u, 0x8021u, 0x8009u, 0x8041u, 0x8041u, 0x8101u,
+   0x8009u, 0x8009u, 0x8021u, 0x8021u, 0x8021u, 0x8101u, 0x8021u, 0x8401u,
+   0x8021u, 0x8401u, 0x8101u, 0xa001u, 0x8009u, 0x9001u, 0x8009u, 0x0109u
+);
+
 
 vec4 px[16];
 uint raw_lo[16];
@@ -309,7 +350,374 @@ uvec2 encode_channel(int v[16], bool sgn)
    return uvec2(e | idx_lo, idx_hi);
 }
 
-/* ---- BC7 mode 6 ---- */
+/* ---- BC7 ---- */
+
+float bc7_err;
+
+int expand_bits(int v, int bits)
+{
+   v <<= (8 - bits);
+   return (v | (v >> bits)) & 255;
+}
+
+/* the stored value (bits, plus a p-bit when hasp) whose expansion is
+ * nearest to x; returns the expansion */
+int qbest(float x, int bits, int p, bool hasp, out int q)
+{
+   int tb = hasp ? bits + 1 : bits;
+   float t = x / 255.0 * float((1 << tb) - 1);
+   int base = hasp ? int(floor((t - float(p)) * 0.5)) : int(floor(t));
+   float be = 1e30;
+   int bv = 0;
+   q = 0;
+   for (int k = 0; k < 2; k++) {
+      int c = clamp(base + k, 0, (1 << bits) - 1);
+      int v = expand_bits(hasp ? ((c << 1) | p) : c, tb);
+      float e = abs(float(v) - x);
+      if (e < be) {
+         be = e;
+         q = c;
+         bv = v;
+      }
+   }
+   return bv;
+}
+
+int bc7_w(uint ib, uint k)
+{
+   return ib == 2u ? w2[k] : ib == 3u ? w3[k] : w4[k];
+}
+
+/* how far the selected texels are from their principal axis (RGB) */
+float line_residual(uint sel)
+{
+   vec4 chm = vec4(1.0, 1.0, 1.0, 0.0);
+   vec4 mean = vec4(0.0);
+   float n = 0.0;
+   for (uint i = 0u; i < 16u; i++)
+      if (((sel >> i) & 1u) != 0u) {
+         mean += px[i] * chm;
+         n += 1.0;
+      }
+   if (n < 2.0)
+      return 0.0;
+   mean /= n;
+   vec4 a = axis_of(mean, sel, chm);
+   float l = dot(a, a);
+   float r = 0.0;
+   for (uint i = 0u; i < 16u; i++)
+      if (((sel >> i) & 1u) != 0u) {
+         vec4 d = px[i] * chm - mean;
+         float t = l > 0.0 ? dot(d, a) : 0.0;
+         r += dot(d, d) - (l > 0.0 ? t * t / l : 0.0);
+      }
+   return r;
+}
+
+uint subset_mask(uint part, uint s)
+{
+   uint m = 0u;
+   for (uint i = 0u; i < 16u; i++)
+      if (((bc7_part[part] >> (2u * i)) & 3u) == s)
+         m |= 1u << i;
+   return m;
+}
+
+/* modes 1 and 3: two subsets, RGB, alpha 255 */
+int tq[2][2][3];
+int tp[2][2];
+uint tidx[16];
+
+float encode_two(uint mode, uint part)
+{
+   uint ib = mode == 1u ? 3u : 2u;
+   int bits = mode == 1u ? 6 : 7;
+   vec4 chm = vec4(1.0, 1.0, 1.0, 0.0);
+   float total = 0.0;
+   for (uint s = 0u; s < 2u; s++) {
+      uint sel = subset_mask(part, s);
+      vec4 e0, e1;
+      fit_line(sel, chm, e0, e1);
+      float best = 1e30;
+      for (int pass = 0; pass < 2; pass++) {
+         float bq = 1e30;
+         int q0[3], q1[3], pa = 0, pb = 0;
+         ivec3 u0 = ivec3(0), u1 = ivec3(0);
+         for (int a = 0; a < 2; a++)
+            for (int b = 0; b < 2; b++) {
+               if (mode == 1u && a != b)
+                  continue;
+               int t0[3], t1[3];
+               ivec3 v0, v1;
+               float eq = 0.0;
+               for (int c = 0; c < 3; c++) {
+                  v0[c] = qbest(e0[c], bits, a, true, t0[c]);
+                  v1[c] = qbest(e1[c], bits, b, true, t1[c]);
+                  eq += (float(v0[c]) - e0[c]) * (float(v0[c]) - e0[c]) +
+                        (float(v1[c]) - e1[c]) * (float(v1[c]) - e1[c]);
+               }
+               if (eq < bq) {
+                  bq = eq;
+                  q0 = t0;
+                  q1 = t1;
+                  pa = a;
+                  pb = b;
+                  u0 = v0;
+                  u1 = v1;
+               }
+            }
+         float err = 0.0;
+         float wt[16];
+         uint idx[16];
+         for (uint i = 0u; i < 16u; i++) {
+            wt[i] = 0.0;
+            idx[i] = 0u;
+            if (((sel >> i) & 1u) == 0u)
+               continue;
+            float be = 1e30;
+            uint bk = 0u;
+            for (uint k = 0u; k < (1u << ib); k++) {
+               int w = bc7_w(ib, k);
+               vec3 pal = vec3((u0 * (64 - w) + u1 * w + 32) >> 6);
+               vec3 d = pal - px[i].rgb;
+               float e = dot(d, d);
+               if (e < be) {
+                  be = e;
+                  bk = k;
+               }
+            }
+            idx[i] = bk;
+            wt[i] = float(bc7_w(ib, bk)) / 64.0;
+            err += be + (255.0 - px[i].a) * (255.0 - px[i].a);
+         }
+         if (err < best) {
+            best = err;
+            for (int c = 0; c < 3; c++) {
+               tq[s][0][c] = q0[c];
+               tq[s][1][c] = q1[c];
+            }
+            tp[s][0] = pa;
+            tp[s][1] = pb;
+            for (uint i = 0u; i < 16u; i++)
+               if (((sel >> i) & 1u) != 0u)
+                  tidx[i] = idx[i];
+         }
+         vec4 r0, r1;
+         if (!refit(sel, wt, chm, r0, r1))
+            break;
+         e0 = clamp(r0, 0.0, 255.0);
+         e1 = clamp(r1, 0.0, 255.0);
+      }
+      total += best;
+   }
+   return total;
+}
+
+void write_two(uint mode, uint part)
+{
+   uint ib = mode == 1u ? 3u : 2u;
+   uint bits = mode == 1u ? 6u : 7u;
+   uint anchor1 = findMSB(bc7_fix[part] & 0xfffeu);
+   for (uint s = 0u; s < 2u; s++) {
+      uint a = s == 0u ? 0u : anchor1;
+      if (tidx[a] < (1u << (ib - 1u)))
+         continue;
+      uint sel = subset_mask(part, s);
+      for (int c = 0; c < 3; c++) {
+         int t = tq[s][0][c];
+         tq[s][0][c] = tq[s][1][c];
+         tq[s][1][c] = t;
+      }
+      int t = tp[s][0];
+      tp[s][0] = tp[s][1];
+      tp[s][1] = t;
+      for (uint i = 0u; i < 16u; i++)
+         if (((sel >> i) & 1u) != 0u)
+            tidx[i] = (1u << ib) - 1u - tidx[i];
+   }
+   ob[0] = 0u; ob[1] = 0u; ob[2] = 0u; ob[3] = 0u;
+   opos = 0u;
+   wbits(1u << mode, mode + 1u);
+   wbits(part, 6u);
+   for (int c = 0; c < 3; c++)
+      for (uint s = 0u; s < 2u; s++) {
+         wbits(uint(tq[s][0][c]), bits);
+         wbits(uint(tq[s][1][c]), bits);
+      }
+   if (mode == 1u) {
+      wbits(uint(tp[0][0]), 1u);
+      wbits(uint(tp[1][0]), 1u);
+   } else {
+      for (uint s = 0u; s < 2u; s++) {
+         wbits(uint(tp[s][0]), 1u);
+         wbits(uint(tp[s][1]), 1u);
+      }
+   }
+   for (uint i = 0u; i < 16u; i++)
+      wbits(tidx[i], (i == 0u || i == anchor1) ? ib - 1u : ib);
+}
+
+/* mode 5: RGB and alpha with their own 2-bit indices */
+float encode_m5()
+{
+   vec4 chm = vec4(1.0, 1.0, 1.0, 0.0);
+   vec4 e0, e1;
+   fit_line(0xffffu, chm, e0, e1);
+   float best = 1e30;
+   int cq0[3], cq1[3];
+   uint cidx[16];
+   for (int pass = 0; pass < 2; pass++) {
+      int q0[3], q1[3];
+      ivec3 u0, u1;
+      for (int c = 0; c < 3; c++) {
+         u0[c] = qbest(e0[c], 7, 0, false, q0[c]);
+         u1[c] = qbest(e1[c], 7, 0, false, q1[c]);
+      }
+      float err = 0.0, wt[16];
+      uint idx[16];
+      for (uint i = 0u; i < 16u; i++) {
+         float be = 1e30;
+         uint bk = 0u;
+         for (uint k = 0u; k < 4u; k++) {
+            vec3 d = vec3((u0 * (64 - w2[k]) + u1 * w2[k] + 32) >> 6) - px[i].rgb;
+            float e = dot(d, d);
+            if (e < be) {
+               be = e;
+               bk = k;
+            }
+         }
+         idx[i] = bk;
+         wt[i] = float(w2[bk]) / 64.0;
+         err += be;
+      }
+      if (err < best) {
+         best = err;
+         cq0 = q0;
+         cq1 = q1;
+         cidx = idx;
+      }
+      vec4 r0, r1;
+      if (!refit(0xffffu, wt, chm, r0, r1))
+         break;
+      e0 = clamp(r0, 0.0, 255.0);
+      e1 = clamp(r1, 0.0, 255.0);
+   }
+   float lo = 255.0, hi = 0.0;
+   for (uint i = 0u; i < 16u; i++) {
+      lo = min(lo, px[i].a);
+      hi = max(hi, px[i].a);
+   }
+   float abest = 1e30;
+   int aq0 = 0, aq1 = 0;
+   uint aidx[16];
+   for (int pass = 0; pass < 2; pass++) {
+      int a0 = int(round(lo)), a1 = int(round(hi));
+      float err = 0.0, wt[16];
+      uint idx[16];
+      for (uint i = 0u; i < 16u; i++) {
+         float be = 1e30;
+         uint bk = 0u;
+         for (uint k = 0u; k < 4u; k++) {
+            float d = float((a0 * (64 - w2[k]) + a1 * w2[k] + 32) >> 6) - px[i].a;
+            if (d * d < be) {
+               be = d * d;
+               bk = k;
+            }
+         }
+         idx[i] = bk;
+         wt[i] = float(w2[bk]) / 64.0;
+         err += be;
+      }
+      if (err < abest) {
+         abest = err;
+         aq0 = a0;
+         aq1 = a1;
+         aidx = idx;
+      }
+      float aa = 0.0, ab = 0.0, bb = 0.0, ax = 0.0, bx = 0.0;
+      for (uint i = 0u; i < 16u; i++) {
+         float w = wt[i];
+         aa += (1.0 - w) * (1.0 - w);
+         ab += (1.0 - w) * w;
+         bb += w * w;
+         ax += (1.0 - w) * px[i].a;
+         bx += w * px[i].a;
+      }
+      float det = aa * bb - ab * ab;
+      if (abs(det) < 1e-6)
+         break;
+      lo = clamp((ax * bb - bx * ab) / det, 0.0, 255.0);
+      hi = clamp((bx * aa - ax * ab) / det, 0.0, 255.0);
+   }
+   if (cidx[0] >= 2u) {
+      int t[3] = cq0;
+      cq0 = cq1;
+      cq1 = t;
+      for (uint i = 0u; i < 16u; i++)
+         cidx[i] = 3u - cidx[i];
+   }
+   if (aidx[0] >= 2u) {
+      int t = aq0;
+      aq0 = aq1;
+      aq1 = t;
+      for (uint i = 0u; i < 16u; i++)
+         aidx[i] = 3u - aidx[i];
+   }
+   ob[0] = 0u; ob[1] = 0u; ob[2] = 0u; ob[3] = 0u;
+   opos = 0u;
+   wbits(32u, 6u);
+   wbits(0u, 2u);
+   for (int c = 0; c < 3; c++) {
+      wbits(uint(cq0[c]), 7u);
+      wbits(uint(cq1[c]), 7u);
+   }
+   wbits(uint(aq0), 8u);
+   wbits(uint(aq1), 8u);
+   for (uint i = 0u; i < 16u; i++)
+      wbits(cidx[i], i == 0u ? 1u : 2u);
+   for (uint i = 0u; i < 16u; i++)
+      wbits(aidx[i], i == 0u ? 1u : 2u);
+   return best + abest;
+}
+
+void encode_bc7_modes()
+{
+   uint keep[4] = ob;
+   float best = bc7_err;
+   bool opaque = true;
+   for (uint i = 0u; i < 16u; i++)
+      opaque = opaque && px[i].a == 255.0;
+   if (opaque) {
+      uint p0 = 0u, p1 = 0u;
+      float r0 = 1e30, r1 = 1e30;
+      for (uint part = 0u; part < 64u; part++) {
+         float r = line_residual(subset_mask(part, 0u)) + line_residual(subset_mask(part, 1u));
+         if (r < r0) {
+            r1 = r0; p1 = p0;
+            r0 = r; p0 = part;
+         } else if (r < r1) {
+            r1 = r; p1 = part;
+         }
+      }
+      for (uint k = 0u; k < 4u; k++) {
+         uint part = k < 2u ? p0 : p1;
+         uint mode = (k & 1u) == 0u ? 1u : 3u;
+         float e = encode_two(mode, part);
+         if (e < best) {
+            best = e;
+            write_two(mode, part);
+            keep = ob;
+         }
+      }
+   } else {
+      float e = encode_m5();
+      if (e < best) {
+         best = e;
+         keep = ob;
+      }
+   }
+   ob = keep;
+}
 
 void encode_bc7()
 {
@@ -359,6 +767,7 @@ void encode_bc7()
       }
       if (err < best_err) {
          best_err = err;
+         bc7_err = err;
          bool flip = idx[0] >= 8u;
          ob[0] = 0u; ob[1] = 0u; ob[2] = 0u; ob[3] = 0u;
          opos = 0u;
@@ -466,6 +875,7 @@ void encode_bc6h(bool sgn)
       }
       if (err < best_err) {
          best_err = err;
+         bc7_err = err;
          bool flip = idx[0] >= 8u;
          ob[0] = 0u; ob[1] = 0u; ob[2] = 0u; ob[3] = 0u;
          opos = 0u;
@@ -531,6 +941,7 @@ void main()
       encode_bc6h(f == 9u);
    } else {
       encode_bc7();
+      encode_bc7_modes();
    }
 
    OutWords d = OutWords(pc.dst);
