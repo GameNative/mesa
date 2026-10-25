@@ -1,6 +1,7 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <time.h>
 #include <string.h>
@@ -11,6 +12,7 @@
 #include "wrapper_bcn_encode_spv.h"
 #include "wrapper_astc_encode_spv.h"
 #include "wrapper_astc_hdr_encode_spv.h"
+#include "wrapper_astc_tables.h"
 #include "wrapper_log.h"
 #include "util/macros.h"
 
@@ -18,8 +20,8 @@
  * image, needs BC blocks where the image holds ASTC or decoded texels: the
  * stored texels are blitted to an RGBA image (the driver decodes ASTC) and
  * BC-encoded by a compute shader; blocks copied in are decoded by another.
- * Uploads are decoded and encoded to ASTC on the GPU whenever the shaders
- * passed the self-test; the CPU path is the fallback, or forced with
+ * Uploads are decoded and encoded to ASTC on the GPU once the shaders they
+ * need are built; the CPU path serves them until then, and when forced with
  * WRAPPER_BCN_FORCE_CPU=1. Nothing is kept beyond the
  * command buffer: the BC blocks of the original upload are not stored. */
 
@@ -47,6 +49,7 @@ struct bcn_pc {
    uint32_t flags;
    uint32_t width;
    uint32_t height;
+   uint32_t tables[2];
 };
 
 static uint32_t
@@ -225,48 +228,6 @@ bcn_transient_image(struct wrapper_command_buffer *wcb, VkFormat format, uint32_
    return b->bcn_image;
 }
 
-static VkResult
-bcn_create_pipeline_spec(struct wrapper_device *device, const uint32_t *code, size_t size,
-                         VkShaderModule *module, VkPipeline *pipeline, uint32_t edge)
-{
-   VkShaderModuleCreateInfo smci = {
-      .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-      .codeSize = size,
-      .pCode = code,
-   };
-   VkResult r = VK_SUCCESS;
-   if (!*module)
-      r = device->dispatch_table.CreateShaderModule(device->dispatch_handle, &smci, NULL,
-                                                    module);
-   if (r != VK_SUCCESS)
-      return r;
-   VkSpecializationMapEntry entry = { 0, 0, sizeof(uint32_t) };
-   VkSpecializationInfo spec = { 1, &entry, sizeof(uint32_t), &edge };
-   VkComputePipelineCreateInfo cpci = {
-      .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-      .stage = {
-         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-         .stage = VK_SHADER_STAGE_COMPUTE_BIT,
-         .module = *module,
-         .pName = "main",
-         .pSpecializationInfo = edge ? &spec : NULL,
-      },
-      .layout = device->bcn_tool_layout,
-   };
-   r = device->dispatch_table.CreateComputePipelines(device->dispatch_handle,
-      device->bcn_pipeline_cache, 1, &cpci, NULL, pipeline);
-   if (r != VK_SUCCESS)
-      *pipeline = VK_NULL_HANDLE;
-   return r;
-}
-
-static VkResult
-bcn_create_pipeline(struct wrapper_device *device, const uint32_t *code, size_t size,
-                    VkShaderModule *module, VkPipeline *pipeline)
-{
-   return bcn_create_pipeline_spec(device, code, size, module, pipeline, 0);
-}
-
 struct bcn_selftest_buf {
    VkBuffer buffer;
    VkDeviceMemory memory;
@@ -335,39 +296,339 @@ bcn_selftest_push(struct wrapper_device *device, VkCommandBuffer cb, VkPipeline 
    device->dispatch_table.CmdDispatch(cb, 1, 1, 1);
 }
 
+/* ---- shaders, built per need ----
+ *
+ * Nothing is built when the device is created. The first upload, readback or
+ * copy that needs a shader asks for it; a worker thread builds the shaders
+ * asked for, one pipeline each (the ASTC encoder per block size, the BC
+ * encoder per format class), through a VkPipelineCache kept on disk and
+ * keyed by the driver's pipeline cache UUID and the wrapper build. Uploads
+ * take the CPU path until theirs exist; readbacks and copies wait for theirs.
+ * Each new pipeline is checked on a known block inside the next vkQueueSubmit
+ * on the device's first queue family, before the application's batches; one
+ * that fails is dropped (and destroyed with the device, since a command
+ * buffer recorded before the check may use it). */
+
+#define BCN_CACHE_DIR "/data/data/app.gamenative/files/imagefs/usr/cache"
+
+static const char *const bcn_slot_names[BCN_SLOT_COUNT] = {
+   "decode", "astc4x4", "astc6x6", "astc8x8", "astc-hdr", "bc1-5-encode", "bc6h-encode",
+   "bc7-encode",
+};
+
+static VkResult
+bcn_create_pipeline_spec(struct wrapper_device *device, const uint32_t *code, size_t size,
+                         VkShaderModule *module, VkPipeline *pipeline, uint32_t spec)
+{
+   VkShaderModuleCreateInfo smci = {
+      .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+      .codeSize = size,
+      .pCode = code,
+   };
+   VkResult r = VK_SUCCESS;
+   if (!*module)
+      r = device->dispatch_table.CreateShaderModule(device->dispatch_handle, &smci, NULL,
+                                                    module);
+   if (r != VK_SUCCESS)
+      return r;
+   VkSpecializationMapEntry entry = { 0, 0, sizeof(uint32_t) };
+   VkSpecializationInfo info = { 1, &entry, sizeof(uint32_t), &spec };
+   VkComputePipelineCreateInfo cpci = {
+      .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+      .stage = {
+         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+         .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+         .module = *module,
+         .pName = "main",
+         .pSpecializationInfo = &info,
+      },
+      .layout = device->bcn_tool_layout,
+   };
+   r = device->dispatch_table.CreateComputePipelines(device->dispatch_handle,
+      device->bcn_pipeline_cache, 1, &cpci, NULL, pipeline);
+   if (r != VK_SUCCESS)
+      *pipeline = VK_NULL_HANDLE;
+   return r;
+}
+
+static VkResult
+bcn_build_slot(struct wrapper_device *device, int slot, VkPipeline *out)
+{
+   switch (slot) {
+   case BCN_SLOT_DECODE:
+      return bcn_create_pipeline_spec(device, wrapper_bcn_decode_spv,
+         sizeof(wrapper_bcn_decode_spv), &device->bcn_decode_module, out, 0);
+   case BCN_SLOT_ASTC4:
+   case BCN_SLOT_ASTC6:
+   case BCN_SLOT_ASTC8:
+      return bcn_create_pipeline_spec(device, wrapper_astc_encode_spv,
+         sizeof(wrapper_astc_encode_spv), &device->bcn_astc_module, out,
+         4 + 2 * (slot - BCN_SLOT_ASTC4));
+   case BCN_SLOT_HDR:
+      return bcn_create_pipeline_spec(device, wrapper_astc_hdr_encode_spv,
+         sizeof(wrapper_astc_hdr_encode_spv), &device->bcn_astc_hdr_module, out, 0);
+   default:
+      return bcn_create_pipeline_spec(device, wrapper_bcn_encode_spv,
+         sizeof(wrapper_bcn_encode_spv), &device->bcn_encode_module, out,
+         slot - BCN_SLOT_ENC_BC15);
+   }
+}
+
+static void
+bcn_cache_path(struct wrapper_device *device, char *path, size_t size)
+{
+   const uint8_t *u = device->physical->properties2.properties.pipelineCacheUUID;
+   char uuid[33];
+   for (int i = 0; i < 16; i++)
+      snprintf(uuid + 2 * i, 3, "%02x", u[i]);
+   snprintf(path, size, BCN_CACHE_DIR "/bcn_pipelines_%s_%08x.bin", uuid,
+            (uint32_t)(sizeof(wrapper_bcn_decode_spv) * 31u + sizeof(wrapper_bcn_encode_spv) * 7u +
+                       sizeof(wrapper_astc_encode_spv) * 3u + sizeof(wrapper_astc_hdr_encode_spv) +
+                       wrapper_bcn_encode_spv[sizeof(wrapper_bcn_encode_spv) / 8] +
+                       wrapper_astc_hdr_encode_spv[sizeof(wrapper_astc_hdr_encode_spv) / 8]));
+}
+
+static void
+bcn_cache_save(struct wrapper_device *device)
+{
+   VkDevice d = device->dispatch_handle;
+   size_t out = 0;
+   void *data;
+   if (!device->bcn_pipeline_cache ||
+       device->dispatch_table.GetPipelineCacheData(d, device->bcn_pipeline_cache, &out, NULL) !=
+          VK_SUCCESS || !out || !(data = malloc(out)))
+      return;
+   char path[256], tmp[272];
+   bcn_cache_path(device, path, sizeof(path));
+   if (device->dispatch_table.GetPipelineCacheData(d, device->bcn_pipeline_cache, &out, data) ==
+       VK_SUCCESS) {
+      mkdir(BCN_CACHE_DIR, 0755);
+      snprintf(tmp, sizeof(tmp), "%s.%d", path, (int)getpid());
+      FILE *f = fopen(tmp, "wb");
+      bool ok = f && fwrite(data, 1, out, f) == out;
+      if (f)
+         ok = !fclose(f) && ok;
+      if (!ok || rename(tmp, path))
+         remove(tmp);
+   }
+   free(data);
+}
+
+static void *
+bcn_tools_worker(void *arg)
+{
+   struct wrapper_device *device = arg;
+   pthread_mutex_lock(&device->bcn_tool_lock);
+   while (!device->bcn_tool_stop) {
+      int slot = -1;
+      for (int i = 0; i < BCN_SLOT_COUNT && slot < 0; i++)
+         if (device->bcn_slot_state[i] == BCN_QUEUED)
+            slot = i;
+      if (slot < 0) {
+         pthread_cond_wait(&device->bcn_tool_cond, &device->bcn_tool_lock);
+         continue;
+      }
+      device->bcn_slot_state[slot] = BCN_BUILDING;
+      pthread_mutex_unlock(&device->bcn_tool_lock);
+      struct timespec t0, t1;
+      clock_gettime(CLOCK_MONOTONIC, &t0);
+      VkPipeline p = VK_NULL_HANDLE;
+      VkResult r = bcn_build_slot(device, slot, &p);
+      clock_gettime(CLOCK_MONOTONIC, &t1);
+      if (r == VK_SUCCESS)
+         bcn_cache_save(device);
+      wrapper_diag_append("[BCN] GPU shader %s built in %.0f ms (VkResult %d)\n",
+                          bcn_slot_names[slot],
+                          (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6, r);
+      pthread_mutex_lock(&device->bcn_tool_lock);
+      device->bcn_pipe[slot] = p;
+      device->bcn_slot_state[slot] = r == VK_SUCCESS ? BCN_BUILT : BCN_FAILED;
+      __atomic_store_n(&device->bcn_tool_untested, 1, __ATOMIC_RELEASE);
+      pthread_cond_broadcast(&device->bcn_tool_cond);
+   }
+   pthread_mutex_unlock(&device->bcn_tool_lock);
+   return NULL;
+}
+
+/* Called when the device is created: records where the self-test runs. */
+void
+wrapper_bcn_gpu_init(struct wrapper_device *device, uint32_t family)
+{
+   device->bcn_tool_family = family;
+   pthread_mutex_init(&device->bcn_tool_lock, NULL);
+   pthread_cond_init(&device->bcn_tool_cond, NULL);
+}
+
+static bool
+bcn_tables_create(struct wrapper_device *device)
+{
+   VkDevice d = device->dispatch_handle;
+   VkBufferCreateInfo bci = {
+      .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+      .size = sizeof(wrapper_astc_tables),
+      .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+      .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+   };
+   if (device->dispatch_table.CreateBuffer(d, &bci, NULL, &device->bcn_tables) != VK_SUCCESS)
+      return false;
+   VkMemoryRequirements mr;
+   device->dispatch_table.GetBufferMemoryRequirements(d, device->bcn_tables, &mr);
+   VkMemoryAllocateFlagsInfo flags = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
+      .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT,
+   };
+   VkMemoryAllocateInfo ai = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      .pNext = &flags,
+      .allocationSize = mr.size,
+      .memoryTypeIndex = bcn_memory_type(device, mr.memoryTypeBits,
+         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
+   };
+   void *map;
+   if (ai.memoryTypeIndex == UINT32_MAX ||
+       device->dispatch_table.AllocateMemory(d, &ai, NULL, &device->bcn_tables_memory) !=
+          VK_SUCCESS ||
+       device->dispatch_table.BindBufferMemory(d, device->bcn_tables, device->bcn_tables_memory,
+                                               0) != VK_SUCCESS ||
+       device->dispatch_table.MapMemory(d, device->bcn_tables_memory, 0, VK_WHOLE_SIZE, 0,
+                                        &map) != VK_SUCCESS)
+      return false;
+   memcpy(map, wrapper_astc_tables, sizeof(wrapper_astc_tables));
+   device->dispatch_table.UnmapMemory(d, device->bcn_tables_memory);
+   VkBufferDeviceAddressInfo dai = {
+      .sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
+      .buffer = device->bcn_tables,
+   };
+   device->bcn_tables_address = device->dispatch_table.GetBufferDeviceAddress(d, &dai);
+   return true;
+}
+
+/* The layout, the tables, the pipeline cache and the worker, once. */
+static bool
+bcn_tools_start(struct wrapper_device *device)
+{
+   int state = __atomic_load_n(&device->bcn_tool_state, __ATOMIC_ACQUIRE);
+   if (state)
+      return state > 0;
+   simple_mtx_lock(&device->bcn_gpu_mutex);
+   if (!device->bcn_tool_state) {
+      VkDevice d = device->dispatch_handle;
+      VkPushConstantRange pcr = {
+         .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+         .size = sizeof(struct bcn_pc),
+      };
+      VkPipelineLayoutCreateInfo plci = {
+         .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+         .pushConstantRangeCount = 1,
+         .pPushConstantRanges = &pcr,
+      };
+      char path[256];
+      bcn_cache_path(device, path, sizeof(path));
+      void *data = NULL;
+      long len = 0;
+      FILE *f = fopen(path, "rb");
+      if (f) {
+         if (!fseek(f, 0, SEEK_END) && (len = ftell(f)) > 0 && !fseek(f, 0, SEEK_SET) &&
+             (data = malloc(len)) && fread(data, 1, len, f) != (size_t)len) {
+            free(data);
+            data = NULL;
+         }
+         fclose(f);
+      }
+      VkPipelineCacheCreateInfo pcci = {
+         .sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,
+         .initialDataSize = data ? (size_t)len : 0,
+         .pInitialData = data,
+      };
+      if (device->dispatch_table.CreatePipelineCache(d, &pcci, NULL,
+                                                     &device->bcn_pipeline_cache) != VK_SUCCESS)
+         device->bcn_pipeline_cache = VK_NULL_HANDLE;
+      free(data);
+      bool ok = device->bcn_bda &&
+                device->dispatch_table.CreatePipelineLayout(d, &plci, NULL,
+                                                            &device->bcn_tool_layout) ==
+                   VK_SUCCESS &&
+                bcn_tables_create(device) &&
+                pthread_create(&device->bcn_tool_thread, NULL, bcn_tools_worker, device) == 0;
+      device->bcn_tool_thread_live = ok;
+      wrapper_diag_append("[BCN] GPU shaders: %s (bda=%d, pipeline cache %ld bytes from %s)\n",
+                          ok ? "built on first use" : "off, upload=cpu", device->bcn_bda,
+                          data ? len : 0L, path);
+      __atomic_store_n(&device->bcn_tool_state, ok ? 1 : -1, __ATOMIC_RELEASE);
+   }
+   simple_mtx_unlock(&device->bcn_gpu_mutex);
+   return device->bcn_tool_state > 0;
+}
+
+/* The pipeline of a slot, built or asked for; with wait, after its build. */
+static VkPipeline
+bcn_pipe(struct wrapper_device *device, int slot, bool wait)
+{
+   int st = __atomic_load_n(&device->bcn_slot_state[slot], __ATOMIC_ACQUIRE);
+   if (st == BCN_BUILT || st == BCN_TESTED)
+      return device->bcn_pipe[slot];
+   if (st == BCN_FAILED || !bcn_tools_start(device))
+      return VK_NULL_HANDLE;
+   pthread_mutex_lock(&device->bcn_tool_lock);
+   if (device->bcn_slot_state[slot] == BCN_NONE) {
+      device->bcn_slot_state[slot] = BCN_QUEUED;
+      pthread_cond_broadcast(&device->bcn_tool_cond);
+   }
+   while (wait && (device->bcn_slot_state[slot] == BCN_QUEUED ||
+                   device->bcn_slot_state[slot] == BCN_BUILDING))
+      pthread_cond_wait(&device->bcn_tool_cond, &device->bcn_tool_lock);
+   st = device->bcn_slot_state[slot];
+   pthread_mutex_unlock(&device->bcn_tool_lock);
+   return st == BCN_BUILT || st == BCN_TESTED ? device->bcn_pipe[slot] : VK_NULL_HANDLE;
+}
+
+static int
+bcn_encode_slot(int format_id)
+{
+   return format_id == 8 || format_id == 9 ? BCN_SLOT_ENC_BC6H :
+          format_id == 10 ? BCN_SLOT_ENC_BC7 : BCN_SLOT_ENC_BC15;
+}
+
 /* A command buffer recorded before the self-test may still use it: it is
  * destroyed with the device. */
 static void
-bcn_disable_pipeline(struct wrapper_device *device, VkPipeline *pipeline)
+bcn_retire(struct wrapper_device *device, int slot)
 {
-   if (*pipeline) {
-      for (uint32_t i = 0; i < ARRAY_SIZE(device->bcn_retired); i++) {
-         if (!device->bcn_retired[i]) {
-            device->bcn_retired[i] = *pipeline;
-            break;
-         }
+   VkPipeline p = device->bcn_pipe[slot];
+   for (uint32_t i = 0; p && i < ARRAY_SIZE(device->bcn_retired); i++) {
+      if (!device->bcn_retired[i]) {
+         device->bcn_retired[i] = p;
+         break;
       }
    }
-   *pipeline = VK_NULL_HANDLE;
+   device->bcn_pipe[slot] = VK_NULL_HANDLE;
+   __atomic_store_n(&device->bcn_slot_state[slot], BCN_FAILED, __ATOMIC_RELEASE);
 }
 
-/* Runs each shader once on a known block on the device's first queue and
- * checks the result on the CPU. A shader that does not produce it is
- * dropped, so the work that needs it stays on the CPU path.
- * WRAPPER_BCN_GPU_FAIL=decode,bc,astc drops them on purpose. */
+/* Runs each pipeline built since the last check once on a known input and
+ * checks the result on the CPU. WRAPPER_BCN_GPU_FAIL=decode,astc,hdr,bc drops
+ * them on purpose. */
 static void
-bcn_selftest(struct wrapper_device *device, VkQueue queue, uint32_t family, char *report,
-             size_t size)
+bcn_selftest(struct wrapper_device *device, VkQueue queue, uint32_t family)
 {
    const char *force = getenv("WRAPPER_BCN_GPU_FAIL");
-   struct bcn_selftest_buf blk = { 0 }, rgba = { 0 }, astc = { 0 }, bc = { 0 };
-   struct bcn_selftest_buf half = { 0 }, hdr = { 0 };
+   int todo[BCN_SLOT_COUNT], n = 0;
+   pthread_mutex_lock(&device->bcn_tool_lock);
+   __atomic_store_n(&device->bcn_tool_untested, 0, __ATOMIC_RELEASE);
+   for (int i = 0; i < BCN_SLOT_COUNT; i++)
+      if (device->bcn_slot_state[i] == BCN_BUILT)
+         todo[n++] = i;
+   pthread_mutex_unlock(&device->bcn_tool_lock);
+   if (!n)
+      return;
+
+   struct timespec t0, t1;
+   clock_gettime(CLOCK_MONOTONIC, &t0);
+   struct bcn_selftest_buf in[BCN_SLOT_COUNT] = { 0 }, out[BCN_SLOT_COUNT] = { 0 };
    VkCommandPool pool = VK_NULL_HANDLE;
    VkCommandBuffer cb = VK_NULL_HANDLE;
    VkFence fence = VK_NULL_HANDLE;
    bool ran = false;
-   int dec_ok = 0, astc_ok = 0, bc_ok = 0, hdr_ok = 0;
-
    VkCommandPoolCreateInfo cpci = {
       .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
       .queueFamilyIndex = family,
@@ -378,64 +639,66 @@ bcn_selftest(struct wrapper_device *device, VkQueue queue, uint32_t family, char
       .commandBufferCount = 1,
    };
    VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
-   if (bcn_selftest_buffer(device, 16, &blk) && bcn_selftest_buffer(device, 64, &rgba) &&
-       bcn_selftest_buffer(device, 16, &astc) && bcn_selftest_buffer(device, 16, &bc) &&
-       bcn_selftest_buffer(device, 128, &half) && bcn_selftest_buffer(device, 16, &hdr) &&
-       device->dispatch_table.CreateCommandPool(device->dispatch_handle, &cpci, NULL,
-                                                &pool) == VK_SUCCESS &&
+   bool bufs = true;
+   for (int k = 0; k < n && bufs; k++)
+      bufs = bcn_selftest_buffer(device, 128, &in[todo[k]]) &&
+             bcn_selftest_buffer(device, 64, &out[todo[k]]);
+   if (bufs &&
+       device->dispatch_table.CreateCommandPool(device->dispatch_handle, &cpci, NULL, &pool) ==
+          VK_SUCCESS &&
        (cbai.commandPool = pool,
-        device->dispatch_table.AllocateCommandBuffers(device->dispatch_handle, &cbai,
-                                                      &cb) == VK_SUCCESS) &&
-       device->dispatch_table.CreateFence(device->dispatch_handle, &fci, NULL,
-                                          &fence) == VK_SUCCESS) {
-      /* BC1: red and blue endpoints, indices 0 1 2 3 on every row */
-      static const uint8_t block[8] = { 0x00, 0xf8, 0x1f, 0x00, 0xe4, 0xe4, 0xe4, 0xe4 };
-      memcpy(blk.map, block, 8);
-      /* HDR: red rising from 1/16 to 12 across the block, green 1, blue 1/4 */
-      uint16_t *h = half.map;
-      for (int i = 0; i < 16; i++) {
-         h[i * 4] = (uint16_t)(0x2c00 + i * 0x0200);
-         h[i * 4 + 1] = 0x3c00;
-         h[i * 4 + 2] = 0x3400;
-         h[i * 4 + 3] = 0x3c00;
-      }
+        device->dispatch_table.AllocateCommandBuffers(device->dispatch_handle, &cbai, &cb) ==
+           VK_SUCCESS) &&
+       device->dispatch_table.CreateFence(device->dispatch_handle, &fci, NULL, &fence) ==
+          VK_SUCCESS) {
       VkCommandBufferBeginInfo bi = {
          .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
          .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
       };
       device->dispatch_table.BeginCommandBuffer(cb, &bi);
-      struct bcn_pc pc = {
-         .src = { (uint32_t)blk.address, (uint32_t)(blk.address >> 32) },
-         .dst = { (uint32_t)rgba.address, (uint32_t)(rgba.address >> 32) },
-         .src_row_pitch = 8, .src_slice_pitch = 8, .dst_row_pitch = 16, .dst_slice_pitch = 64,
-         .blocks_x = 1, .blocks_y = 1, .format = 0, .width = 4, .height = 4,
-      };
-      if (device->bcn_decode_pipeline)
-         bcn_selftest_push(device, cb, device->bcn_decode_pipeline, &pc);
-      struct bcn_pc ac = {
-         .src = { (uint32_t)rgba.address, (uint32_t)(rgba.address >> 32) },
-         .dst = { (uint32_t)astc.address, (uint32_t)(astc.address >> 32) },
-         .src_row_pitch = 16, .src_slice_pitch = 64, .dst_row_pitch = 16, .dst_slice_pitch = 16,
-         .blocks_x = 1, .blocks_y = 1, .format = 4, .flags = 0, .width = 4, .height = 4,
-      };
-      if (device->bcn_decode_pipeline && device->bcn_astc_pipeline[0])
-         bcn_selftest_push(device, cb, device->bcn_astc_pipeline[0], &ac);
-      struct bcn_pc ec = ac;
-      ec.dst[0] = (uint32_t)bc.address;
-      ec.dst[1] = (uint32_t)(bc.address >> 32);
-      ec.dst_row_pitch = 8;
-      ec.dst_slice_pitch = 8;
-      ec.format = 0;
-      if (device->bcn_decode_pipeline && device->bcn_encode_pipeline)
-         bcn_selftest_push(device, cb, device->bcn_encode_pipeline, &ec);
-      struct bcn_pc hc = {
-         .src = { (uint32_t)half.address, (uint32_t)(half.address >> 32) },
-         .dst = { (uint32_t)hdr.address, (uint32_t)(hdr.address >> 32) },
-         .src_row_pitch = 32, .src_slice_pitch = 128, .dst_row_pitch = 16, .dst_slice_pitch = 16,
-         .blocks_x = 1, .blocks_y = 1, .format = 4, .width = 4, .height = 4,
-      };
-      if (device->bcn_astc_hdr_pipeline)
-         bcn_selftest_push(device, cb, device->bcn_astc_hdr_pipeline, &hc);
+      for (int k = 0; k < n; k++) {
+         int s = todo[k];
+         struct bcn_pc pc = {
+            .src = { (uint32_t)in[s].address, (uint32_t)(in[s].address >> 32) },
+            .dst = { (uint32_t)out[s].address, (uint32_t)(out[s].address >> 32) },
+            .src_row_pitch = 16, .src_slice_pitch = 64, .dst_row_pitch = 16,
+            .dst_slice_pitch = 16, .blocks_x = 1, .blocks_y = 1, .width = 4, .height = 4,
+            .tables = { (uint32_t)device->bcn_tables_address,
+                        (uint32_t)(device->bcn_tables_address >> 32) },
+         };
+         uint8_t *src = in[s].map;
+         if (s == BCN_SLOT_DECODE) {
+            /* BC1: red and blue endpoints, indices 0 1 2 3 on every row */
+            static const uint8_t block[8] = { 0x00, 0xf8, 0x1f, 0x00, 0xe4, 0xe4, 0xe4, 0xe4 };
+            memcpy(src, block, 8);
+            pc.src_row_pitch = 8;
+            pc.src_slice_pitch = 8;
+            pc.dst_slice_pitch = 64;
+            pc.format = 0;
+         } else if (s == BCN_SLOT_HDR || s == BCN_SLOT_ENC_BC6H) {
+            /* red rising from 1/16 to 12 across the block, green 1, blue 1/4 */
+            uint16_t *h = (uint16_t *)src;
+            for (int i = 0; i < 16; i++) {
+               h[i * 4] = (uint16_t)(0x2c00 + i * 0x0200);
+               h[i * 4 + 1] = 0x3c00;
+               h[i * 4 + 2] = 0x3400;
+               h[i * 4 + 3] = 0x3c00;
+            }
+            pc.src_row_pitch = 32;
+            pc.src_slice_pitch = 128;
+            pc.format = s == BCN_SLOT_HDR ? 4 : 8;
+         } else {
+            for (int i = 0; i < 16; i++) {
+               src[i * 4] = (uint8_t)(i * 17);
+               src[i * 4 + 1] = (uint8_t)(255 - i * 17);
+               src[i * 4 + 2] = (uint8_t)((i & 3) * 85);
+               src[i * 4 + 3] = 255;
+            }
+            pc.format = s <= BCN_SLOT_ASTC8 ? 4 + 2 * (s - BCN_SLOT_ASTC4) :
+                        s == BCN_SLOT_ENC_BC7 ? 10 : 0;
+         }
+         bcn_selftest_push(device, cb, device->bcn_pipe[s], &pc);
+      }
       VkMemoryBarrier mb = {
          .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
          .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
@@ -449,251 +712,77 @@ bcn_selftest(struct wrapper_device *device, VkQueue queue, uint32_t family, char
          .commandBufferCount = 1,
          .pCommandBuffers = &cb,
       };
-      ran = queue && device->dispatch_table.QueueSubmit(queue, 1, &si, fence) == VK_SUCCESS &&
+      ran = device->dispatch_table.QueueSubmit(queue, 1, &si, fence) == VK_SUCCESS &&
             device->dispatch_table.WaitForFences(device->dispatch_handle, 1, &fence, VK_TRUE,
                                                  2000000000ull) == VK_SUCCESS;
    }
-   if (ran) {
-      static const uint8_t pal[4][4] = {
-         { 255, 0, 0, 255 }, { 0, 0, 255, 255 }, { 170, 0, 85, 255 }, { 85, 0, 170, 255 },
-      };
-      const uint8_t *got = rgba.map;
-      dec_ok = 1;
-      for (int i = 0; i < 16; i++)
-         dec_ok &= !memcmp(got + i * 4, pal[i & 3], 4);
-      const uint8_t *a = astc.map;
-      for (int i = 0; i < 16; i++)
-         astc_ok |= a[i] != 0;
-      const uint8_t *b = bc.map;
-      bc_ok = (b[0] | b[1] | b[2] | b[3]) != 0;
-      uint32_t w0;
-      memcpy(&w0, hdr.map, 4);
-      uint32_t cem = (w0 >> 13) & 15;
-      hdr_ok = (w0 & 0x1ff) != 0x1fc && ((w0 >> 11) & 3) == 0 && (cem == 7 || cem == 11);
+   clock_gettime(CLOCK_MONOTONIC, &t1);
+   char report[256];
+   size_t at = 0;
+   for (int k = 0; k < n; k++) {
+      int s = todo[k];
+      const uint8_t *o = ran ? out[s].map : NULL;
+      bool ok = false;
+      if (o && s == BCN_SLOT_DECODE) {
+         static const uint8_t pal[4][4] = {
+            { 255, 0, 0, 255 }, { 0, 0, 255, 255 }, { 170, 0, 85, 255 }, { 85, 0, 170, 255 },
+         };
+         ok = true;
+         for (int i = 0; i < 16; i++)
+            ok = ok && !memcmp(o + i * 4, pal[i & 3], 4);
+      } else if (o && (s == BCN_SLOT_HDR || s <= BCN_SLOT_ASTC8)) {
+         uint32_t w0;
+         memcpy(&w0, o, 4);
+         uint32_t cem = (w0 >> 13) & 15;
+         ok = (w0 & 0x1ff) != 0x1fc && ((w0 >> 11) & 3) == 0 &&
+              (s == BCN_SLOT_HDR ? (cem == 7 || cem == 11) : cem >= 8);
+      } else if (o) {
+         for (int i = 0; i < 8; i++)
+            ok = ok || o[i] != 0;
+      }
+      const char *tag = s == BCN_SLOT_DECODE ? "decode" : s == BCN_SLOT_HDR ? "hdr" :
+                        s <= BCN_SLOT_ASTC8 ? "astc" : "bc";
+      if (force && strstr(force, tag))
+         ok = false;
+      pthread_mutex_lock(&device->bcn_tool_lock);
+      if (ok)
+         device->bcn_slot_state[s] = BCN_TESTED;
+      else
+         bcn_retire(device, s);
+      pthread_mutex_unlock(&device->bcn_tool_lock);
+      at += snprintf(report + at, sizeof(report) - MIN2(at, sizeof(report)), " %s=%s",
+                     bcn_slot_names[s], ok ? "ok" : "off");
+      if (at >= sizeof(report))
+         at = sizeof(report) - 1;
    }
-   if (!dec_ok || (force && strstr(force, "decode")))
-      bcn_disable_pipeline(device, &device->bcn_decode_pipeline);
-   if (!astc_ok || (force && strstr(force, "astc")))
-      for (int i = 0; i < 3; i++)
-         bcn_disable_pipeline(device, &device->bcn_astc_pipeline[i]);
-   if (!bc_ok || (force && strstr(force, "bc")))
-      bcn_disable_pipeline(device, &device->bcn_encode_pipeline);
-   if (!hdr_ok || (force && strstr(force, "hdr")))
-      bcn_disable_pipeline(device, &device->bcn_astc_hdr_pipeline);
-   const uint8_t *g = ran ? rgba.map : NULL;
-   snprintf(report, size, "self-test ran=%d decode=%s astc=%s bc=%s hdr=%s first=%02x%02x%02x%02x",
-            ran, device->bcn_decode_pipeline ? "ok" : "off",
-            device->bcn_astc_pipeline[0] ? "ok" : "off", device->bcn_encode_pipeline ? "ok" : "off",
-            device->bcn_astc_hdr_pipeline ? "ok" : "off",
-            g ? g[0] : 0, g ? g[1] : 0, g ? g[2] : 0, g ? g[3] : 0);
+   wrapper_diag_append("[BCN] GPU self-test ran=%d%s (%.0f ms)\n", ran, report,
+                       (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6);
 
    if (fence)
       device->dispatch_table.DestroyFence(device->dispatch_handle, fence, NULL);
    if (pool)
       device->dispatch_table.DestroyCommandPool(device->dispatch_handle, pool, NULL);
-   struct bcn_selftest_buf *bufs[6] = { &blk, &rgba, &astc, &bc, &half, &hdr };
-   for (int i = 0; i < 6; i++) {
-      if (bufs[i]->buffer)
-         device->dispatch_table.DestroyBuffer(device->dispatch_handle, bufs[i]->buffer, NULL);
-      if (bufs[i]->memory)
-         device->dispatch_table.FreeMemory(device->dispatch_handle, bufs[i]->memory, NULL);
-   }
-}
-
-#define BCN_CACHE_DIR "/data/data/app.gamenative/files/imagefs/usr/cache"
-
-static void
-bcn_cache_path(struct wrapper_device *device, char *path, size_t size)
-{
-   const VkPhysicalDeviceProperties *p = &device->physical->properties2.properties;
-   snprintf(path, size, BCN_CACHE_DIR "/bcn_pipelines_%08x_%08x_%08x.bin", p->vendorID,
-            p->deviceID, p->driverVersion);
-}
-
-/* Builds the shaders on a worker thread, through a pipeline cache kept on
- * disk, so creating a device costs nothing and later launches little. */
-static void *
-bcn_tools_build(void *arg)
-{
-   struct wrapper_device *device = arg;
-   VkDevice d = device->dispatch_handle;
-   struct timespec t0, t1;
-   clock_gettime(CLOCK_MONOTONIC, &t0);
-   char path[256];
-   bcn_cache_path(device, path, sizeof(path));
-   void *data = NULL;
-   size_t len = 0;
-   FILE *f = fopen(path, "rb");
-   if (f) {
-      if (!fseek(f, 0, SEEK_END) && (long)(len = ftell(f)) > 0 && !fseek(f, 0, SEEK_SET) &&
-          (data = malloc(len)) && fread(data, 1, len, f) != len) {
-         free(data);
-         data = NULL;
-      }
-      fclose(f);
-   }
-   VkPipelineCacheCreateInfo pcci = {
-      .sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,
-      .initialDataSize = data ? len : 0,
-      .pInitialData = data,
-   };
-   if (device->dispatch_table.CreatePipelineCache(d, &pcci, NULL, &device->bcn_pipeline_cache) !=
-       VK_SUCCESS)
-      device->bcn_pipeline_cache = VK_NULL_HANDLE;
-   free(data);
-
-   VkPushConstantRange pcr = {
-      .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
-      .size = sizeof(struct bcn_pc),
-   };
-   VkPipelineLayoutCreateInfo plci = {
-      .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-      .pushConstantRangeCount = 1,
-      .pPushConstantRanges = &pcr,
-   };
-   VkResult layout = device->dispatch_table.CreatePipelineLayout(d, &plci, NULL,
-                                                                 &device->bcn_tool_layout);
-   VkResult dec = layout, enc = layout, astc = layout, hdr = layout;
-   double ms[6] = { 0 };
-   wrapper_diag_append("[BCN] GPU shaders: building on a worker\n");
-#define BCN_TIMED(k, expr) do { struct timespec a_, b_; clock_gettime(CLOCK_MONOTONIC, &a_); expr; \
-   clock_gettime(CLOCK_MONOTONIC, &b_); \
-   ms[k] = (b_.tv_sec - a_.tv_sec) * 1e3 + (b_.tv_nsec - a_.tv_nsec) / 1e6; } while (0)
-   if (layout == VK_SUCCESS) {
-      BCN_TIMED(0, dec = bcn_create_pipeline(device, wrapper_bcn_decode_spv,
-         sizeof(wrapper_bcn_decode_spv), &device->bcn_decode_module, &device->bcn_decode_pipeline));
-      BCN_TIMED(1, enc = bcn_create_pipeline(device, wrapper_bcn_encode_spv,
-         sizeof(wrapper_bcn_encode_spv), &device->bcn_encode_module, &device->bcn_encode_pipeline));
-      for (uint32_t i = 0; i < 3; i++) {
-         VkResult r;
-         BCN_TIMED(2 + i, r = bcn_create_pipeline_spec(device, wrapper_astc_encode_spv,
-            sizeof(wrapper_astc_encode_spv), &device->bcn_astc_module,
-            &device->bcn_astc_pipeline[i], 4 + 2 * i));
-         if (i == 0 || r != VK_SUCCESS)
-            astc = r;
-      }
-      BCN_TIMED(5, hdr = bcn_create_pipeline(device, wrapper_astc_hdr_encode_spv,
-         sizeof(wrapper_astc_hdr_encode_spv), &device->bcn_astc_hdr_module,
-         &device->bcn_astc_hdr_pipeline));
-   }
-#undef BCN_TIMED
-   size_t out = 0;
-   bool saved = false;
-   if (device->bcn_pipeline_cache &&
-       device->dispatch_table.GetPipelineCacheData(d, device->bcn_pipeline_cache, &out, NULL) ==
-          VK_SUCCESS && out && (data = malloc(out))) {
-      if (device->dispatch_table.GetPipelineCacheData(d, device->bcn_pipeline_cache, &out,
-                                                      data) == VK_SUCCESS) {
-         char tmp[272];
-         snprintf(tmp, sizeof(tmp), "%s.%d", path, (int)getpid());
-         f = fopen(tmp, "wb");
-         if (f) {
-            saved = fwrite(data, 1, out, f) == out;
-            saved = !fclose(f) && saved && !rename(tmp, path);
-            if (!saved)
-               remove(tmp);
-         }
-      }
-      free(data);
-   }
-   clock_gettime(CLOCK_MONOTONIC, &t1);
-   wrapper_diag_append("[BCN] GPU shaders built in %.0f ms on a worker (pipeline cache %zu bytes "
-                       "in, %zu out%s): layout=%d decode=%d bc-encode=%d astc-encode=%d "
-                       "astc-hdr-encode=%d; ms decode %.0f bc-encode %.0f astc %.0f/%.0f/%.0f hdr %.0f\n",
-                       (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6, len,
-                       out, saved ? ", saved" : "", layout, dec, enc, astc, hdr, ms[0], ms[1], ms[2],
-                       ms[3], ms[4], ms[5]);
-   __atomic_store_n(&device->bcn_tool_state, layout == VK_SUCCESS ? 2 : -1, __ATOMIC_RELEASE);
-   return NULL;
-}
-
-/* Called when the device is created: nothing is built until BCn work needs it. */
-void
-wrapper_bcn_gpu_init(struct wrapper_device *device, uint32_t family)
-{
-   device->bcn_tool_family = family;
-}
-
-static void
-bcn_tools_start(struct wrapper_device *device)
-{
-   if (__atomic_load_n(&device->bcn_tool_state, __ATOMIC_ACQUIRE) != 0)
-      return;
-   simple_mtx_lock(&device->bcn_gpu_mutex);
-   if (device->bcn_tool_state == 0) {
-      if (!device->bcn_bda) {
-         device->bcn_tool_state = -1;
-         wrapper_diag_append("[BCN] GPU shaders off: no bufferDeviceAddress, upload=cpu\n");
-      } else if (pthread_create(&device->bcn_tool_thread, NULL, bcn_tools_build, device) == 0) {
-         device->bcn_tool_thread_live = true;
-         device->bcn_tool_state = 3;
-      } else {
-         device->bcn_tool_state = -1;
+   for (int i = 0; i < BCN_SLOT_COUNT; i++) {
+      struct bcn_selftest_buf *b[2] = { &in[i], &out[i] };
+      for (int j = 0; j < 2; j++) {
+         if (b[j]->buffer)
+            device->dispatch_table.DestroyBuffer(device->dispatch_handle, b[j]->buffer, NULL);
+         if (b[j]->memory)
+            device->dispatch_table.FreeMemory(device->dispatch_handle, b[j]->memory, NULL);
       }
    }
-   simple_mtx_unlock(&device->bcn_gpu_mutex);
 }
 
-static void
-bcn_tools_join(struct wrapper_device *device)
-{
-   simple_mtx_lock(&device->bcn_gpu_mutex);
-   if (device->bcn_tool_thread_live) {
-      pthread_join(device->bcn_tool_thread, NULL);
-      device->bcn_tool_thread_live = false;
-   }
-   simple_mtx_unlock(&device->bcn_gpu_mutex);
-}
-
-/* Uploads: the GPU path once the shaders are built (the self-test runs at
- * the next submit, before the batch that holds them); the CPU path serves
- * them until then. */
-static bool
-bcn_tools_ready(struct wrapper_device *device)
-{
-   bcn_tools_start(device);
-   int state = __atomic_load_n(&device->bcn_tool_state, __ATOMIC_ACQUIRE);
-   return state == 1 || state == 2;
-}
-
-/* Readbacks and copies have no CPU path that keeps BC blocks: they wait for
- * the build, and use the shaders before the self-test has run if need be. */
-static bool
-bcn_tools_wait(struct wrapper_device *device)
-{
-   bcn_tools_start(device);
-   int state = __atomic_load_n(&device->bcn_tool_state, __ATOMIC_ACQUIRE);
-   if (state == 3) {
-      bcn_tools_join(device);
-      state = __atomic_load_n(&device->bcn_tool_state, __ATOMIC_ACQUIRE);
-   }
-   return state == 1 || state == 2;
-}
-
-/* Inside vkQueueSubmit, where the application keeps the queue to itself:
- * the self-test of freshly built shaders runs on it before its batches. */
+/* Inside vkQueueSubmit, where the application keeps the queue to itself. */
 void
 wrapper_bcn_gpu_submit(struct wrapper_queue *queue)
 {
    struct wrapper_device *device = queue->device;
-   if (__atomic_load_n(&device->bcn_tool_state, __ATOMIC_ACQUIRE) != 2 ||
+   if (!__atomic_load_n(&device->bcn_tool_untested, __ATOMIC_ACQUIRE) ||
        queue->vk.queue_family_index != device->bcn_tool_family)
       return;
-   bcn_tools_join(device);
    simple_mtx_lock(&device->bcn_gpu_mutex);
-   if (device->bcn_tool_state == 2) {
-      struct timespec t0, t1;
-      clock_gettime(CLOCK_MONOTONIC, &t0);
-      char report[160];
-      bcn_selftest(device, queue->dispatch_handle, device->bcn_tool_family, report,
-                   sizeof(report));
-      clock_gettime(CLOCK_MONOTONIC, &t1);
-      wrapper_diag_append("[BCN] GPU shaders: bda=%d, %s (%.0f ms), upload=%s\n", device->bcn_bda,
-                          report, (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6,
-                          wrapper_bcn_gpu_path() && device->bcn_decode_pipeline &&
-                          device->bcn_astc_pipeline[0] ? "gpu" : "cpu");
-      __atomic_store_n(&device->bcn_tool_state, 1, __ATOMIC_RELEASE);
-   }
+   bcn_selftest(device, queue->dispatch_handle, device->bcn_tool_family);
    simple_mtx_unlock(&device->bcn_gpu_mutex);
 }
 
@@ -701,31 +790,35 @@ void
 wrapper_bcn_gpu_finish(struct wrapper_device *device)
 {
    VkDevice d = device->dispatch_handle;
-   bcn_tools_join(device);
+   if (device->bcn_tool_thread_live) {
+      pthread_mutex_lock(&device->bcn_tool_lock);
+      device->bcn_tool_stop = true;
+      pthread_cond_broadcast(&device->bcn_tool_cond);
+      pthread_mutex_unlock(&device->bcn_tool_lock);
+      pthread_join(device->bcn_tool_thread, NULL);
+      device->bcn_tool_thread_live = false;
+   }
+   for (int i = 0; i < BCN_SLOT_COUNT; i++)
+      if (device->bcn_pipe[i])
+         device->dispatch_table.DestroyPipeline(d, device->bcn_pipe[i], NULL);
    for (uint32_t i = 0; i < ARRAY_SIZE(device->bcn_retired); i++)
       if (device->bcn_retired[i])
          device->dispatch_table.DestroyPipeline(d, device->bcn_retired[i], NULL);
+   VkShaderModule modules[4] = { device->bcn_decode_module, device->bcn_encode_module,
+                                 device->bcn_astc_module, device->bcn_astc_hdr_module };
+   for (int i = 0; i < 4; i++)
+      if (modules[i])
+         device->dispatch_table.DestroyShaderModule(d, modules[i], NULL);
+   if (device->bcn_tables)
+      device->dispatch_table.DestroyBuffer(d, device->bcn_tables, NULL);
+   if (device->bcn_tables_memory)
+      device->dispatch_table.FreeMemory(d, device->bcn_tables_memory, NULL);
    if (device->bcn_pipeline_cache)
       device->dispatch_table.DestroyPipelineCache(d, device->bcn_pipeline_cache, NULL);
-   if (device->bcn_decode_pipeline)
-      device->dispatch_table.DestroyPipeline(d, device->bcn_decode_pipeline, NULL);
-   if (device->bcn_encode_pipeline)
-      device->dispatch_table.DestroyPipeline(d, device->bcn_encode_pipeline, NULL);
-   for (int i = 0; i < 3; i++)
-      if (device->bcn_astc_pipeline[i])
-         device->dispatch_table.DestroyPipeline(d, device->bcn_astc_pipeline[i], NULL);
-   if (device->bcn_astc_hdr_pipeline)
-      device->dispatch_table.DestroyPipeline(d, device->bcn_astc_hdr_pipeline, NULL);
-   if (device->bcn_astc_module)
-      device->dispatch_table.DestroyShaderModule(d, device->bcn_astc_module, NULL);
-   if (device->bcn_astc_hdr_module)
-      device->dispatch_table.DestroyShaderModule(d, device->bcn_astc_hdr_module, NULL);
-   if (device->bcn_decode_module)
-      device->dispatch_table.DestroyShaderModule(d, device->bcn_decode_module, NULL);
-   if (device->bcn_encode_module)
-      device->dispatch_table.DestroyShaderModule(d, device->bcn_encode_module, NULL);
    if (device->bcn_tool_layout)
       device->dispatch_table.DestroyPipelineLayout(d, device->bcn_tool_layout, NULL);
+   pthread_cond_destroy(&device->bcn_tool_cond);
+   pthread_mutex_destroy(&device->bcn_tool_lock);
 }
 
 void
@@ -811,11 +904,14 @@ bcn_dispatch(struct wrapper_command_buffer *wcb, VkPipeline pipeline, const stru
              uint32_t layers)
 {
    struct wrapper_device *device = wcb->device;
+   struct bcn_pc p = *pc;
+   p.tables[0] = (uint32_t)device->bcn_tables_address;
+   p.tables[1] = (uint32_t)(device->bcn_tables_address >> 32);
    bcn_barrier(wcb);
    device->dispatch_table.CmdBindPipeline(wcb->dispatch_handle,
       VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
    device->dispatch_table.CmdPushConstants(wcb->dispatch_handle, device->bcn_tool_layout,
-      VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(*pc), pc);
+      VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(p), &p);
    device->dispatch_table.CmdDispatch(wcb->dispatch_handle, (pc->blocks_x + 7) / 8,
       (pc->blocks_y + 7) / 8, layers);
    bcn_barrier(wcb);
@@ -859,7 +955,7 @@ bcn_encode_region(struct wrapper_command_buffer *wcb, struct wrapper_image *wi,
    uint32_t layers = bcn_layers(wi, sub);
    int id = bcn_format_id(wi->info.format);
    if (id < 0 || wi->info.imageType != VK_IMAGE_TYPE_2D || !ext.width || !ext.height ||
-       !bcn_tools_wait(device) || !device->bcn_encode_pipeline)
+       !bcn_pipe(device, bcn_encode_slot(id), true))
       return NULL;
    if (!bcn_blit_supported(device, stored, unpacked)) {
       static bool logged;
@@ -916,7 +1012,7 @@ bcn_encode_region(struct wrapper_command_buffer *wcb, struct wrapper_image *wi,
       .width = ext.width,
       .height = ext.height,
    };
-   bcn_dispatch(wcb, device->bcn_encode_pipeline, &pc, layers);
+   bcn_dispatch(wcb, bcn_pipe(device, bcn_encode_slot(id), true), &pc, layers);
    return blocks;
 }
 
@@ -962,7 +1058,7 @@ wrapper_bcn_gpu_readback(struct wrapper_command_buffer *wcb, struct wrapper_imag
 static bool
 bcn_gpu_upload_region(struct wrapper_command_buffer *wcb, struct wrapper_image *wi,
                       struct wrapper_buffer *wb, VkBuffer src, VkImageLayout layout,
-                      const VkBufferImageCopy *c);
+                      const VkBufferImageCopy *c, bool wait);
 
 /* One vkCmdCopyImage region with an emulated BC image on one side or both.
  * Returns false when the region should go to the driver as it is. */
@@ -1012,7 +1108,7 @@ wrapper_bcn_gpu_copy_image_region(struct wrapper_command_buffer *wcb,
     * blocks would be. */
    int id = bcn_format_id(dst->info.format);
    if (id < 0 || dst->info.imageType != VK_IMAGE_TYPE_2D ||
-       !bcn_tools_wait(device) || !device->bcn_decode_pipeline) {
+       !bcn_pipe(device, BCN_SLOT_DECODE, true)) {
       static bool logged;
       if (!logged)
          WRAPPER_LOG(error, "BCn: copy into BC format %d stored as %d is not supported",
@@ -1044,7 +1140,7 @@ wrapper_bcn_gpu_copy_image_region(struct wrapper_command_buffer *wcb,
       .imageExtent = { MIN2(nbx * 4, lw - (uint32_t)c->dstOffset.x),
                        MIN2(nby * 4, lh - (uint32_t)c->dstOffset.y), 1 },
    };
-   if (!bcn_gpu_upload_region(wcb, dst, NULL, blocks->dispatch_handle, dst_layout, &up)) {
+   if (!bcn_gpu_upload_region(wcb, dst, NULL, blocks->dispatch_handle, dst_layout, &up, true)) {
       static bool logged;
       if (!logged)
          WRAPPER_LOG(error, "BCn: GPU path cannot store a copy into format %d",
@@ -1084,7 +1180,7 @@ wrapper_bcn_gpu_misaligned(const struct wrapper_image *wi, const VkBufferImageCo
 static bool
 bcn_gpu_upload_region(struct wrapper_command_buffer *wcb, struct wrapper_image *wi,
                       struct wrapper_buffer *wb, VkBuffer src, VkImageLayout layout,
-                      const VkBufferImageCopy *c)
+                      const VkBufferImageCopy *c, bool wait)
 {
    struct wrapper_device *device = wcb->device;
    VkFormat format = wi->info.format;
@@ -1099,12 +1195,14 @@ bcn_gpu_upload_region(struct wrapper_command_buffer *wcb, struct wrapper_image *
    uint32_t w = c->imageExtent.width, h = c->imageExtent.height;
    uint32_t m = c->imageSubresource.mipLevel;
    uint32_t lw = MAX2(1u, wi->info.extent.width >> m), lh = MAX2(1u, wi->info.extent.height >> m);
-   if (!w || !h || !bcn_tools_ready(device) || !device->bcn_decode_pipeline)
+   if (!w || !h)
       return false;
-   VkPipeline encoder = hdr ? device->bcn_astc_hdr_pipeline :
-                        astc ? device->bcn_astc_pipeline[astc == 4 ? 0 : astc == 6 ? 1 : 2] :
+   VkPipeline decoder = bcn_pipe(device, BCN_SLOT_DECODE, wait);
+   VkPipeline encoder = hdr ? bcn_pipe(device, BCN_SLOT_HDR, wait) :
+                        astc ? bcn_pipe(device, astc == 4 ? BCN_SLOT_ASTC4 :
+                                        astc == 6 ? BCN_SLOT_ASTC6 : BCN_SLOT_ASTC8, wait) :
                         VK_NULL_HANDLE;
-   if (astc && !encoder)
+   if (!decoder || (astc && !encoder))
       return false;
    bool merge = astc && wrapper_bcn_gpu_misaligned(wi, c);
    /* the rectangle written: the region, or the ASTC blocks covering it */
@@ -1174,7 +1272,7 @@ bcn_gpu_upload_region(struct wrapper_command_buffer *wcb, struct wrapper_image *
       .format = (uint32_t)id,
       .flags = (astc && !hdr) ? 1 : packed ? 2 : 0,
    };
-   bcn_dispatch(wcb, device->bcn_decode_pipeline, &pc, layers);
+   bcn_dispatch(wcb, decoder, &pc, layers);
 
    VkBufferImageCopy copy = {
       .bufferRowLength = nbx * 4,
@@ -1303,7 +1401,7 @@ wrapper_bcn_gpu_upload(struct wrapper_command_buffer *wcb, struct wrapper_image 
 {
    uint32_t done = 0;
    while (done < count && bcn_gpu_upload_region(wcb, wi, wb, wb->dispatch_handle, layout,
-                                                &regions[done]))
+                                                &regions[done], false))
       done++;
    return done;
 }
