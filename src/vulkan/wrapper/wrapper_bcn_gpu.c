@@ -13,6 +13,8 @@
 #include "wrapper_astc_encode_spv.h"
 #include "wrapper_astc_hdr_encode_spv.h"
 #include "wrapper_astc_tables.h"
+#include "wrapper_astc_fast_spv.h"
+#include "wrapper_astc_fast_sg_spv.h"
 #include "wrapper_log.h"
 #include "util/macros.h"
 
@@ -351,6 +353,43 @@ bcn_create_pipeline_spec(struct wrapper_device *device, const uint32_t *code, si
    return r;
 }
 
+/* The ASTC encoder for 4x4 and 6x6: 0 one invocation per block
+ * (wrapper_astc_encode), 1 a workgroup per block or 2x2 blocks with shared
+ * memory sums (wrapper_astc_fast), 2 the same with subgroup sums for 4x4
+ * where clustered subgroup arithmetic covers 16 invocations.
+ * WRAPPER_BCN_ASTC_ENCODER=block|group|subgroup picks one; the default is
+ * subgroup where it is available, else group. */
+static int
+bcn_astc_encoder(struct wrapper_device *device, int slot)
+{
+   const char *e = getenv("WRAPPER_BCN_ASTC_ENCODER");
+   VkPhysicalDeviceSubgroupProperties sg = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES,
+   };
+   VkPhysicalDeviceProperties2 props = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+      .pNext = &sg,
+   };
+   struct wrapper_physical_device *pd = device->physical;
+   pd->dispatch_table.GetPhysicalDeviceProperties2(pd->dispatch_handle, &props);
+   bool sg_ok = slot == BCN_SLOT_ASTC4 && sg.subgroupSize >= 16 &&
+                (sg.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) &&
+                (sg.supportedOperations & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT) &&
+                (sg.supportedOperations & VK_SUBGROUP_FEATURE_CLUSTERED_BIT);
+   int enc = sg_ok ? 2 : 1;
+   if (e && !strcmp(e, "block"))
+      enc = 0;
+   else if (e && !strcmp(e, "group"))
+      enc = 1;
+   else if (e && !strcmp(e, "subgroup") && !sg_ok)
+      enc = 1;
+   wrapper_diag_append("[BCN] ASTC %s encoder: %s (subgroup size %u, operations 0x%x)\n",
+                       slot == BCN_SLOT_ASTC4 ? "4x4" : "6x6",
+                       enc == 2 ? "subgroup" : enc == 1 ? "group" : "block", sg.subgroupSize,
+                       sg.supportedOperations);
+   return enc;
+}
+
 static VkResult
 bcn_build_slot(struct wrapper_device *device, int slot, VkPipeline *out)
 {
@@ -359,8 +398,20 @@ bcn_build_slot(struct wrapper_device *device, int slot, VkPipeline *out)
       return bcn_create_pipeline_spec(device, wrapper_bcn_decode_spv,
          sizeof(wrapper_bcn_decode_spv), &device->bcn_decode_module, out, 0);
    case BCN_SLOT_ASTC4:
-   case BCN_SLOT_ASTC6:
+   case BCN_SLOT_ASTC6: {
+      int enc = bcn_astc_encoder(device, slot);
+      device->bcn_slot_group[slot] = enc ? (slot == BCN_SLOT_ASTC4 ? 2 : 1) : 8;
+      if (enc == 2)
+         return bcn_create_pipeline_spec(device, wrapper_astc_fast_sg_spv,
+            sizeof(wrapper_astc_fast_sg_spv), &device->bcn_astc_fast_sg_module, out, 4);
+      if (enc == 1)
+         return bcn_create_pipeline_spec(device, wrapper_astc_fast_spv,
+            sizeof(wrapper_astc_fast_spv), &device->bcn_astc_fast_module, out,
+            4 + 2 * (slot - BCN_SLOT_ASTC4));
+   }
+   __attribute__((fallthrough));
    case BCN_SLOT_ASTC8:
+      device->bcn_slot_group[slot] = 8;
       return bcn_create_pipeline_spec(device, wrapper_astc_encode_spv,
          sizeof(wrapper_astc_encode_spv), &device->bcn_astc_module, out,
          4 + 2 * (slot - BCN_SLOT_ASTC4));
@@ -385,7 +436,8 @@ bcn_cache_path(struct wrapper_device *device, char *path, size_t size)
             (uint32_t)(sizeof(wrapper_bcn_decode_spv) * 31u + sizeof(wrapper_bcn_encode_spv) * 7u +
                        sizeof(wrapper_astc_encode_spv) * 3u + sizeof(wrapper_astc_hdr_encode_spv) +
                        wrapper_bcn_encode_spv[sizeof(wrapper_bcn_encode_spv) / 8] +
-                       wrapper_astc_hdr_encode_spv[sizeof(wrapper_astc_hdr_encode_spv) / 8]));
+                       wrapper_astc_hdr_encode_spv[sizeof(wrapper_astc_hdr_encode_spv) / 8] +
+                       sizeof(wrapper_astc_fast_spv) * 5u + sizeof(wrapper_astc_fast_sg_spv) * 11u));
 }
 
 static void
@@ -804,9 +856,10 @@ wrapper_bcn_gpu_finish(struct wrapper_device *device)
    for (uint32_t i = 0; i < ARRAY_SIZE(device->bcn_retired); i++)
       if (device->bcn_retired[i])
          device->dispatch_table.DestroyPipeline(d, device->bcn_retired[i], NULL);
-   VkShaderModule modules[4] = { device->bcn_decode_module, device->bcn_encode_module,
-                                 device->bcn_astc_module, device->bcn_astc_hdr_module };
-   for (int i = 0; i < 4; i++)
+   VkShaderModule modules[6] = { device->bcn_decode_module, device->bcn_encode_module,
+                                 device->bcn_astc_module, device->bcn_astc_hdr_module,
+                                 device->bcn_astc_fast_module, device->bcn_astc_fast_sg_module };
+   for (int i = 0; i < 6; i++)
       if (modules[i])
          device->dispatch_table.DestroyShaderModule(d, modules[i], NULL);
    if (device->bcn_tables)
@@ -912,8 +965,12 @@ bcn_dispatch(struct wrapper_command_buffer *wcb, VkPipeline pipeline, const stru
       VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
    device->dispatch_table.CmdPushConstants(wcb->dispatch_handle, device->bcn_tool_layout,
       VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(p), &p);
-   device->dispatch_table.CmdDispatch(wcb->dispatch_handle, (pc->blocks_x + 7) / 8,
-      (pc->blocks_y + 7) / 8, layers);
+   uint32_t g = 8;
+   for (int i = 0; i < BCN_SLOT_COUNT; i++)
+      if (device->bcn_pipe[i] == pipeline && device->bcn_slot_group[i])
+         g = device->bcn_slot_group[i];
+   device->dispatch_table.CmdDispatch(wcb->dispatch_handle, (pc->blocks_x + g - 1) / g,
+      (pc->blocks_y + g - 1) / g, layers);
    bcn_barrier(wcb);
    if (wcb->compute_pipeline)
       device->dispatch_table.CmdBindPipeline(wcb->dispatch_handle,
