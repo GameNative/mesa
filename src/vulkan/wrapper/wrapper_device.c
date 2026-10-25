@@ -1259,6 +1259,7 @@ if (pdf2 && pdf2->features.f) { \
    DISABLE_FEATURE(shaderCullDistance);
    DISABLE_FEATURE(dualSrcBlend);
    DISABLE_FEATURE(multiDrawIndirect);
+   DISABLE_FEATURE(shaderInt64);
 
 #undef DISABLE_FEATURE
 
@@ -3259,6 +3260,102 @@ wrapper_CmdEndRendering(VkCommandBuffer commandBuffer)
    wcb->dynamic_rendering_active = false;
 }
 
+static bool
+wrapper_lowers_maintenance5(const struct wrapper_device *device)
+{
+   return device->vk.enabled_extensions.KHR_maintenance5 &&
+          !device->physical->base_supported_extensions.KHR_maintenance5;
+}
+
+static VkPipelineCreateFlags
+wrapper_fold_pipeline_flags2(const void **pNext, VkPipelineCreateFlags flags)
+{
+   const VkPipelineCreateFlags2CreateInfo *flags2 =
+      vk_find_struct_const(*pNext, PIPELINE_CREATE_FLAGS_2_CREATE_INFO);
+   if (!flags2)
+      return flags;
+   if (*pNext == (const void *)flags2)
+      *pNext = flags2->pNext;
+   return (VkPipelineCreateFlags)flags2->flags;
+}
+
+static VkResult
+wrapper_lower_inline_shader_stage(struct wrapper_device *device,
+                                  VkPipelineShaderStageCreateInfo *stage,
+                                  VkShaderModule *modules, uint32_t *module_count)
+{
+   const VkShaderModuleCreateInfo *module_info;
+
+   if (stage->module != VK_NULL_HANDLE ||
+       !(module_info = vk_find_struct_const(stage->pNext, SHADER_MODULE_CREATE_INFO)))
+      return VK_SUCCESS;
+
+   VkShaderModuleCreateInfo info = *module_info;
+   info.pNext = NULL;
+   VkResult result = wrapper_CreateShaderModule(wrapper_device_to_handle(device),
+                                                &info, NULL, &modules[*module_count]);
+   if (result != VK_SUCCESS)
+      return result;
+
+   stage->module = modules[(*module_count)++];
+   if (stage->pNext == (const void *)module_info)
+      stage->pNext = module_info->pNext;
+   return VK_SUCCESS;
+}
+
+static void
+wrapper_destroy_lowered_modules(struct wrapper_device *device,
+                                VkShaderModule *modules, uint32_t count)
+{
+   for (uint32_t i = 0; i < count; i++)
+      device->dispatch_table.DestroyShaderModule(device->dispatch_handle,
+                                                 modules[i], NULL);
+   free(modules);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+wrapper_CreateComputePipelines(VkDevice _device, VkPipelineCache pipelineCache,
+                               uint32_t createInfoCount,
+                               const VkComputePipelineCreateInfo *pCreateInfos,
+                               const VkAllocationCallbacks *pAllocator,
+                               VkPipeline *pPipelines)
+{
+   VK_FROM_HANDLE(wrapper_device, device, _device);
+
+   if (!wrapper_lowers_maintenance5(device) || !createInfoCount)
+      return device->dispatch_table.CreateComputePipelines(device->dispatch_handle,
+         pipelineCache, createInfoCount, pCreateInfos, pAllocator, pPipelines);
+
+   VkComputePipelineCreateInfo *infos = malloc(createInfoCount * sizeof(*infos));
+   VkShaderModule *modules = malloc(createInfoCount * sizeof(*modules));
+   uint32_t module_count = 0;
+   VkResult result = VK_SUCCESS;
+
+   if (!infos || !modules) {
+      free(infos);
+      free(modules);
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
+
+   memcpy(infos, pCreateInfos, createInfoCount * sizeof(*infos));
+   for (uint32_t i = 0; i < createInfoCount && result == VK_SUCCESS; i++) {
+      infos[i].flags = wrapper_fold_pipeline_flags2(&infos[i].pNext, infos[i].flags);
+      result = wrapper_lower_inline_shader_stage(device, &infos[i].stage,
+                                                 modules, &module_count);
+   }
+
+   if (result == VK_SUCCESS)
+      result = device->dispatch_table.CreateComputePipelines(device->dispatch_handle,
+         pipelineCache, createInfoCount, infos, pAllocator, pPipelines);
+   else
+      for (uint32_t i = 0; i < createInfoCount; i++)
+         pPipelines[i] = VK_NULL_HANDLE;
+
+   wrapper_destroy_lowered_modules(device, modules, module_count);
+   free(infos);
+   return result;
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 wrapper_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
                                 uint32_t createInfoCount,
@@ -3270,6 +3367,55 @@ wrapper_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
    VkGraphicsPipelineCreateInfo *legacy = NULL;
    VkRenderPass *render_passes = NULL;
    const VkGraphicsPipelineCreateInfo *driver_infos = pCreateInfos;
+   VkGraphicsPipelineCreateInfo *m5_infos = NULL;
+   VkPipelineShaderStageCreateInfo *m5_stages = NULL;
+   VkShaderModule *m5_modules = NULL;
+   uint32_t m5_module_count = 0;
+
+   if (wrapper_lowers_maintenance5(device) && createInfoCount) {
+      uint32_t stage_count = 0;
+      for (uint32_t i = 0; i < createInfoCount; i++)
+         stage_count += pCreateInfos[i].stageCount;
+
+      m5_infos = malloc(createInfoCount * sizeof(*m5_infos));
+      m5_stages = malloc(MAX2(stage_count, 1) * sizeof(*m5_stages));
+      m5_modules = malloc(MAX2(stage_count, 1) * sizeof(*m5_modules));
+      if (!m5_infos || !m5_stages || !m5_modules) {
+         free(m5_infos);
+         free(m5_stages);
+         free(m5_modules);
+         return VK_ERROR_OUT_OF_HOST_MEMORY;
+      }
+
+      memcpy(m5_infos, pCreateInfos, createInfoCount * sizeof(*m5_infos));
+      VkResult m5_result = VK_SUCCESS;
+      uint32_t s = 0;
+      for (uint32_t i = 0; i < createInfoCount; i++) {
+         m5_infos[i].flags = wrapper_fold_pipeline_flags2(&m5_infos[i].pNext,
+                                                          m5_infos[i].flags);
+         if (!pCreateInfos[i].stageCount)
+            continue;
+         memcpy(&m5_stages[s], pCreateInfos[i].pStages,
+                pCreateInfos[i].stageCount * sizeof(*m5_stages));
+         m5_infos[i].pStages = &m5_stages[s];
+         for (uint32_t j = 0; j < pCreateInfos[i].stageCount && m5_result == VK_SUCCESS; j++)
+            m5_result = wrapper_lower_inline_shader_stage(device, &m5_stages[s + j],
+                                                          m5_modules, &m5_module_count);
+         s += pCreateInfos[i].stageCount;
+      }
+
+      if (m5_result != VK_SUCCESS) {
+         wrapper_destroy_lowered_modules(device, m5_modules, m5_module_count);
+         free(m5_infos);
+         free(m5_stages);
+         for (uint32_t i = 0; i < createInfoCount; i++)
+            pPipelines[i] = VK_NULL_HANDLE;
+         return m5_result;
+      }
+
+      pCreateInfos = m5_infos;
+      driver_infos = m5_infos;
+   }
 
    if (wrapper_lowers_core13(device) &&
        !device->dispatch_table.CmdBeginRendering && createInfoCount) {
@@ -3278,6 +3424,11 @@ wrapper_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
       if (!legacy || !render_passes) {
          free(legacy);
          free(render_passes);
+         if (m5_infos) {
+            wrapper_destroy_lowered_modules(device, m5_modules, m5_module_count);
+            free(m5_infos);
+            free(m5_stages);
+         }
          return VK_ERROR_OUT_OF_HOST_MEMORY;
       }
       memcpy(legacy, pCreateInfos, createInfoCount * sizeof(*legacy));
@@ -3299,6 +3450,11 @@ wrapper_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
                      device->dispatch_handle, render_passes[j], NULL);
             free(legacy);
             free(render_passes);
+            if (m5_infos) {
+               wrapper_destroy_lowered_modules(device, m5_modules, m5_module_count);
+               free(m5_infos);
+               free(m5_stages);
+            }
             return rp_result;
          }
          legacy[i].renderPass = render_passes[i];
@@ -3347,6 +3503,11 @@ wrapper_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
    }
    free(legacy);
    free(render_passes);
+   if (m5_infos) {
+      wrapper_destroy_lowered_modules(device, m5_modules, m5_module_count);
+      free(m5_infos);
+      free(m5_stages);
+   }
    WRAPPER_LOG(info, "CreateGraphicsPipelines result %d", result);
    return result;
 }

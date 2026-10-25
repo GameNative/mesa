@@ -415,6 +415,19 @@ VkResult enumerate_physical_device(struct vk_instance *_instance)
          if (is_d3d && !pdevice->base_supported_extensions.KHR_maintenance5) {
             WRAPPER_LOG(info, "Faking VK_KHR_maintenance5 (base driver lacks it)");
             pdevice->vk.supported_extensions.KHR_maintenance5 = true;
+            if (strstr(engine_name, "DXVK"))
+               supported_features->maintenance5 = true;
+         }
+      }
+
+      if (strstr(engine_name, "DXVK") && engine_version >= VK_MAKE_VERSION(2, 7, 0)) {
+         if (!pdevice->base_supported_extensions.KHR_pipeline_library) {
+            WRAPPER_LOG(info, "Faking VK_KHR_pipeline_library (base driver lacks it)");
+            pdevice->vk.supported_extensions.KHR_pipeline_library = true;
+         }
+         if (!pdevice->base_supported_features.shaderInt64) {
+            WRAPPER_LOG(info, "Faking shaderInt64 (base driver lacks it)");
+            supported_features->shaderInt64 = true;
          }
       }
 
