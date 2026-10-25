@@ -3408,6 +3408,18 @@ wrapper_lowers_maintenance5(const struct wrapper_device *device)
           !device->physical->base_supported_extensions.KHR_maintenance5;
 }
 
+static bool
+wrapper_patches_spirv(const struct wrapper_device *device)
+{
+   return device->physical->driver_properties.driverID == VK_DRIVER_ID_ARM_PROPRIETARY;
+}
+
+static bool
+wrapper_lowers_inline_shaders(const struct wrapper_device *device)
+{
+   return wrapper_lowers_maintenance5(device) || wrapper_patches_spirv(device);
+}
+
 static VkPipelineCreateFlags
 wrapper_fold_pipeline_flags2(const void **pNext, VkPipelineCreateFlags flags)
 {
@@ -3466,7 +3478,7 @@ wrapper_CreateComputePipelines(VkDevice _device, VkPipelineCache pipelineCache,
 {
    VK_FROM_HANDLE(wrapper_device, device, _device);
 
-   if (!wrapper_lowers_maintenance5(device) || !createInfoCount)
+   if (!wrapper_lowers_inline_shaders(device) || !createInfoCount)
       return device->dispatch_table.CreateComputePipelines(device->dispatch_handle,
          pipelineCache, createInfoCount, pCreateInfos, pAllocator, pPipelines);
 
@@ -3483,7 +3495,8 @@ wrapper_CreateComputePipelines(VkDevice _device, VkPipelineCache pipelineCache,
 
    memcpy(infos, pCreateInfos, createInfoCount * sizeof(*infos));
    for (uint32_t i = 0; i < createInfoCount && result == VK_SUCCESS; i++) {
-      infos[i].flags = wrapper_fold_pipeline_flags2(&infos[i].pNext, infos[i].flags);
+      if (wrapper_lowers_maintenance5(device))
+         infos[i].flags = wrapper_fold_pipeline_flags2(&infos[i].pNext, infos[i].flags);
       result = wrapper_lower_inline_shader_stage(device, &infos[i].stage,
                                                  modules, &module_count);
    }
@@ -3516,7 +3529,7 @@ wrapper_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
    VkShaderModule *m5_modules = NULL;
    uint32_t m5_module_count = 0;
 
-   if (wrapper_lowers_maintenance5(device) && createInfoCount) {
+   if (wrapper_lowers_inline_shaders(device) && createInfoCount) {
       uint32_t stage_count = 0;
       for (uint32_t i = 0; i < createInfoCount; i++)
          stage_count += pCreateInfos[i].stageCount;
@@ -3535,8 +3548,9 @@ wrapper_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
       VkResult m5_result = VK_SUCCESS;
       uint32_t s = 0;
       for (uint32_t i = 0; i < createInfoCount; i++) {
-         m5_infos[i].flags = wrapper_fold_pipeline_flags2(&m5_infos[i].pNext,
-                                                          m5_infos[i].flags);
+         if (wrapper_lowers_maintenance5(device))
+            m5_infos[i].flags = wrapper_fold_pipeline_flags2(&m5_infos[i].pNext,
+                                                             m5_infos[i].flags);
          if (!pCreateInfos[i].stageCount)
             continue;
          memcpy(&m5_stages[s], pCreateInfos[i].pStages,
