@@ -322,7 +322,16 @@ bcn_astc_hint(VkFormat format, const uint8_t *blk, struct astc_hint *h)
       h->dual_ccs = 3;
       h->dual_wq = W(1) | W(2);
       if (h->alpha && bcn_bc1_clear_mask(blk)) {
-         h->masks[h->nmasks++] = bcn_bc1_clear_mask(blk);
+         uint16_t clear = bcn_bc1_clear_mask(blk);
+         h->masks[h->nmasks++] = clear;
+         for (int k = 0; k < 3; k++) {
+            uint16_t m = clear;
+            for (int i = 0; i < 16; i++)
+               if (((blk[4 + i / 4] >> ((i & 3) * 2)) & 3) == k)
+                  m |= 1 << i;
+            if (m != clear && m != 0xffff)
+               h->masks[h->nmasks++] = m;
+         }
          h->clear = 1;
          h->part_wq = W(1) | W(2);
       }

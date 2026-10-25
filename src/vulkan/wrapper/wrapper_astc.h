@@ -1057,7 +1057,7 @@ struct astc_hint {
    int dual_ccs;
    int seed3;
    int nmasks, clear;
-   uint16_t masks[3];
+   uint16_t masks[4];
    uint16_t single_wq, dual_wq, part_wq;
 };
 
@@ -1487,7 +1487,7 @@ astc_encode_4x4_search(const uint8_t tex[64], const struct astc_hint *h, uint8_t
             ASTC_TRY(1, 0, dcem, 1, h->dual_ccs, wq, -1);
    }
    for (int m = 0; m < h->nmasks && best_err > ASTC_GOOD; m++) {
-      int seeds[4], n = astc_seeds_for_mask(h->masks[m], seeds, h->nmasks > 1 ? 2 : 4);
+      int seeds[4], n = astc_seeds_for_mask(h->masks[m], seeds, h->clear || h->nmasks == 1 ? 4 : 2);
       for (int k = 0; k < n; k++)
          for (int wq = 0; wq < 12; wq++) {
             if (!((h->part_wq >> wq) & 1))
