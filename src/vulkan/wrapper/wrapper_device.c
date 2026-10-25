@@ -6,6 +6,7 @@
 #include "wrapper_private.h"
 #include "wrapper_log.h"
 #include "wrapper_bcdec.h"
+#include "wrapper_bcn_gpu.h"
 #include "wrapper_bcn_spv.h"
 #include "spirv_patcher.hpp"
 #include "wrapper_entrypoints.h"
@@ -1240,6 +1241,20 @@ wrapper_CreateDevice(VkPhysicalDevice physicalDevice,
    if (enable_device_fault)
       wrapper_enable_extensions[wrapper_enable_extension_count++] = "VK_EXT_device_fault";
 
+   /* The BCn decode/encode shaders address their buffers by device address. */
+   const bool base12 = physical_device->properties2.properties.apiVersion >= VK_API_VERSION_1_2;
+   const bool bcn_bda = physical_device->emulate_bcn > 1 &&
+      physical_device->base_supported_features.bufferDeviceAddress &&
+      (base12 || physical_device->base_supported_extensions.KHR_buffer_device_address);
+   if (bcn_bda && !base12) {
+      bool listed = false;
+      for (uint32_t i = 0; i < wrapper_enable_extension_count; i++)
+         listed |= !strcmp(wrapper_enable_extensions[i], "VK_KHR_buffer_device_address");
+      if (!listed)
+         wrapper_enable_extensions[wrapper_enable_extension_count++] =
+            "VK_KHR_buffer_device_address";
+   }
+
    /* Policy bc6h=4x4: BC6H is stored as ASTC 4x4 HDR when the base driver has
     * textureCompressionASTC_HDR (core 1.3 or the EXT). */
    const bool base13 = physical_device->properties2.properties.apiVersion >= VK_API_VERSION_1_3;
@@ -1313,6 +1328,25 @@ if (pdf2 && pdf2->features.f) { \
       else {
          astc_hdr_features.pNext = (void *)wrapper_create_info.pNext;
          wrapper_create_info.pNext = &astc_hdr_features;
+      }
+   }
+
+   VkPhysicalDeviceBufferDeviceAddressFeatures bda_features = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES,
+      .bufferDeviceAddress = VK_TRUE,
+   };
+   if (bcn_bda) {
+      VkPhysicalDeviceVulkan12Features *v12 = (void *)vk_find_struct_const(
+         wrapper_create_info.pNext, PHYSICAL_DEVICE_VULKAN_1_2_FEATURES);
+      VkPhysicalDeviceBufferDeviceAddressFeatures *bf = (void *)vk_find_struct_const(
+         wrapper_create_info.pNext, PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES);
+      if (v12)
+         v12->bufferDeviceAddress = VK_TRUE;
+      else if (bf)
+         bf->bufferDeviceAddress = VK_TRUE;
+      else {
+         bda_features.pNext = (void *)wrapper_create_info.pNext;
+         wrapper_create_info.pNext = &bda_features;
       }
    }
 
@@ -1452,6 +1486,7 @@ if (pdf2 && pdf2->features.f) { \
          wrapper_device_trampolines.FreeMemory;
    }
 
+   device->bcn_bda = bcn_bda && !used_fallback_create;
    bcn_set_astc_hdr(bc6h_hdr && !used_fallback_create);
    if (physical_device->emulate_bcn > 1) {
       char storage[512];
@@ -2855,9 +2890,13 @@ wrapper_bcn_transients_free(struct wrapper_command_buffer *wcb)
          device->bcn_gpu_inflight -= wb->bcn_inflight;
          simple_mtx_unlock(&device->bcn_gpu_mutex);
       }
-      device->dispatch_table.DestroyBuffer(device->dispatch_handle,
-         wb->dispatch_handle, NULL);
-      device->dispatch_table.FreeMemory(device->dispatch_handle, wb->memory, NULL);
+      if (wb->dispatch_handle)
+         device->dispatch_table.DestroyBuffer(device->dispatch_handle,
+            wb->dispatch_handle, NULL);
+      if (wb->bcn_image)
+         device->dispatch_table.DestroyImage(device->dispatch_handle, wb->bcn_image, NULL);
+      if (wb->memory)
+         device->dispatch_table.FreeMemory(device->dispatch_handle, wb->memory, NULL);
       list_del(&wb->link);
       vk_object_free(&device->vk, &device->vk.alloc, wb);
    }
@@ -2871,6 +2910,7 @@ wrapper_BeginCommandBuffer(VkCommandBuffer commandBuffer,
    wrapper_dynamic_render_objects_reset(wcb);
    wrapper_stride_reset(wcb);
    wrapper_bcn_transients_free(wcb);
+   wrapper_cmd_track_reset(wcb);
    if (wcb->device->emulate_push_descriptor)
       wrapper_push_pool_reset_all(wcb);
    VkResult begin_result =
@@ -2888,6 +2928,18 @@ wrapper_BeginCommandBuffer(VkCommandBuffer commandBuffer,
          0, 1, &barrier, 0, NULL, 0, NULL);
    }
    return begin_result;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wrapper_CmdPushConstants(VkCommandBuffer commandBuffer, VkPipelineLayout layout,
+                         VkShaderStageFlags stageFlags, uint32_t offset,
+                         uint32_t size, const void *pValues)
+{
+   VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   if (wcb->device->bcn_bda)
+      wrapper_cmd_track_push(wcb, layout, stageFlags, offset, size, pValues);
+   wcb->device->dispatch_table.CmdPushConstants(wcb->dispatch_handle, layout,
+      stageFlags, offset, size, pValues);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -3830,6 +3882,7 @@ wrapper_ResetCommandBuffer(VkCommandBuffer commandBuffer,
    wrapper_dynamic_render_objects_reset(wcb);
    wrapper_stride_reset(wcb);
    wrapper_bcn_transients_free(wcb);
+   wrapper_cmd_track_reset(wcb);
    if (wcb->device->emulate_push_descriptor)
       wrapper_push_pool_reset_all(wcb);
    return wcb->device->dispatch_table.ResetCommandBuffer(wcb->dispatch_handle,
@@ -4350,6 +4403,8 @@ wrapper_CmdBindPipeline(VkCommandBuffer commandBuffer,
                         VkPipelineBindPoint pipelineBindPoint, VkPipeline pipeline)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   if (wcb->device->bcn_bda)
+      wrapper_cmd_track_pipeline(wcb, pipelineBindPoint, pipeline);
    if (wcb->device->emulate_dynamic_stride &&
        pipelineBindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS)
       wrapper_stride_bind(wcb, pipeline);
@@ -5436,6 +5491,35 @@ wrapper_CmdWaitEvents2(VkCommandBuffer commandBuffer, uint32_t eventCount,
    free(capped);
 }
 
+/* Regions of a copy with an emulated BC image on either side that the BCn
+ * emulation recorded itself; keep[i] is set for the ones left to the driver.
+ * Returns how many are left. */
+static uint32_t
+wrapper_bcn_copy_image(struct wrapper_command_buffer *wcb, VkImage srcImage,
+                       VkImageLayout srcLayout, VkImage dstImage,
+                       VkImageLayout dstLayout, uint32_t count,
+                       const VkImageCopy *regions, bool *keep)
+{
+   struct wrapper_device *device = wcb->device;
+   for (uint32_t i = 0; i < count; i++)
+      keep[i] = true;
+   struct wrapper_image *src = get_wrapper_image_from_handle(device, srcImage);
+   struct wrapper_image *dst = get_wrapper_image_from_handle(device, dstImage);
+   if (!src || !dst || src->mip_drop || dst->mip_drop)
+      return count;
+   bool src_emu = is_emulated_bcn(device->physical, src->info.format);
+   bool dst_emu = is_emulated_bcn(device->physical, dst->info.format);
+   if (!src_emu && !dst_emu)
+      return count;
+   uint32_t left = 0;
+   for (uint32_t i = 0; i < count; i++) {
+      keep[i] = !wrapper_bcn_gpu_copy_image_region(wcb, src, src_emu, srcLayout,
+                                                   dst, dst_emu, dstLayout, &regions[i]);
+      left += keep[i];
+   }
+   return left;
+}
+
 VKAPI_ATTR void VKAPI_CALL
 wrapper_CmdCopyImage(VkCommandBuffer commandBuffer,
                      VkImage srcImage, VkImageLayout srcImageLayout,
@@ -5464,6 +5548,23 @@ wrapper_CmdCopyImage(VkCommandBuffer commandBuffer,
       }
       regionCount = n;
       pRegions = capped;
+   }
+
+   if (!src_drop && !dst_drop && device->physical->emulate_bcn > 1 && regionCount) {
+      bool keep[regionCount];
+      uint32_t left = wrapper_bcn_copy_image(wcb, srcImage, srcImageLayout, dstImage,
+         dstImageLayout, regionCount, pRegions, keep);
+      if (left < regionCount) {
+         VkImageCopy rest[left ? left : 1];
+         uint32_t n = 0;
+         for (uint32_t i = 0; i < regionCount; i++)
+            if (keep[i])
+               rest[n++] = pRegions[i];
+         if (n)
+            device->dispatch_table.CmdCopyImage(wcb->dispatch_handle, srcImage,
+               srcImageLayout, dstImage, dstImageLayout, n, rest);
+         return;
+      }
    }
 
    device->dispatch_table.CmdCopyImage(wcb->dispatch_handle, srcImage,
@@ -5501,6 +5602,38 @@ wrapper_CmdCopyImage2(VkCommandBuffer commandBuffer,
       capped_info.regionCount = n;
       capped_info.pRegions = capped;
       pCopyImageInfo = &capped_info;
+   }
+
+   if (!src_drop && !dst_drop && device->physical->emulate_bcn > 1 && count) {
+      VkImageCopy regions[count];
+      bool keep[count];
+      for (uint32_t i = 0; i < count; i++) {
+         const VkImageCopy2 *r = &pCopyImageInfo->pRegions[i];
+         regions[i] = (VkImageCopy){
+            .srcSubresource = r->srcSubresource,
+            .srcOffset = r->srcOffset,
+            .dstSubresource = r->dstSubresource,
+            .dstOffset = r->dstOffset,
+            .extent = r->extent,
+         };
+      }
+      uint32_t left = wrapper_bcn_copy_image(wcb, pCopyImageInfo->srcImage,
+         pCopyImageInfo->srcImageLayout, pCopyImageInfo->dstImage,
+         pCopyImageInfo->dstImageLayout, count, regions, keep);
+      if (left < count) {
+         VkImageCopy2 rest[left ? left : 1];
+         uint32_t n = 0;
+         for (uint32_t i = 0; i < count; i++)
+            if (keep[i])
+               rest[n++] = pCopyImageInfo->pRegions[i];
+         if (n) {
+            VkCopyImageInfo2 info = *pCopyImageInfo;
+            info.regionCount = n;
+            info.pRegions = rest;
+            device->dispatch_table.CmdCopyImage2(wcb->dispatch_handle, &info);
+         }
+         return;
+      }
    }
 
    device->dispatch_table.CmdCopyImage2(wcb->dispatch_handle, pCopyImageInfo);
@@ -5571,6 +5704,13 @@ wrapper_CmdCopyImageToBuffer(VkCommandBuffer commandBuffer, VkImage srcImage,
    VkBufferImageCopy stack[WRAPPER_CAP_STACK_ENTRIES];
    VkBufferImageCopy *capped = NULL;
 
+   if (!mip_drop && device->physical->emulate_bcn > 1) {
+      struct wrapper_image *wi = get_wrapper_image_from_handle(device, srcImage);
+      if (wi && is_emulated_bcn(device->physical, wi->info.format) &&
+          wrapper_bcn_gpu_readback(wcb, wi, srcImageLayout, dstBuffer, regionCount, pRegions))
+         return;
+   }
+
    if (mip_drop && (capped = wrapper_cap_alloc(stack, sizeof(*capped), regionCount))) {
       for (uint32_t i = 0; i < regionCount; i++) {
          capped[i] = pRegions[i];
@@ -5596,6 +5736,27 @@ wrapper_CmdCopyImageToBuffer2(VkCommandBuffer commandBuffer,
    VkCopyImageToBufferInfo2 capped_info;
    VkBufferImageCopy2 stack[WRAPPER_CAP_STACK_ENTRIES];
    VkBufferImageCopy2 *capped = NULL;
+
+   if (!mip_drop && device->physical->emulate_bcn > 1 && pInfo->regionCount) {
+      struct wrapper_image *wi = get_wrapper_image_from_handle(device, pInfo->srcImage);
+      if (wi && is_emulated_bcn(device->physical, wi->info.format)) {
+         VkBufferImageCopy regions[pInfo->regionCount];
+         for (uint32_t i = 0; i < pInfo->regionCount; i++) {
+            const VkBufferImageCopy2 *r = &pInfo->pRegions[i];
+            regions[i] = (VkBufferImageCopy){
+               .bufferOffset = r->bufferOffset,
+               .bufferRowLength = r->bufferRowLength,
+               .bufferImageHeight = r->bufferImageHeight,
+               .imageSubresource = r->imageSubresource,
+               .imageOffset = r->imageOffset,
+               .imageExtent = r->imageExtent,
+            };
+         }
+         if (wrapper_bcn_gpu_readback(wcb, wi, pInfo->srcImageLayout, pInfo->dstBuffer,
+                                      pInfo->regionCount, regions))
+            return;
+      }
+   }
 
    if (mip_drop && (capped = wrapper_cap_alloc(stack, sizeof(*capped), pInfo->regionCount))) {
       for (uint32_t i = 0; i < pInfo->regionCount; i++) {
@@ -5736,6 +5897,7 @@ wrapper_DestroyDevice(VkDevice _device, const VkAllocationCallbacks* pAllocator)
       vk_free2(&device->vk.alloc, pAllocator, queue);
    }
    if (device->dispatch_handle != VK_NULL_HANDLE) {
+      wrapper_bcn_gpu_finish(device);
       device->dispatch_table.DestroyDevice(device->
          dispatch_handle, pAllocator);
    }
