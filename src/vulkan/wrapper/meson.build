@@ -84,6 +84,7 @@ wrapper_files = files(
   'wrapper_bcdec.c',
   'wrapper_log.c',
   'wrapper_physical_device.c',
+  'wrapper_abort_diag.c',
 )
 
 wrapper_deps = [
