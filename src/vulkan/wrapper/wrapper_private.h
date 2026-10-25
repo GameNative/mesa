@@ -187,7 +187,6 @@ struct wrapper_fence {
 	struct wrapper_device *device;
 	struct list_head link;
 	VkFence dispatch_handle;
-	struct list_head staging_buffers_list;
 };
 
 /* One chunked descriptor pool used to service emulated push-descriptor sets for
@@ -212,6 +211,7 @@ struct wrapper_command_buffer {
    struct wrapper_push_pool *push_pools;   /* emulated push-descriptor pools */
    struct list_head dynamic_render_objects;
    bool dynamic_rendering_active;
+   struct list_head bcn_transients;
 };
 
 VK_DEFINE_HANDLE_CASTS(wrapper_command_buffer, vk.base, VkCommandBuffer,
