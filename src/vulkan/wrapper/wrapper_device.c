@@ -1221,10 +1221,13 @@ wrapper_CreateDevice(VkPhysicalDevice physicalDevice,
 
    /* The BCn decode/encode shaders address their buffers by device address. */
    const bool base12 = physical_device->properties2.properties.apiVersion >= VK_API_VERSION_1_2;
+   /* An application on a Vulkan 1.0/1.1 instance (DXVK 1.10) gets no core 1.2
+    * entry points, so vkGetBufferDeviceAddress comes from the extension. */
+   const bool app12 = physical_device->instance->vk.app_info.api_version >= VK_API_VERSION_1_2;
    const bool bcn_bda = physical_device->emulate_bcn > 1 &&
       physical_device->base_supported_features.bufferDeviceAddress &&
-      (base12 || physical_device->base_supported_extensions.KHR_buffer_device_address);
-   if (bcn_bda && !base12) {
+      ((base12 && app12) || physical_device->base_supported_extensions.KHR_buffer_device_address);
+   if (bcn_bda && !(base12 && app12)) {
       bool listed = false;
       for (uint32_t i = 0; i < wrapper_enable_extension_count; i++)
          listed |= !strcmp(wrapper_enable_extensions[i], "VK_KHR_buffer_device_address");
@@ -1456,17 +1459,20 @@ if (pdf2 && pdf2->features.f) { \
          wrapper_device_trampolines.FreeMemory;
    }
 
-   device->bcn_bda = bcn_bda && !used_fallback_create;
+   device->bcn_bda = bcn_bda && !used_fallback_create &&
+                     device->dispatch_table.GetBufferDeviceAddress;
    bcn_set_astc_hdr(bc6h_hdr && !used_fallback_create);
    if (physical_device->emulate_bcn > 1) {
       char storage[512];
       bcn_describe_storage(storage, sizeof(storage));
       wrapper_diag_append("[BCN] storage %s\n", storage);
-      wrapper_diag_append("[BCN] bufferDeviceAddress: base=%d api=%u.%u requested=%d "
+      wrapper_diag_append("[BCN] bufferDeviceAddress: base=%d api=%u.%u app=%u.%u requested=%d "
                           "fallback=%d\n",
                           physical_device->base_supported_features.bufferDeviceAddress,
                           VK_API_VERSION_MAJOR(physical_device->properties2.properties.apiVersion),
                           VK_API_VERSION_MINOR(physical_device->properties2.properties.apiVersion),
+                          VK_API_VERSION_MAJOR(physical_device->instance->vk.app_info.api_version),
+                          VK_API_VERSION_MINOR(physical_device->instance->vk.app_info.api_version),
                           bcn_bda, used_fallback_create);
       wrapper_bcn_gpu_init(device, pCreateInfo->queueCreateInfoCount ?
          pCreateInfo->pQueueCreateInfos[0].queueFamilyIndex : UINT32_MAX);
