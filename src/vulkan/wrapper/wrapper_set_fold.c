@@ -43,6 +43,7 @@ struct fold_instance {
    uint32_t variable_count;
    VkDescriptorPool pool;
    VkDescriptorSet set;
+   bool truncation_logged;
 };
 
 struct fold_set {
@@ -565,10 +566,11 @@ fold_resolve(struct wrapper_device *device, VkDescriptorSet *set, uint32_t *bind
       return true;
    uint32_t limit = fold_member_limit(fs->instance, fs->member, *binding);
    if (*element >= limit) {
-      static bool warned;
-      if (!warned) {
-         warned = true;
-         WRAPPER_LOG(error, "Folded descriptor access past the fixed array size %u dropped", limit);
+      if (!fs->instance->truncation_logged) {
+         fs->instance->truncation_logged = true;
+         WRAPPER_LOG(error, "Folded heap set %p: descriptor %u of binding %u is above the array size %u; "
+                     "accesses above it are dropped", (void *)(uintptr_t)fs->instance->set,
+                     *element, *binding, limit);
       }
       return false;
    }
