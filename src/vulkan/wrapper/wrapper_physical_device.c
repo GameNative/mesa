@@ -427,7 +427,8 @@ VkResult enumerate_physical_device(struct vk_instance *_instance)
 
       if (pdevice->driver_properties.driverID == VK_DRIVER_ID_IMAGINATION_PROPRIETARY &&
           !strstr(engine_name, "DXVK") && !strstr(engine_name, "vkd3d")) {
-         WRAPPER_LOG(info, "Disabling VK_EXT_extended_dynamic_state3");
+         WRAPPER_LOG(info, "Disabling VK_EXT_extended_dynamic_state and VK_EXT_extended_dynamic_state3");
+         pdevice->vk.supported_extensions.EXT_extended_dynamic_state = false;
          pdevice->vk.supported_extensions.EXT_extended_dynamic_state3 = false;
       }
 
