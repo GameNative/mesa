@@ -438,7 +438,7 @@ float encode_two(uint mode, uint part)
    int bits = mode == 1u ? 6 : 7;
    vec4 chm = vec4(1.0, 1.0, 1.0, 0.0);
    float total = 0.0;
-   for (uint s = 0u; s < 2u; s++) {
+   [[dont_unroll]] for (uint s = 0u; s < 2u; s++) {
       uint sel = subset_mask(part, s);
       vec4 e0, e1;
       fit_line(sel, chm, e0, e1);
@@ -447,14 +447,14 @@ float encode_two(uint mode, uint part)
          float bq = 1e30;
          int q0[3], q1[3], pa = 0, pb = 0;
          ivec3 u0 = ivec3(0), u1 = ivec3(0);
-         for (int a = 0; a < 2; a++)
-            for (int b = 0; b < 2; b++) {
+         [[dont_unroll]] for (int a = 0; a < 2; a++)
+            [[dont_unroll]] for (int b = 0; b < 2; b++) {
                if (mode == 1u && a != b)
                   continue;
                int t0[3], t1[3];
                ivec3 v0, v1;
                float eq = 0.0;
-               for (int c = 0; c < 3; c++) {
+               [[dont_unroll]] for (int c = 0; c < 3; c++) {
                   v0[c] = qbest(e0[c], bits, a, true, t0[c]);
                   v1[c] = qbest(e1[c], bits, b, true, t1[c]);
                   eq += (float(v0[c]) - e0[c]) * (float(v0[c]) - e0[c]) +
@@ -522,7 +522,7 @@ void write_two(uint mode, uint part)
    uint ib = mode == 1u ? 3u : 2u;
    uint bits = mode == 1u ? 6u : 7u;
    uint anchor1 = findMSB(bc7_fix[part] & 0xfffeu);
-   for (uint s = 0u; s < 2u; s++) {
+   [[dont_unroll]] for (uint s = 0u; s < 2u; s++) {
       uint a = s == 0u ? 0u : anchor1;
       if (tidx[a] < (1u << (ib - 1u)))
          continue;
@@ -543,7 +543,7 @@ void write_two(uint mode, uint part)
    opos = 0u;
    wbits(1u << mode, mode + 1u);
    wbits(part, 6u);
-   for (int c = 0; c < 3; c++)
+   [[dont_unroll]] for (int c = 0; c < 3; c++)
       for (uint s = 0u; s < 2u; s++) {
          wbits(uint(tq[s][0][c]), bits);
          wbits(uint(tq[s][1][c]), bits);
@@ -573,7 +573,7 @@ float encode_m5()
    [[dont_unroll]] for (int pass = 0; pass < 2; pass++) {
       int q0[3], q1[3];
       ivec3 u0, u1;
-      for (int c = 0; c < 3; c++) {
+      [[dont_unroll]] for (int c = 0; c < 3; c++) {
          u0[c] = qbest(e0[c], 7, 0, false, q0[c]);
          u1[c] = qbest(e1[c], 7, 0, false, q1[c]);
       }
@@ -703,7 +703,7 @@ void encode_bc7_modes()
             r1 = r; p1 = part;
          }
       }
-      for (uint k = 0u; k < 4u; k++) {
+      [[dont_unroll]] for (uint k = 0u; k < 4u; k++) {
          uint part = k < 2u ? p0 : p1;
          uint mode = (k & 1u) == 0u ? 1u : 3u;
          float e = encode_two(mode, part);
@@ -733,7 +733,7 @@ void encode_bc7()
       int q0[4], q1[4];
       int p0 = 0, p1 = 0;
       float ep0 = 1e30, ep1 = 1e30;
-      for (int p = 0; p < 2; p++) {
+      [[dont_unroll]] for (int p = 0; p < 2; p++) {
          float s0 = 0.0, s1 = 0.0;
          for (int c = 0; c < 4; c++) {
             float v0 = float(clamp(int(round((e0[c] - float(p)) * 0.5)), 0, 127) * 2 + p) - e0[c];
