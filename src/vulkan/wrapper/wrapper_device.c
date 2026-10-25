@@ -4794,6 +4794,28 @@ wrapper_bcn_note_dropped(struct wrapper_device *device, struct wrapper_buffer *w
    simple_mtx_unlock(&device->resource_mutex);
 }
 
+static uint32_t
+wrapper_bcn_region_slices(const VkBufferImageCopy *r)
+{
+   return MAX2(r->imageSubresource.layerCount, 1) * MAX2(r->imageExtent.depth, 1);
+}
+
+static int
+wrapper_bcn_block_bytes(VkFormat format)
+{
+   switch (format) {
+   case VK_FORMAT_BC1_RGB_UNORM_BLOCK:
+   case VK_FORMAT_BC1_RGB_SRGB_BLOCK:
+   case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
+   case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
+   case VK_FORMAT_BC4_UNORM_BLOCK:
+   case VK_FORMAT_BC4_SNORM_BLOCK:
+      return 8;
+   default:
+      return 16;
+   }
+}
+
 /* Mapped host-visible staging buffer for one upload; NULL on failure. */
 static struct wrapper_buffer *
 wrapper_bcn_staging_create(struct wrapper_device *device, VkDeviceSize upload_size)
@@ -4905,7 +4927,9 @@ wrapper_bcn_cpu_copy_regions(struct wrapper_command_buffer *wcb,
       int w = copy_region.imageExtent.width;
       int h = copy_region.imageExtent.height;
       int offset = copy_region.bufferOffset;
-      VkDeviceSize upload_size = bcn_upload_size(format, w, h);
+      uint32_t slices = wrapper_bcn_region_slices(&copy_region);
+      VkDeviceSize slice_size = bcn_upload_size(format, w, h);
+      VkDeviceSize upload_size = slice_size * slices;
 
       struct wrapper_buffer *staging_wb = wrapper_bcn_staging_create(device, upload_size);
       if (!staging_wb) {
@@ -4914,7 +4938,13 @@ wrapper_bcn_cpu_copy_regions(struct wrapper_command_buffer *wcb,
       }
 
       int src_w = copy_region.bufferRowLength ? (int)copy_region.bufferRowLength : w;
-      decompress_bcn_format(wb->mapped_address, staging_wb->mapped_address, w, h, src_w, format, offset);
+      int src_h = copy_region.bufferImageHeight ? (int)copy_region.bufferImageHeight : h;
+      VkDeviceSize src_slice = (VkDeviceSize)((src_w + 3) / 4) * ((src_h + 3) / 4) *
+         wrapper_bcn_block_bytes(format);
+      for (uint32_t s = 0; s < slices; s++)
+         decompress_bcn_format(wb->mapped_address,
+            (char *)staging_wb->mapped_address + s * slice_size, w, h, src_w, format,
+            (int)(offset + s * src_slice));
 
       /* Texture-path diagnostic (part of WRAPPER_DIAG=1): for each BCn CPU upload,
        * record the real parameters (source stride, target format, image tiling/
@@ -5048,8 +5078,14 @@ wrapper_bcn_do_copy_regions(struct wrapper_command_buffer *wcb,
 {
    int fmt_id = wrapper_bcn_gpu_format_id(format);
    if (fmt_id >= 0 && wrapper_bcn_gpu_ready(device)) {
-      wrapper_bcn_gpu_copy_regions(wcb, device, wb, dstImage, dstLayout, format,
-                                   fmt_id, regionCount, pRegions);
+      for (uint32_t i = 0; i < regionCount; i++) {
+         if (wrapper_bcn_region_slices(&pRegions[i]) == 1)
+            wrapper_bcn_gpu_copy_regions(wcb, device, wb, dstImage, dstLayout,
+                                         format, fmt_id, 1, &pRegions[i]);
+         else
+            wrapper_bcn_cpu_copy_regions(wcb, device, wb, dstImage, dstLayout,
+                                         format, 1, &pRegions[i]);
+      }
       return;
    }
    wrapper_bcn_cpu_copy_regions(wcb, device, wb, dstImage, dstLayout, format,
