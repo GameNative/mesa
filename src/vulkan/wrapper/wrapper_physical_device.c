@@ -329,6 +329,14 @@ VkResult enumerate_physical_device(struct vk_instance *_instance)
          wrapper_core13_wanted(pdevice, instance->vk.app_info.engine_name);
       if (pdevice->emulate_vulkan13)
          wrapper_core13_init_physical_device(pdevice);
+      pdevice->fold_sets = pdevice->emulate_vulkan13 &&
+         instance->vk.app_info.engine_name &&
+         strstr(instance->vk.app_info.engine_name, "vkd3d") &&
+         pdevice->properties2.properties.limits.maxBoundDescriptorSets < 8 &&
+         debug_get_bool_option("WRAPPER_FOLD_DESCRIPTOR_SETS", true);
+      if (pdevice->fold_sets)
+         WRAPPER_LOG(info, "Reporting 8 descriptor sets (driver has %u); bindless sets are folded",
+                     pdevice->properties2.properties.limits.maxBoundDescriptorSets);
 
       pdevice->dispatch_table.GetPhysicalDeviceMemoryProperties(
          pdevice->dispatch_handle, &pdevice->memory_properties);
@@ -646,6 +654,8 @@ wrapper_GetPhysicalDeviceProperties(VkPhysicalDevice physicalDevice,
 
    if (api_version > 0)
       pProperties->apiVersion = api_version;
+   if (pdevice->fold_sets)
+      pProperties->limits.maxBoundDescriptorSets = 8;
 
    /* See wrapper_GetPhysicalDeviceProperties2: bump push constant size to the
     * DXVK-required minimum on Xclipse. */
@@ -714,6 +724,8 @@ wrapper_GetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice,
 
    if (api_version > 0)
       pProperties->properties.apiVersion = api_version;
+   if (pdevice->fold_sets)
+      pProperties->properties.limits.maxBoundDescriptorSets = 8;
 
    /* DXVK 2.6+ requires maxPushConstantsSize >= 256 (its unified "push data"
     * model) and skips the adapter otherwise. Xclipse reports less; the RDNA

@@ -619,6 +619,17 @@ wrapper_UpdateDescriptorSets(VkDevice _device, uint32_t descriptorWriteCount,
                              const VkCopyDescriptorSet *pDescriptorCopies)
 {
    VK_FROM_HANDLE(wrapper_device, device, _device);
+   VkWriteDescriptorSet *fold_writes = (VkWriteDescriptorSet *)pDescriptorWrites;
+   VkCopyDescriptorSet *fold_copies = (VkCopyDescriptorSet *)pDescriptorCopies;
+   if (device->fold_sets &&
+       wrapper_fold_remap_updates(device, &descriptorWriteCount, &fold_writes,
+                                  &descriptorCopyCount, &fold_copies)) {
+      wrapper_UpdateDescriptorSets(_device, descriptorWriteCount, fold_writes,
+                                   descriptorCopyCount, fold_copies);
+      free(fold_writes);
+      free(fold_copies);
+      return;
+   }
 
    if (!device->emulate_null_descriptor || descriptorWriteCount == 0) {
       device->dispatch_table.UpdateDescriptorSets(device->dispatch_handle,
@@ -1374,6 +1385,10 @@ if (pdf2 && pdf2->features.f) { \
    if (device->emulate_eds || device->emulate_eds2)
       WRAPPER_LOG(info, "Emulating extended dynamic state%s with pipeline variants",
                   device->emulate_eds ? (device->emulate_eds2 ? " 1 and 2" : " 1") : " 2");
+
+   device->fold_sets = physical_device->fold_sets;
+   if (device->fold_sets)
+      wrapper_fold_init(device);
 
    device->emulate_dynamic_stride = device->emulate_eds ||
       debug_get_bool_option("WRAPPER_EMULATE_DYNAMIC_STRIDE",
@@ -2633,7 +2648,8 @@ wrapper_emulate_push_descriptor(struct wrapper_command_buffer *wcb,
                                 writeCount, writes, 0, NULL);
    free(writes);
 
-   dt->CmdBindDescriptorSets(wcb->dispatch_handle, bindPoint, layout, set,
+   dt->CmdBindDescriptorSets(wcb->dispatch_handle, bindPoint, layout,
+                             device->fold_sets ? wrapper_fold_set_index(device, layout, set) : set,
                              1, &dset, 0, NULL);
 }
 
@@ -2690,7 +2706,8 @@ wrapper_emulate_push_descriptor_template(struct wrapper_command_buffer *wcb,
       dt->UpdateDescriptorSetWithTemplate ? dt->UpdateDescriptorSetWithTemplate
                                           : dt->UpdateDescriptorSetWithTemplateKHR;
    upd(device->dispatch_handle, dset, tpl_handle, pData);
-   dt->CmdBindDescriptorSets(wcb->dispatch_handle, bp, layout, set,
+   dt->CmdBindDescriptorSets(wcb->dispatch_handle, bp, layout,
+                             device->fold_sets ? wrapper_fold_set_index(device, layout, set) : set,
                              1, &dset, 0, NULL);
 }
 
@@ -2710,11 +2727,31 @@ wrapper_CmdPushDescriptorSetWithTemplateKHR(VkCommandBuffer commandBuffer,
                                             layout, set, pData);
 }
 
+static VkResult
+wrapper_create_descriptor_set_layout(VkDevice _device,
+                                     const VkDescriptorSetLayoutCreateInfo *pCreateInfo,
+                                     const VkAllocationCallbacks *pAllocator,
+                                     VkDescriptorSetLayout *pSetLayout);
+
 VKAPI_ATTR VkResult VKAPI_CALL
 wrapper_CreateDescriptorSetLayout(VkDevice _device,
                                  const VkDescriptorSetLayoutCreateInfo *pCreateInfo,
                                  const VkAllocationCallbacks *pAllocator,
                                  VkDescriptorSetLayout *pSetLayout)
+{
+   VK_FROM_HANDLE(wrapper_device, device, _device);
+   VkResult r = wrapper_create_descriptor_set_layout(_device, pCreateInfo, pAllocator,
+                                                     pSetLayout);
+   if (r == VK_SUCCESS && device->fold_sets)
+      wrapper_fold_note_layout(device, pCreateInfo, *pSetLayout);
+   return r;
+}
+
+static VkResult
+wrapper_create_descriptor_set_layout(VkDevice _device,
+                                     const VkDescriptorSetLayoutCreateInfo *pCreateInfo,
+                                     const VkAllocationCallbacks *pAllocator,
+                                     VkDescriptorSetLayout *pSetLayout)
 {
    VK_FROM_HANDLE(wrapper_device, device, _device);
    const struct vk_device_dispatch_table *dt = &device->dispatch_table;
@@ -2789,8 +2826,12 @@ wrapper_CreatePipelineLayout(VkDevice _device,
                             VkPipelineLayout *pPipelineLayout)
 {
    VK_FROM_HANDLE(wrapper_device, device, _device);
-   VkResult r = device->dispatch_table.CreatePipelineLayout(
-      device->dispatch_handle, pCreateInfo, pAllocator, pPipelineLayout);
+   VkResult r;
+   if (!device->fold_sets ||
+       !wrapper_fold_create_pipeline_layout(device, pCreateInfo, pAllocator,
+                                            pPipelineLayout, &r))
+      r = device->dispatch_table.CreatePipelineLayout(
+         device->dispatch_handle, pCreateInfo, pAllocator, pPipelineLayout);
    if (r != VK_SUCCESS || !device->emulate_push_descriptor)
       return r;
 
@@ -2829,8 +2870,91 @@ wrapper_DestroyPipelineLayout(VkDevice _device, VkPipelineLayout pipelineLayout,
       }
       simple_mtx_unlock(&device->push_mutex);
    }
+   if (device->fold_sets && pipelineLayout)
+      wrapper_fold_destroy_pipeline_layout(device, pipelineLayout);
    device->dispatch_table.DestroyPipelineLayout(device->dispatch_handle,
       pipelineLayout, pAllocator);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+wrapper_CreateDescriptorPool(VkDevice _device, const VkDescriptorPoolCreateInfo *pCreateInfo,
+                             const VkAllocationCallbacks *pAllocator,
+                             VkDescriptorPool *pDescriptorPool)
+{
+   VK_FROM_HANDLE(wrapper_device, device, _device);
+   if (device->fold_sets)
+      wrapper_fold_note_pool(device, pCreateInfo);
+   return device->dispatch_table.CreateDescriptorPool(device->dispatch_handle, pCreateInfo,
+                                                      pAllocator, pDescriptorPool);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wrapper_DestroyDescriptorPool(VkDevice _device, VkDescriptorPool descriptorPool,
+                              const VkAllocationCallbacks *pAllocator)
+{
+   VK_FROM_HANDLE(wrapper_device, device, _device);
+   if (device->fold_sets && descriptorPool)
+      wrapper_fold_reset_pool(device, descriptorPool, true);
+   device->dispatch_table.DestroyDescriptorPool(device->dispatch_handle, descriptorPool,
+                                                pAllocator);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+wrapper_ResetDescriptorPool(VkDevice _device, VkDescriptorPool descriptorPool,
+                            VkDescriptorPoolResetFlags flags)
+{
+   VK_FROM_HANDLE(wrapper_device, device, _device);
+   if (device->fold_sets)
+      wrapper_fold_reset_pool(device, descriptorPool, false);
+   return device->dispatch_table.ResetDescriptorPool(device->dispatch_handle, descriptorPool,
+                                                     flags);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+wrapper_AllocateDescriptorSets(VkDevice _device, const VkDescriptorSetAllocateInfo *pAllocateInfo,
+                               VkDescriptorSet *pDescriptorSets)
+{
+   VK_FROM_HANDLE(wrapper_device, device, _device);
+   VkResult r;
+   if (device->fold_sets && wrapper_fold_allocate(device, pAllocateInfo, pDescriptorSets, &r))
+      return r;
+   return device->dispatch_table.AllocateDescriptorSets(device->dispatch_handle, pAllocateInfo,
+                                                        pDescriptorSets);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+wrapper_FreeDescriptorSets(VkDevice _device, VkDescriptorPool descriptorPool,
+                           uint32_t descriptorSetCount, const VkDescriptorSet *pDescriptorSets)
+{
+   VK_FROM_HANDLE(wrapper_device, device, _device);
+   if (!device->fold_sets)
+      return device->dispatch_table.FreeDescriptorSets(device->dispatch_handle, descriptorPool,
+                                                       descriptorSetCount, pDescriptorSets);
+   VkDescriptorSet *real = malloc(MAX2(descriptorSetCount, 1) * sizeof(*real));
+   if (!real)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   uint32_t n = wrapper_fold_free_sets(device, descriptorSetCount, pDescriptorSets, real);
+   VkResult r = n ? device->dispatch_table.FreeDescriptorSets(device->dispatch_handle,
+                                                              descriptorPool, n, real)
+                  : VK_SUCCESS;
+   free(real);
+   return r;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wrapper_CmdBindDescriptorSets(VkCommandBuffer commandBuffer, VkPipelineBindPoint pipelineBindPoint,
+                              VkPipelineLayout layout, uint32_t firstSet,
+                              uint32_t descriptorSetCount, const VkDescriptorSet *pDescriptorSets,
+                              uint32_t dynamicOffsetCount, const uint32_t *pDynamicOffsets)
+{
+   VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   if (wcb->device->fold_sets &&
+       wrapper_fold_bind(wcb, pipelineBindPoint, layout, firstSet, descriptorSetCount,
+                         pDescriptorSets, dynamicOffsetCount, pDynamicOffsets))
+      return;
+   wcb->device->dispatch_table.CmdBindDescriptorSets(wcb->dispatch_handle, pipelineBindPoint,
+      layout, firstSet, descriptorSetCount, pDescriptorSets, dynamicOffsetCount,
+      pDynamicOffsets);
 }
 
 static VkResult
@@ -3611,6 +3735,51 @@ wrapper_destroy_lowered_modules(struct wrapper_device *device,
    free(modules);
 }
 
+static VkResult
+wrapper_fold_remap_stages(struct wrapper_device *device, VkPipelineLayout layout,
+                          VkPipelineShaderStageCreateInfo *stages, uint32_t count,
+                          VkShaderModule *modules, uint32_t *module_count)
+{
+   for (uint32_t i = 0; i < count; i++) {
+      size_t size = 0;
+      uint32_t *code = wrapper_stride_module_code(device, stages[i].module, &size);
+      if (!code) {
+         WRAPPER_LOG(error, "Folded pipeline layout: no SPIR-V recorded for a shader module");
+         return VK_ERROR_INITIALIZATION_FAILED;
+      }
+      uint32_t *remapped = wrapper_fold_remap_spirv(device, layout, code, size / 4);
+      free(code);
+      if (!remapped)
+         return VK_ERROR_OUT_OF_HOST_MEMORY;
+      VkShaderModuleCreateInfo mi = {
+         .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+         .codeSize = size,
+         .pCode = remapped,
+      };
+      VkShaderModule module;
+      VkResult r = device->dispatch_table.CreateShaderModule(device->dispatch_handle, &mi,
+                                                             NULL, &module);
+      if (r == VK_SUCCESS)
+         wrapper_stride_note_module(device, module, remapped, size);
+      free(remapped);
+      if (r != VK_SUCCESS)
+         return r;
+      modules[(*module_count)++] = module;
+      stages[i].module = module;
+   }
+   return VK_SUCCESS;
+}
+
+static void
+wrapper_fold_destroy_modules(struct wrapper_device *device, VkShaderModule *modules,
+                             uint32_t count)
+{
+   for (uint32_t i = 0; i < count; i++) {
+      wrapper_stride_forget_module(device, modules[i]);
+      device->dispatch_table.DestroyShaderModule(device->dispatch_handle, modules[i], NULL);
+   }
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 wrapper_CreateComputePipelines(VkDevice _device, VkPipelineCache pipelineCache,
                                uint32_t createInfoCount,
@@ -3620,7 +3789,11 @@ wrapper_CreateComputePipelines(VkDevice _device, VkPipelineCache pipelineCache,
 {
    VK_FROM_HANDLE(wrapper_device, device, _device);
 
-   if (!wrapper_lowers_maintenance5(device) || !createInfoCount)
+   bool fold = false;
+   for (uint32_t i = 0; device->fold_sets && i < createInfoCount; i++)
+      fold |= wrapper_fold_layout_folded(device, pCreateInfos[i].layout);
+
+   if ((!wrapper_lowers_maintenance5(device) && !fold) || !createInfoCount)
       return device->dispatch_table.CreateComputePipelines(device->dispatch_handle,
          pipelineCache, createInfoCount, pCreateInfos, pAllocator, pPipelines);
 
@@ -3635,11 +3808,19 @@ wrapper_CreateComputePipelines(VkDevice _device, VkPipelineCache pipelineCache,
       return VK_ERROR_OUT_OF_HOST_MEMORY;
    }
 
+   VkShaderModule *fold_modules = malloc(createInfoCount * sizeof(*fold_modules));
+   uint32_t fold_module_count = 0;
    memcpy(infos, pCreateInfos, createInfoCount * sizeof(*infos));
    for (uint32_t i = 0; i < createInfoCount && result == VK_SUCCESS; i++) {
-      infos[i].flags = wrapper_fold_pipeline_flags2(&infos[i].pNext, infos[i].flags);
-      result = wrapper_lower_inline_shader_stage(device, &infos[i].stage,
-                                                 modules, &module_count);
+      if (wrapper_lowers_maintenance5(device)) {
+         infos[i].flags = wrapper_fold_pipeline_flags2(&infos[i].pNext, infos[i].flags);
+         result = wrapper_lower_inline_shader_stage(device, &infos[i].stage,
+                                                    modules, &module_count);
+      }
+      if (result == VK_SUCCESS && fold && fold_modules &&
+          wrapper_fold_layout_folded(device, infos[i].layout))
+         result = wrapper_fold_remap_stages(device, infos[i].layout, &infos[i].stage, 1,
+                                            fold_modules, &fold_module_count);
    }
 
    if (result == VK_SUCCESS)
@@ -3650,6 +3831,9 @@ wrapper_CreateComputePipelines(VkDevice _device, VkPipelineCache pipelineCache,
          pPipelines[i] = VK_NULL_HANDLE;
 
    wrapper_destroy_lowered_modules(device, modules, module_count);
+   if (fold_modules)
+      wrapper_fold_destroy_modules(device, fold_modules, fold_module_count);
+   free(fold_modules);
    free(infos);
    return result;
 }
@@ -3714,6 +3898,56 @@ wrapper_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
 
       pCreateInfos = m5_infos;
       driver_infos = m5_infos;
+   }
+
+   VkGraphicsPipelineCreateInfo *fold_infos = NULL;
+   VkPipelineShaderStageCreateInfo *fold_stages = NULL;
+   VkShaderModule *fold_modules = NULL;
+   uint32_t fold_module_count = 0;
+   bool fold = false;
+   for (uint32_t i = 0; device->fold_sets && i < createInfoCount; i++)
+      fold |= wrapper_fold_layout_folded(device, pCreateInfos[i].layout);
+   if (fold) {
+      uint32_t stage_total = 0;
+      for (uint32_t i = 0; i < createInfoCount; i++)
+         stage_total += pCreateInfos[i].stageCount;
+      fold_infos = malloc(createInfoCount * sizeof(*fold_infos));
+      fold_stages = malloc(MAX2(stage_total, 1) * sizeof(*fold_stages));
+      fold_modules = malloc(MAX2(stage_total, 1) * sizeof(*fold_modules));
+      VkResult fr = (fold_infos && fold_stages && fold_modules) ? VK_SUCCESS
+                                                                : VK_ERROR_OUT_OF_HOST_MEMORY;
+      if (fr == VK_SUCCESS) {
+         memcpy(fold_infos, pCreateInfos, createInfoCount * sizeof(*fold_infos));
+         uint32_t at = 0;
+         for (uint32_t i = 0; i < createInfoCount && fr == VK_SUCCESS; i++) {
+            if (!wrapper_fold_layout_folded(device, fold_infos[i].layout))
+               continue;
+            memcpy(&fold_stages[at], fold_infos[i].pStages,
+                   fold_infos[i].stageCount * sizeof(*fold_stages));
+            fr = wrapper_fold_remap_stages(device, fold_infos[i].layout, &fold_stages[at],
+                                           fold_infos[i].stageCount, fold_modules,
+                                           &fold_module_count);
+            fold_infos[i].pStages = &fold_stages[at];
+            at += fold_infos[i].stageCount;
+         }
+      }
+      if (fr != VK_SUCCESS) {
+         if (fold_modules)
+            wrapper_fold_destroy_modules(device, fold_modules, fold_module_count);
+         free(fold_infos);
+         free(fold_stages);
+         free(fold_modules);
+         for (uint32_t i = 0; i < createInfoCount; i++)
+            pPipelines[i] = VK_NULL_HANDLE;
+         if (m5_infos) {
+            wrapper_destroy_lowered_modules(device, m5_modules, m5_module_count);
+            free(m5_infos);
+            free(m5_stages);
+         }
+         return fr;
+      }
+      pCreateInfos = fold_infos;
+      driver_infos = fold_infos;
    }
 
    if (wrapper_lowers_core13(device) &&
@@ -3838,6 +4072,11 @@ wrapper_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
    free(legacy);
    free(render_passes);
    ralloc_free(chain_mem);
+   if (fold_modules)
+      wrapper_fold_destroy_modules(device, fold_modules, fold_module_count);
+   free(fold_infos);
+   free(fold_stages);
+   free(fold_modules);
    if (m5_infos) {
       wrapper_destroy_lowered_modules(device, m5_modules, m5_module_count);
       free(m5_infos);
@@ -4590,7 +4829,8 @@ wrapper_CreateShaderModule(VkDevice _device,
    VkResult result = device->dispatch_table.CreateShaderModule(
       device->dispatch_handle, &create_info, pAllocator, pShaderModule);
    if (result == VK_SUCCESS &&
-       (wrapper_uses_variants(device) || device->emulate_vertex_divisor))
+       (wrapper_uses_variants(device) || device->emulate_vertex_divisor ||
+        device->fold_sets))
       wrapper_stride_note_module(device, *pShaderModule, create_info.pCode,
                                  create_info.codeSize);
    free(lowered);
@@ -4602,7 +4842,7 @@ wrapper_DestroyShaderModule(VkDevice _device, VkShaderModule shaderModule,
                             const VkAllocationCallbacks *pAllocator)
 {
    VK_FROM_HANDLE(wrapper_device, device, _device);
-   if (wrapper_uses_variants(device) || device->emulate_vertex_divisor)
+   if (wrapper_uses_variants(device) || device->emulate_vertex_divisor || device->fold_sets)
       wrapper_stride_forget_module(device, shaderModule);
    device->dispatch_table.DestroyShaderModule(device->dispatch_handle, shaderModule,
                                               pAllocator);
