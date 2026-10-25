@@ -165,6 +165,8 @@ wrapper_append_required_extensions(const struct wrapper_device *device,
 #undef REQUIRED_EXTENSION
 }
 
+static void wrapper_lower_missing_commands(struct wrapper_device *device);
+
 static inline bool
 wrapper_uses_variants(const struct wrapper_device *device)
 {
@@ -1481,6 +1483,8 @@ if (pdf2 && pdf2->features.f) { \
       physical_device->instance->dispatch_handle, "vkGetDeviceProcAddr");
    vk_device_dispatch_table_load(&device->dispatch_table, gdpa,
                                  device->dispatch_handle);
+   if (physical_device->emulate_vulkan13)
+      wrapper_lower_missing_commands(device);
 
    if (emulate_query_reset) {
       result = wrapper_query_reset_init(device);
@@ -6025,4 +6029,198 @@ wrapper_GetPrivateData(VkDevice _device, VkObjectType objectType,
    uint64_t object_handle = unwrap_device_object(objectType, objectHandle);
    return device->dispatch_table.GetPrivateData(device->dispatch_handle,
       objectType, object_handle, privateDataSlot, pData);
+}
+
+static PFN_vkCmdCopyBuffer legacy_copy_buffer;
+static PFN_vkCmdCopyImage legacy_copy_image;
+static PFN_vkCmdBlitImage legacy_blit_image;
+static PFN_vkCmdCopyBufferToImage legacy_copy_buffer_to_image;
+static PFN_vkCmdCopyImageToBuffer legacy_copy_image_to_buffer;
+static PFN_vkCmdResolveImage legacy_resolve_image;
+static PFN_vkCmdWriteTimestamp legacy_write_timestamp;
+static PFN_vkCmdSetEvent legacy_set_event;
+static PFN_vkCmdResetEvent legacy_reset_event;
+static PFN_vkCmdWaitEvents legacy_wait_events;
+
+static VKAPI_ATTR void VKAPI_CALL
+lower_copy_buffer2(VkCommandBuffer cb, const VkCopyBufferInfo2 *info)
+{
+   VkBufferCopy *r = malloc(MAX2(info->regionCount, 1) * sizeof(*r));
+   if (!r)
+      return;
+   for (uint32_t i = 0; i < info->regionCount; i++)
+      r[i] = (VkBufferCopy) { info->pRegions[i].srcOffset, info->pRegions[i].dstOffset,
+                              info->pRegions[i].size };
+   legacy_copy_buffer(cb, info->srcBuffer, info->dstBuffer, info->regionCount, r);
+   free(r);
+}
+
+static VKAPI_ATTR void VKAPI_CALL
+lower_copy_image2(VkCommandBuffer cb, const VkCopyImageInfo2 *info)
+{
+   VkImageCopy *r = malloc(MAX2(info->regionCount, 1) * sizeof(*r));
+   if (!r)
+      return;
+   for (uint32_t i = 0; i < info->regionCount; i++) {
+      const VkImageCopy2 *s = &info->pRegions[i];
+      r[i] = (VkImageCopy) { s->srcSubresource, s->srcOffset, s->dstSubresource,
+                             s->dstOffset, s->extent };
+   }
+   legacy_copy_image(cb, info->srcImage, info->srcImageLayout, info->dstImage,
+                     info->dstImageLayout, info->regionCount, r);
+   free(r);
+}
+
+static VKAPI_ATTR void VKAPI_CALL
+lower_blit_image2(VkCommandBuffer cb, const VkBlitImageInfo2 *info)
+{
+   VkImageBlit *r = malloc(MAX2(info->regionCount, 1) * sizeof(*r));
+   if (!r)
+      return;
+   for (uint32_t i = 0; i < info->regionCount; i++) {
+      const VkImageBlit2 *s = &info->pRegions[i];
+      r[i].srcSubresource = s->srcSubresource;
+      r[i].srcOffsets[0] = s->srcOffsets[0];
+      r[i].srcOffsets[1] = s->srcOffsets[1];
+      r[i].dstSubresource = s->dstSubresource;
+      r[i].dstOffsets[0] = s->dstOffsets[0];
+      r[i].dstOffsets[1] = s->dstOffsets[1];
+   }
+   legacy_blit_image(cb, info->srcImage, info->srcImageLayout, info->dstImage,
+                     info->dstImageLayout, info->regionCount, r, info->filter);
+   free(r);
+}
+
+static VkBufferImageCopy *
+lower_buffer_image_regions(const VkBufferImageCopy2 *in, uint32_t count)
+{
+   VkBufferImageCopy *r = malloc(MAX2(count, 1) * sizeof(*r));
+   if (!r)
+      return NULL;
+   for (uint32_t i = 0; i < count; i++)
+      r[i] = (VkBufferImageCopy) { in[i].bufferOffset, in[i].bufferRowLength,
+                                   in[i].bufferImageHeight, in[i].imageSubresource,
+                                   in[i].imageOffset, in[i].imageExtent };
+   return r;
+}
+
+static VKAPI_ATTR void VKAPI_CALL
+lower_copy_buffer_to_image2(VkCommandBuffer cb, const VkCopyBufferToImageInfo2 *info)
+{
+   VkBufferImageCopy *r = lower_buffer_image_regions(info->pRegions, info->regionCount);
+   if (!r)
+      return;
+   legacy_copy_buffer_to_image(cb, info->srcBuffer, info->dstImage, info->dstImageLayout,
+                               info->regionCount, r);
+   free(r);
+}
+
+static VKAPI_ATTR void VKAPI_CALL
+lower_copy_image_to_buffer2(VkCommandBuffer cb, const VkCopyImageToBufferInfo2 *info)
+{
+   VkBufferImageCopy *r = lower_buffer_image_regions(info->pRegions, info->regionCount);
+   if (!r)
+      return;
+   legacy_copy_image_to_buffer(cb, info->srcImage, info->srcImageLayout, info->dstBuffer,
+                               info->regionCount, r);
+   free(r);
+}
+
+static VKAPI_ATTR void VKAPI_CALL
+lower_resolve_image2(VkCommandBuffer cb, const VkResolveImageInfo2 *info)
+{
+   VkImageResolve *r = malloc(MAX2(info->regionCount, 1) * sizeof(*r));
+   if (!r)
+      return;
+   for (uint32_t i = 0; i < info->regionCount; i++) {
+      const VkImageResolve2 *s = &info->pRegions[i];
+      r[i] = (VkImageResolve) { s->srcSubresource, s->srcOffset, s->dstSubresource,
+                                s->dstOffset, s->extent };
+   }
+   legacy_resolve_image(cb, info->srcImage, info->srcImageLayout, info->dstImage,
+                        info->dstImageLayout, info->regionCount, r);
+   free(r);
+}
+
+static VKAPI_ATTR void VKAPI_CALL
+lower_write_timestamp2(VkCommandBuffer cb, VkPipelineStageFlags2 stage,
+                       VkQueryPool pool, uint32_t query)
+{
+   legacy_write_timestamp(cb, (VkPipelineStageFlagBits)wrapper_stage_mask2_to_legacy(stage, false),
+                          pool, query);
+}
+
+static VkPipelineStageFlags
+dependency_src_stages(const VkDependencyInfo *dep)
+{
+   VkPipelineStageFlags2 stages = 0;
+   for (uint32_t i = 0; i < dep->memoryBarrierCount; i++)
+      stages |= dep->pMemoryBarriers[i].srcStageMask;
+   for (uint32_t i = 0; i < dep->bufferMemoryBarrierCount; i++)
+      stages |= dep->pBufferMemoryBarriers[i].srcStageMask;
+   for (uint32_t i = 0; i < dep->imageMemoryBarrierCount; i++)
+      stages |= dep->pImageMemoryBarriers[i].srcStageMask;
+   return wrapper_stage_mask2_to_legacy(stages, true);
+}
+
+static VKAPI_ATTR void VKAPI_CALL
+lower_set_event2(VkCommandBuffer cb, VkEvent event, const VkDependencyInfo *dep)
+{
+   legacy_set_event(cb, event, dependency_src_stages(dep));
+}
+
+static VKAPI_ATTR void VKAPI_CALL
+lower_reset_event2(VkCommandBuffer cb, VkEvent event, VkPipelineStageFlags2 stage)
+{
+   legacy_reset_event(cb, event, wrapper_stage_mask2_to_legacy(stage, true));
+}
+
+static VKAPI_ATTR void VKAPI_CALL
+lower_wait_events2(VkCommandBuffer cb, uint32_t count, const VkEvent *events,
+                   const VkDependencyInfo *deps)
+{
+   VkPipelineStageFlags src = 0;
+   for (uint32_t i = 0; i < count; i++)
+      src |= dependency_src_stages(&deps[i]);
+   VkMemoryBarrier barrier = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+      .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+      .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+   };
+   legacy_wait_events(cb, count, events, src, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                      1, &barrier, 0, NULL, 0, NULL);
+}
+
+static void
+wrapper_lower_missing_commands(struct wrapper_device *device)
+{
+   struct vk_device_dispatch_table *t = &device->dispatch_table;
+
+   legacy_copy_buffer = t->CmdCopyBuffer;
+   legacy_copy_image = t->CmdCopyImage;
+   legacy_blit_image = t->CmdBlitImage;
+   legacy_copy_buffer_to_image = t->CmdCopyBufferToImage;
+   legacy_copy_image_to_buffer = t->CmdCopyImageToBuffer;
+   legacy_resolve_image = t->CmdResolveImage;
+   legacy_write_timestamp = t->CmdWriteTimestamp;
+   legacy_set_event = t->CmdSetEvent;
+   legacy_reset_event = t->CmdResetEvent;
+   legacy_wait_events = t->CmdWaitEvents;
+
+#define LOWER(name, fn) \
+   if (!t->name) { \
+      t->name = fn; \
+      WRAPPER_LOG(info, "Lowering vk" #name " to the legacy command"); \
+   }
+   LOWER(CmdCopyBuffer2, lower_copy_buffer2);
+   LOWER(CmdCopyImage2, lower_copy_image2);
+   LOWER(CmdBlitImage2, lower_blit_image2);
+   LOWER(CmdCopyBufferToImage2, lower_copy_buffer_to_image2);
+   LOWER(CmdCopyImageToBuffer2, lower_copy_image_to_buffer2);
+   LOWER(CmdResolveImage2, lower_resolve_image2);
+   LOWER(CmdWriteTimestamp2, lower_write_timestamp2);
+   LOWER(CmdSetEvent2, lower_set_event2);
+   LOWER(CmdResetEvent2, lower_reset_event2);
+   LOWER(CmdWaitEvents2, lower_wait_events2);
+#undef LOWER
 }
