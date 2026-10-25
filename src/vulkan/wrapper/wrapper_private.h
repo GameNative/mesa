@@ -94,6 +94,7 @@ struct wrapper_device {
     * Enabled when the app uses push descriptors and either the base driver
     * lacks the extension or WRAPPER_EMULATE_PUSH_DESCRIPTOR forces it. */
    bool emulate_push_descriptor;
+   bool cmdbuf_entry_barrier;
    uint32_t max_push_descriptors;
    simple_mtx_t push_mutex;
    struct hash_table_u64 *push_dsl_table;       /* VkDescriptorSetLayout -> wrapper_push_dsl */
@@ -212,6 +213,7 @@ struct wrapper_command_buffer {
    struct wrapper_push_pool *push_pools;   /* emulated push-descriptor pools */
    struct list_head dynamic_render_objects;
    bool dynamic_rendering_active;
+   bool secondary;
 };
 
 VK_DEFINE_HANDLE_CASTS(wrapper_command_buffer, vk.base, VkCommandBuffer,

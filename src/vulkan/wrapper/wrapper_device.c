@@ -1265,6 +1265,9 @@ if (pdf2 && pdf2->features.f) { \
 
    process_pnext_chain((VkBaseInStructure *)&wrapper_create_info, device->physical);
 
+   device->cmdbuf_entry_barrier = debug_get_bool_option("WRAPPER_CMDBUF_ENTRY_BARRIER",
+      physical_device->driver_properties.driverID == VK_DRIVER_ID_IMAGINATION_PROPRIETARY);
+
    VkPhysicalDeviceTextureCompressionASTCHDRFeatures astc_hdr_features = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXTURE_COMPRESSION_ASTC_HDR_FEATURES,
       .textureCompressionASTC_HDR = VK_TRUE,
@@ -2806,6 +2809,17 @@ wrapper_BeginCommandBuffer(VkCommandBuffer commandBuffer,
    VkResult begin_result =
       wcb->device->dispatch_table.BeginCommandBuffer(wcb->dispatch_handle,
                                                      pBeginInfo);
+   if (begin_result == VK_SUCCESS && wcb->device->cmdbuf_entry_barrier &&
+       !wcb->secondary) {
+      VkMemoryBarrier barrier = {
+         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+         .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+         .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+      };
+      wcb->device->dispatch_table.CmdPipelineBarrier(wcb->dispatch_handle,
+         VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+         0, 1, &barrier, 0, NULL, 0, NULL);
+   }
    return begin_result;
 }
 
@@ -4218,6 +4232,8 @@ wrapper_AllocateCommandBuffers(VkDevice _device,
          pCommandBuffers + i);
       if (result != VK_SUCCESS)
          break;
+      wrapper_command_buffer_from_handle(pCommandBuffers[i])->secondary =
+         pAllocateInfo->level == VK_COMMAND_BUFFER_LEVEL_SECONDARY;
    }
 
    if (result != VK_SUCCESS) {
