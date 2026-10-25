@@ -154,7 +154,7 @@ fold_merge_get(struct wrapper_device *device, const VkDescriptorSetLayout *handl
             small += l->bindings[b].vk.descriptorCount;
    }
    uint32_t per_array = budget > small ? (budget - small) / count : 1;
-   uint32_t fixed = MIN2(MAX2(device->fold_max_pool_count, 65536), per_array);
+   uint32_t fixed = MIN2(MAX2(device->fold_max_pool_count, 1), per_array);
    VkDescriptorSetLayoutCreateFlags flags = 0;
    uint32_t n = 0, base = 0;
    uint64_t total = 0;
@@ -540,6 +540,8 @@ fold_instance_create(struct wrapper_device *device, struct fold_merge *m,
    if (copy_count)
       device->dispatch_table.UpdateDescriptorSets(device->dispatch_handle, 0, NULL,
                                                   copy_count, copies);
+   WRAPPER_LOG(info, "Folded set migrated: %u bindings copied from %u member sets",
+               copy_count, m->member_count);
 
    for (uint32_t k = 0; k < m->member_count; k++) {
       if (fsets[k]->instance)
