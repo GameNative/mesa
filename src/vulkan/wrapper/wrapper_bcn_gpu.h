@@ -54,7 +54,11 @@ wrapper_bcn_hq_write(struct wrapper_device *device, struct wrapper_image *wi,
                      const VkImageSubresourceLayers *sub, VkOffset3D offset, VkExtent3D extent);
 
 void
-wrapper_bcn_hq_layout(struct wrapper_device *device, VkImage image, VkImageLayout layout);
+wrapper_bcn_hq_barrier(struct wrapper_command_buffer *wcb, VkImage image, VkImageLayout old_layout,
+                       VkImageLayout new_layout, uint32_t src_family, uint32_t dst_family);
+
+/* CPU BCn work the application is waiting for; the background stage yields to it */
+extern uint32_t wrapper_bcn_fg_busy;
 
 void
 wrapper_bcn_hq_image_destroy(struct wrapper_device *device, struct wrapper_image *wi);

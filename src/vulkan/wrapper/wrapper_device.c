@@ -2920,25 +2920,27 @@ wrapper_bcn_transients_free(struct wrapper_command_buffer *wcb)
 }
 
 static void
-wrapper_bcn_hq_barriers(struct wrapper_device *device, uint32_t count,
+wrapper_bcn_hq_barriers(struct wrapper_command_buffer *wcb, uint32_t count,
                         const VkImageMemoryBarrier *barriers)
 {
-   if (!__atomic_load_n(&device->bcn_hq_active, __ATOMIC_RELAXED))
+   if (!__atomic_load_n(&wcb->device->bcn_hq_active, __ATOMIC_RELAXED))
       return;
    for (uint32_t i = 0; i < count; i++)
-      if (barriers[i].oldLayout != barriers[i].newLayout)
-         wrapper_bcn_hq_layout(device, barriers[i].image, barriers[i].newLayout);
+      wrapper_bcn_hq_barrier(wcb, barriers[i].image, barriers[i].oldLayout,
+                             barriers[i].newLayout, barriers[i].srcQueueFamilyIndex,
+                             barriers[i].dstQueueFamilyIndex);
 }
 
 static void
-wrapper_bcn_hq_barriers2(struct wrapper_device *device, const VkDependencyInfo *dep)
+wrapper_bcn_hq_barriers2(struct wrapper_command_buffer *wcb, const VkDependencyInfo *dep)
 {
-   if (!__atomic_load_n(&device->bcn_hq_active, __ATOMIC_RELAXED))
+   if (!__atomic_load_n(&wcb->device->bcn_hq_active, __ATOMIC_RELAXED))
       return;
-   for (uint32_t i = 0; i < dep->imageMemoryBarrierCount; i++)
-      if (dep->pImageMemoryBarriers[i].oldLayout != dep->pImageMemoryBarriers[i].newLayout)
-         wrapper_bcn_hq_layout(device, dep->pImageMemoryBarriers[i].image,
-                               dep->pImageMemoryBarriers[i].newLayout);
+   for (uint32_t i = 0; i < dep->imageMemoryBarrierCount; i++) {
+      const VkImageMemoryBarrier2 *b = &dep->pImageMemoryBarriers[i];
+      wrapper_bcn_hq_barrier(wcb, b->image, b->oldLayout, b->newLayout,
+                             b->srcQueueFamilyIndex, b->dstQueueFamilyIndex);
+   }
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -3148,7 +3150,7 @@ wrapper_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
    }
 
    wrapper_pipeline_barrier2(wcb, pDependencyInfo);
-   wrapper_bcn_hq_barriers2(wcb->device, pDependencyInfo);
+   wrapper_bcn_hq_barriers2(wcb, pDependencyInfo);
    wrapper_cap_free(capped, stack);
 }
 
@@ -4728,10 +4730,12 @@ wrapper_bcn_cpu_copy_regions(struct wrapper_command_buffer *wcb,
       int src_h = copy_region.bufferImageHeight ? (int)copy_region.bufferImageHeight : h;
       VkDeviceSize src_slice = (VkDeviceSize)((src_w + 3) / 4) * ((src_h + 3) / 4) *
          wrapper_bcn_block_bytes(format);
+      __atomic_add_fetch(&wrapper_bcn_fg_busy, 1, __ATOMIC_RELAXED);
       for (uint32_t s = 0; s < slices; s++)
          decompress_bcn_format(wb->mapped_address,
             (char *)staging_wb->mapped_address + s * slice_size, w, h, src_w, format,
             (int)(offset + s * src_slice));
+      __atomic_sub_fetch(&wrapper_bcn_fg_busy, 1, __ATOMIC_RELAXED);
 
       /* Texture-path diagnostic (part of WRAPPER_DIAG=1): for each BCn CPU upload,
        * record the real parameters (source stride, target format, image tiling/
@@ -5084,7 +5088,7 @@ wrapper_CmdPipelineBarrier(VkCommandBuffer commandBuffer,
       dstStageMask, dependencyFlags, memoryBarrierCount, pMemoryBarriers,
       bufferMemoryBarrierCount, pBufferMemoryBarriers, imageMemoryBarrierCount,
       pImageMemoryBarriers);
-   wrapper_bcn_hq_barriers(device, imageMemoryBarrierCount, pImageMemoryBarriers);
+   wrapper_bcn_hq_barriers(wcb, imageMemoryBarrierCount, pImageMemoryBarriers);
    wrapper_cap_free(capped, stack);
 }
 
@@ -5116,7 +5120,7 @@ wrapper_CmdWaitEvents(VkCommandBuffer commandBuffer, uint32_t eventCount,
       pEvents, srcStageMask, dstStageMask, memoryBarrierCount, pMemoryBarriers,
       bufferMemoryBarrierCount, pBufferMemoryBarriers, imageMemoryBarrierCount,
       pImageMemoryBarriers);
-   wrapper_bcn_hq_barriers(device, imageMemoryBarrierCount, pImageMemoryBarriers);
+   wrapper_bcn_hq_barriers(wcb, imageMemoryBarrierCount, pImageMemoryBarriers);
    wrapper_cap_free(capped, stack);
 }
 
@@ -5153,7 +5157,7 @@ wrapper_CmdWaitEvents2(VkCommandBuffer commandBuffer, uint32_t eventCount,
    device->dispatch_table.CmdWaitEvents2(wcb->dispatch_handle, eventCount,
       pEvents, pDependencyInfos);
    for (uint32_t i = 0; i < eventCount; i++)
-      wrapper_bcn_hq_barriers2(device, &pDependencyInfos[i]);
+      wrapper_bcn_hq_barriers2(wcb, &pDependencyInfos[i]);
    free(deps);
    free(capped);
 }

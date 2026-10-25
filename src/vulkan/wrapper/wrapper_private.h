@@ -184,6 +184,7 @@ struct wrapper_image {
    uint32_t mip_drop;
    uint32_t bcn_hq_jobs;                  /* background ASTC jobs for this image */
    VkImageLayout bcn_layout;              /* last layout recorded while it has some */
+   struct wrapper_command_buffer *bcn_touch; /* last command buffer that moved it */
 };
 
 struct wrapper_image *

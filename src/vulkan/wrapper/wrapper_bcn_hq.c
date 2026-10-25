@@ -1,7 +1,10 @@
 #include <pthread.h>
+#include <sched.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "wrapper_bcn_gpu.h"
 #include "wrapper_bcdec.h"
@@ -14,7 +17,15 @@
  * texels on a later submit to the queue the upload went to, between two
  * barriers from and back to the layout the image was last moved to. A later
  * write to the same texels, the image's destruction or the command buffer
- * being reset before it is submitted drops the job.
+ * being reset before it is submitted drops the job, and so does a barrier
+ * moving the image to another queue family or a submit of a command buffer
+ * that moved it to another queue: the copy is only ordered against work on
+ * its own queue.
+ *
+ * The worker runs at the lowest priority (SCHED_IDLE, nice 19), encodes in
+ * strips of 96 rows, waits between strips while CPU BCn work the application
+ * waits for is running, and is held to WRAPPER_BCN_HQ_MTEXPS Mtexel per
+ * second (4).
  * WRAPPER_BCN_HQ=0 turns it off, WRAPPER_BCN_HQ_THREADS sets the encoder
  * threads (2), WRAPPER_BCN_HQ_QUALITY the astcenc quality (60, its medium
  * preset), WRAPPER_BCN_HQ_MB caps the blocks waiting (256). */
@@ -57,6 +68,8 @@ struct bcn_hq {
    size_t bytes;
    unsigned threads;
    float quality;
+   double mtexps;
+   unsigned drops;
    size_t cap;
    VkCommandPool pools[16];
 };
@@ -75,6 +88,8 @@ hq_format_name(VkFormat f)
    default: return "bc7";
    }
 }
+
+uint32_t wrapper_bcn_fg_busy;
 
 static double
 now_ms(void)
@@ -108,6 +123,20 @@ hq_free_job(struct bcn_hq *hq, struct bcn_hq_job *j)
 }
 
 static void
+hq_drop(struct wrapper_device *device, struct bcn_hq *hq, struct bcn_hq_job *j);
+
+static void
+hq_drop_logged(struct wrapper_device *device, struct bcn_hq *hq, struct bcn_hq_job *j,
+               const char *why)
+{
+   if (hq->drops++ < 16 || (hq->drops & (hq->drops - 1)) == 0)
+      wrapper_diag_append("[BCN] hq drop %s %ux%u mip %u: %s (%u drops)\n",
+                          hq_format_name(j->format), j->extent.width, j->extent.height,
+                          j->sub.mipLevel, why, hq->drops);
+   hq_drop(device, hq, j);
+}
+
+static void
 hq_drop(struct wrapper_device *device, struct bcn_hq *hq, struct bcn_hq_job *j)
 {
    if (j->wi)
@@ -126,6 +155,11 @@ hq_worker(void *arg)
 {
    struct wrapper_device *device = arg;
    struct bcn_hq *hq = device->bcn_hq;
+#ifdef SCHED_IDLE
+   struct sched_param sp = { 0 };
+   sched_setscheduler(0, SCHED_IDLE, &sp);
+#endif
+   setpriority(PRIO_PROCESS, 0, 19);
    pthread_mutex_lock(&hq->lock);
    while (!hq->stop) {
       struct bcn_hq_job *job = NULL;
@@ -143,11 +177,29 @@ hq_worker(void *arg)
       pthread_mutex_unlock(&hq->lock);
       double t0 = now_ms();
       bool ok = true;
-      for (uint32_t l = 0; l < job->sub.layerCount && ok; l++)
-         ok = wrapper_bcn_astc_encode_cpu(job->in + l * job->layer_in, job->extent.width,
-                                          job->extent.height, job->format,
-                                          job->out + l * job->layer_out, job->layer_out,
-                                          hq->threads, hq->quality) == 0;
+      uint32_t w = job->extent.width, h = job->extent.height;
+      uint32_t bb = (uint32_t)(job->layer_in / (((w + 3) / 4) * ((h + 3) / 4)));
+      size_t out_row = (size_t)((w + job->block - 1) / job->block) * 16;
+      for (uint32_t l = 0; l < job->sub.layerCount && ok; l++) {
+         for (uint32_t y = 0; y < h && ok; y += 96) {
+            while (__atomic_load_n(&wrapper_bcn_fg_busy, __ATOMIC_RELAXED) &&
+                   !__atomic_load_n(&hq->stop, __ATOMIC_RELAXED))
+               usleep(2000);
+            uint32_t sh = MIN2(96u, h - y);
+            double s0 = now_ms();
+            ok = wrapper_bcn_astc_encode_cpu(job->in + l * job->layer_in +
+                                                (size_t)(y / 4) * ((w + 3) / 4) * bb,
+                                             w, sh, job->format,
+                                             job->out + l * job->layer_out +
+                                                (size_t)(y / job->block) * out_row,
+                                             job->layer_out - (size_t)(y / job->block) * out_row,
+                                             hq->threads, hq->quality) == 0;
+            double budget = (double)w * sh / (hq->mtexps * 1000.0);
+            double spent = now_ms() - s0;
+            if (spent < budget)
+               usleep((useconds_t)((budget - spent) * 1000.0));
+         }
+      }
       double t1 = now_ms();
       pthread_mutex_lock(&hq->lock);
       job->encode_ms = t1 - t0;
@@ -183,6 +235,8 @@ hq_get(struct wrapper_device *device)
          const char *q = getenv("WRAPPER_BCN_HQ_QUALITY");
          hq->threads = t && atoi(t) > 0 ? atoi(t) : 2;
          hq->quality = q ? (float)atof(q) : 60.0f;
+         const char *r = getenv("WRAPPER_BCN_HQ_MTEXPS");
+         hq->mtexps = r && atof(r) > 0.0 ? atof(r) : 4.0;
          hq->cap = (size_t)(mb && atoi(mb) > 0 ? atoi(mb) : 256) << 20;
          device->bcn_hq = hq;
          if (pthread_create(&hq->thread, NULL, hq_worker, device) != 0) {
@@ -309,14 +363,26 @@ wrapper_bcn_hq_capture(struct wrapper_command_buffer *wcb, struct wrapper_image 
 }
 
 void
-wrapper_bcn_hq_layout(struct wrapper_device *device, VkImage image, VkImageLayout layout)
+wrapper_bcn_hq_barrier(struct wrapper_command_buffer *wcb, VkImage image, VkImageLayout old_layout,
+                       VkImageLayout new_layout, uint32_t src_family, uint32_t dst_family)
 {
+   struct wrapper_device *device = wcb->device;
    struct wrapper_image *wi = get_wrapper_image_from_handle(device, image);
    if (!wi || !wi->bcn_hq_jobs || !device->bcn_hq)
       return;
-   pthread_mutex_lock(&device->bcn_hq->lock);
-   wi->bcn_layout = layout;
-   pthread_mutex_unlock(&device->bcn_hq->lock);
+   struct bcn_hq *hq = device->bcn_hq;
+   pthread_mutex_lock(&hq->lock);
+   if (src_family != dst_family && src_family != VK_QUEUE_FAMILY_IGNORED &&
+       dst_family != VK_QUEUE_FAMILY_IGNORED) {
+      list_for_each_entry_safe(struct bcn_hq_job, j, &hq->jobs, link)
+         if (j->wi == wi)
+            hq_drop_logged(device, hq, j, "queue family transfer");
+   } else {
+      if (old_layout != new_layout)
+         wi->bcn_layout = new_layout;
+      wi->bcn_touch = wcb;
+   }
+   pthread_mutex_unlock(&hq->lock);
 }
 
 void
@@ -347,10 +413,12 @@ wrapper_bcn_hq_submitted(struct wrapper_queue *queue, struct wrapper_command_buf
       return;
    struct bcn_hq *hq = device->bcn_hq;
    pthread_mutex_lock(&hq->lock);
-   list_for_each_entry(struct bcn_hq_job, j, &hq->jobs, link) {
+   list_for_each_entry_safe(struct bcn_hq_job, j, &hq->jobs, link) {
       if (j->wcb == wcb) {
          j->wcb = NULL;
          j->queue = queue;
+      } else if (j->wi && j->wi->bcn_touch == wcb && j->queue && j->queue != queue) {
+         hq_drop_logged(device, hq, j, "image used on another queue");
       }
    }
    pthread_mutex_unlock(&hq->lock);
