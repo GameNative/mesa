@@ -642,6 +642,7 @@ void main()
                                   uvec4(83u, 5u, 20u, 48u));
    float best = 1e30;
    uint best_out[4] = uint[](0u, 0u, 0u, 0u);
+   float first_err = -1.0;
    float top = 0.0;
    [[dont_unroll]] for (uint i = 0u; i < 16u; i++)
       top = max(top, max(orig[i].r, max(orig[i].g, orig[i].b)));
@@ -671,6 +672,8 @@ void main()
          ideal_weights(u0, u1, false);
          fit_weights(wq);
          float err = block_error(u0, u1);
+         if (first_err < 0.0)
+            first_err = err;
          if (err >= best)
             continue;
          best = err;
@@ -730,6 +733,10 @@ void main()
          best_out = ob;
       }
    }
+   /* no candidate kept: what the self-test log shows to find out why */
+   if (best_out[0] == 0u)
+      best_out = uint[](0u, floatBitsToUint(first_err), floatBitsToUint(top),
+                        floatBitsToUint(orig[5].r));
    d.w[off] = best_out[0];
    d.w[off + 1u] = best_out[1];
    d.w[off + 2u] = best_out[2];

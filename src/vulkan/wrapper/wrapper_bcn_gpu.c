@@ -614,12 +614,13 @@ bcn_tools_start(struct wrapper_device *device)
    return device->bcn_tool_state > 0;
 }
 
-/* The pipeline of a slot, built or asked for; with wait, after its build. */
+/* The pipeline of a slot once it has passed its self-test, or asked for;
+ * with wait (readbacks and copies), as soon as it is built. */
 static VkPipeline
 bcn_pipe(struct wrapper_device *device, int slot, bool wait)
 {
    int st = __atomic_load_n(&device->bcn_slot_state[slot], __ATOMIC_ACQUIRE);
-   if (st == BCN_BUILT || st == BCN_TESTED)
+   if (st == BCN_TESTED || (wait && st == BCN_BUILT))
       return device->bcn_pipe[slot];
    if (st == BCN_FAILED || !bcn_tools_start(device))
       return VK_NULL_HANDLE;
@@ -633,7 +634,7 @@ bcn_pipe(struct wrapper_device *device, int slot, bool wait)
       pthread_cond_wait(&device->bcn_tool_cond, &device->bcn_tool_lock);
    st = device->bcn_slot_state[slot];
    pthread_mutex_unlock(&device->bcn_tool_lock);
-   return st == BCN_BUILT || st == BCN_TESTED ? device->bcn_pipe[slot] : VK_NULL_HANDLE;
+   return st == BCN_TESTED || (wait && st == BCN_BUILT) ? device->bcn_pipe[slot] : VK_NULL_HANDLE;
 }
 
 static int
