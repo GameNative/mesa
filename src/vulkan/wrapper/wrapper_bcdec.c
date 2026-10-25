@@ -32,13 +32,20 @@ astc_enabled(void)
 
 /* ASTC block footprint: 0 = 4x4 (8bpp, crisp), 1 = 8x8 (2bpp, 4x smaller/softer).
  * Selected by WRAPPER_ASTC_BLOCK ("4x4" default, "8x8"). */
+/* bcnEmulationType=compute (ENABLE_BCN_COMPUTE=1, the app's default) means
+ * the parity policy on the GPU path whatever the quality setting; 8x8 is
+ * taken only with the CPU path (bcnEmulationType=cpu, quality=low). */
 static int
 astc_block8(void)
 {
    static int b = -1;
    if (b == -1) {
       const char *e = getenv("WRAPPER_ASTC_BLOCK");
+      const char *compute = getenv("ENABLE_BCN_COMPUTE");
+      const char *keep = getenv("WRAPPER_KEEP_BCN_LAYER");
       b = (e && strstr(e, "8x8")) ? 1 : 0;
+      if (compute && atoi(compute) && !(keep && atoi(keep)))
+         b = 0;
    }
    return b;
 }
