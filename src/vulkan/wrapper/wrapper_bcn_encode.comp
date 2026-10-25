@@ -1,6 +1,7 @@
 #version 450
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_buffer_reference_uvec2 : require
+#extension GL_EXT_control_flow_attributes : require
 /*
  * BCn encode, one invocation per 4x4 block, for reading back an emulated BC
  * image: texels in (RGBA8 or RGBA8_SNORM, 4 bytes, or RGBA16F, 8 bytes, rows
@@ -15,6 +16,9 @@
  * flags bit 0: the second BC5 channel is in alpha (luminance + alpha storage)
  */
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+/* one pipeline per format class, so each builds only its encoder:
+ * 0 BC1-BC5, 1 BC6H, 2 BC7 */
+layout(constant_id = 0) const uint FMT_CLASS = 0u;
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Words { uint w[]; };
 layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer OutWords { uint w[]; };
 layout(push_constant) uniform PC {
@@ -98,7 +102,7 @@ void load_texels(uint bx, uint by, uint z)
    Words s = Words(pc.src);
    bool wide = pc.format == 8u || pc.format == 9u;
    bool snorm = pc.format == 5u || pc.format == 7u;
-   for (uint i = 0u; i < 16u; i++) {
+   [[dont_unroll]] for (uint i = 0u; i < 16u; i++) {
       uint x = min(bx * 4u + (i & 3u), pc.width - 1u);
       uint y = min(by * 4u + (i >> 2), pc.height - 1u);
       uint off = z * pc.src_slice_pitch + y * pc.src_row_pitch + x * (wide ? 8u : 4u);
@@ -123,7 +127,7 @@ vec4 axis_of(vec4 mean, uint sel, vec4 chm)
 {
    mat4 cov = mat4(0.0);
    vec4 lo = vec4(1e9), hi = vec4(-1e9);
-   for (uint i = 0u; i < 16u; i++) {
+   [[dont_unroll]] for (uint i = 0u; i < 16u; i++) {
       if (((sel >> i) & 1u) == 0u)
          continue;
       vec4 d = (px[i] - mean) * chm;
@@ -132,7 +136,7 @@ vec4 axis_of(vec4 mean, uint sel, vec4 chm)
       hi = max(hi, px[i]);
    }
    vec4 a = (hi - lo) * chm;
-   for (int it = 0; it < 6; it++) {
+   [[dont_unroll]] for (int it = 0; it < 6; it++) {
       vec4 n = cov * a;
       float m = max(max(abs(n.x), abs(n.y)), max(abs(n.z), abs(n.w)));
       if (m <= 0.0)
@@ -146,7 +150,7 @@ void fit_line(uint sel, vec4 chm, out vec4 e0, out vec4 e1)
 {
    vec4 mean = vec4(0.0);
    float n = 0.0;
-   for (uint i = 0u; i < 16u; i++)
+   [[dont_unroll]] for (uint i = 0u; i < 16u; i++)
       if (((sel >> i) & 1u) != 0u) {
          mean += px[i] * chm;
          n += 1.0;
@@ -162,7 +166,7 @@ void fit_line(uint sel, vec4 chm, out vec4 e0, out vec4 e1)
    if (l > 0.0) {
       tmin = 1e9;
       tmax = -1e9;
-      for (uint i = 0u; i < 16u; i++)
+      [[dont_unroll]] for (uint i = 0u; i < 16u; i++)
          if (((sel >> i) & 1u) != 0u) {
             float t = dot(px[i] * chm - mean, a) / l;
             tmin = min(tmin, t);
@@ -178,7 +182,7 @@ bool refit(uint sel, float wt[16], vec4 chm, out vec4 e0, out vec4 e1)
 {
    float aa = 0.0, ab = 0.0, bb = 0.0;
    vec4 ax = vec4(0.0), bx = vec4(0.0);
-   for (uint i = 0u; i < 16u; i++) {
+   [[dont_unroll]] for (uint i = 0u; i < 16u; i++) {
       if (((sel >> i) & 1u) == 0u)
          continue;
       float w = wt[i];
@@ -229,13 +233,13 @@ float bc1_indices(uint c0, uint c1, bool four, uint clear, out uint idx)
    palette565(c0, c1, four, pal);
    float err = 0.0;
    idx = 0u;
-   for (uint i = 0u; i < 16u; i++) {
+   [[dont_unroll]] for (uint i = 0u; i < 16u; i++) {
       uint best = 0u;
       if (((clear >> i) & 1u) != 0u) {
          best = 3u;
       } else {
          float be = 1e30;
-         for (uint k = 0u; k < (four ? 4u : 3u); k++) {
+         [[dont_unroll]] for (uint k = 0u; k < (four ? 4u : 3u); k++) {
             vec3 d = pal[k] - px[i].rgb;
             float e = dot(d, d);
             if (e < be) {
@@ -258,7 +262,7 @@ uvec2 encode_bc1(bool allow_clear)
 {
    uint clear = 0u;
    if (allow_clear)
-      for (uint i = 0u; i < 16u; i++)
+      [[dont_unroll]] for (uint i = 0u; i < 16u; i++)
          if (px[i].a < 128.0)
             clear |= 1u << i;
    uint sel = ~clear & 0xffffu;
@@ -269,7 +273,7 @@ uvec2 encode_bc1(bool allow_clear)
    fit_line(sel, vec4(1.0, 1.0, 1.0, 0.0), e0, e1);
    uint best_c0 = 0u, best_c1 = 0u, best_idx = 0u;
    float best_err = 1e30;
-   for (int pass = 0; pass < 2; pass++) {
+   [[dont_unroll]] for (int pass = 0; pass < 2; pass++) {
       uint a = to565(e1.rgb), b = to565(e0.rgb);
       uint c0 = four ? max(a, b) : min(a, b), c1 = four ? min(a, b) : max(a, b);
       uint idx;
@@ -285,7 +289,7 @@ uvec2 encode_bc1(bool allow_clear)
       float wt[16];
       vec3 p0[4];
       palette565(c0, c1, four, p0);
-      for (uint i = 0u; i < 16u; i++) {
+      [[dont_unroll]] for (uint i = 0u; i < 16u; i++) {
          uint k = (idx >> (2u * i)) & 3u;
          wt[i] = four ? bc1_w4[k] : bc1_w3[k];
       }
@@ -312,7 +316,7 @@ uvec2 encode_bc1(bool allow_clear)
 uvec2 encode_channel(int v[16], bool sgn)
 {
    int lo = v[0], hi = v[0];
-   for (uint i = 1u; i < 16u; i++) {
+   [[dont_unroll]] for (uint i = 1u; i < 16u; i++) {
       lo = min(lo, v[i]);
       hi = max(hi, v[i]);
    }
@@ -327,10 +331,10 @@ uvec2 encode_channel(int v[16], bool sgn)
    a[6] = (18724 * a0 + 46812 * a1 + 32768) >> 16;
    a[7] = (9363 * a0 + 56173 * a1 + 32768) >> 16;
    uint idx_lo = 0u, idx_hi = 0u;
-   for (uint i = 0u; i < 16u; i++) {
+   [[dont_unroll]] for (uint i = 0u; i < 16u; i++) {
       uint best = 0u;
       int be = 1 << 30;
-      for (uint k = 0u; k < 8u; k++) {
+      [[dont_unroll]] for (uint k = 0u; k < 8u; k++) {
          int d = abs(a[k] - v[i]);
          if (d < be) {
             be = d;
@@ -394,7 +398,7 @@ float line_residual(uint sel)
    vec4 chm = vec4(1.0, 1.0, 1.0, 0.0);
    vec4 mean = vec4(0.0);
    float n = 0.0;
-   for (uint i = 0u; i < 16u; i++)
+   [[dont_unroll]] for (uint i = 0u; i < 16u; i++)
       if (((sel >> i) & 1u) != 0u) {
          mean += px[i] * chm;
          n += 1.0;
@@ -405,7 +409,7 @@ float line_residual(uint sel)
    vec4 a = axis_of(mean, sel, chm);
    float l = dot(a, a);
    float r = 0.0;
-   for (uint i = 0u; i < 16u; i++)
+   [[dont_unroll]] for (uint i = 0u; i < 16u; i++)
       if (((sel >> i) & 1u) != 0u) {
          vec4 d = px[i] * chm - mean;
          float t = l > 0.0 ? dot(d, a) : 0.0;
@@ -417,7 +421,7 @@ float line_residual(uint sel)
 uint subset_mask(uint part, uint s)
 {
    uint m = 0u;
-   for (uint i = 0u; i < 16u; i++)
+   [[dont_unroll]] for (uint i = 0u; i < 16u; i++)
       if (((bc7_part[part] >> (2u * i)) & 3u) == s)
          m |= 1u << i;
    return m;
@@ -439,7 +443,7 @@ float encode_two(uint mode, uint part)
       vec4 e0, e1;
       fit_line(sel, chm, e0, e1);
       float best = 1e30;
-      for (int pass = 0; pass < 2; pass++) {
+      [[dont_unroll]] for (int pass = 0; pass < 2; pass++) {
          float bq = 1e30;
          int q0[3], q1[3], pa = 0, pb = 0;
          ivec3 u0 = ivec3(0), u1 = ivec3(0);
@@ -469,14 +473,14 @@ float encode_two(uint mode, uint part)
          float err = 0.0;
          float wt[16];
          uint idx[16];
-         for (uint i = 0u; i < 16u; i++) {
+         [[dont_unroll]] for (uint i = 0u; i < 16u; i++) {
             wt[i] = 0.0;
             idx[i] = 0u;
             if (((sel >> i) & 1u) == 0u)
                continue;
             float be = 1e30;
             uint bk = 0u;
-            for (uint k = 0u; k < (1u << ib); k++) {
+            [[dont_unroll]] for (uint k = 0u; k < (1u << ib); k++) {
                int w = bc7_w(ib, k);
                vec3 pal = vec3((u0 * (64 - w) + u1 * w + 32) >> 6);
                vec3 d = pal - px[i].rgb;
@@ -498,7 +502,7 @@ float encode_two(uint mode, uint part)
             }
             tp[s][0] = pa;
             tp[s][1] = pb;
-            for (uint i = 0u; i < 16u; i++)
+            [[dont_unroll]] for (uint i = 0u; i < 16u; i++)
                if (((sel >> i) & 1u) != 0u)
                   tidx[i] = idx[i];
          }
@@ -531,7 +535,7 @@ void write_two(uint mode, uint part)
       int t = tp[s][0];
       tp[s][0] = tp[s][1];
       tp[s][1] = t;
-      for (uint i = 0u; i < 16u; i++)
+      [[dont_unroll]] for (uint i = 0u; i < 16u; i++)
          if (((sel >> i) & 1u) != 0u)
             tidx[i] = (1u << ib) - 1u - tidx[i];
    }
@@ -553,7 +557,7 @@ void write_two(uint mode, uint part)
          wbits(uint(tp[s][1]), 1u);
       }
    }
-   for (uint i = 0u; i < 16u; i++)
+   [[dont_unroll]] for (uint i = 0u; i < 16u; i++)
       wbits(tidx[i], (i == 0u || i == anchor1) ? ib - 1u : ib);
 }
 
@@ -566,7 +570,7 @@ float encode_m5()
    float best = 1e30;
    int cq0[3], cq1[3];
    uint cidx[16];
-   for (int pass = 0; pass < 2; pass++) {
+   [[dont_unroll]] for (int pass = 0; pass < 2; pass++) {
       int q0[3], q1[3];
       ivec3 u0, u1;
       for (int c = 0; c < 3; c++) {
@@ -575,7 +579,7 @@ float encode_m5()
       }
       float err = 0.0, wt[16];
       uint idx[16];
-      for (uint i = 0u; i < 16u; i++) {
+      [[dont_unroll]] for (uint i = 0u; i < 16u; i++) {
          float be = 1e30;
          uint bk = 0u;
          for (uint k = 0u; k < 4u; k++) {
@@ -603,18 +607,18 @@ float encode_m5()
       e1 = clamp(r1, 0.0, 255.0);
    }
    float lo = 255.0, hi = 0.0;
-   for (uint i = 0u; i < 16u; i++) {
+   [[dont_unroll]] for (uint i = 0u; i < 16u; i++) {
       lo = min(lo, px[i].a);
       hi = max(hi, px[i].a);
    }
    float abest = 1e30;
    int aq0 = 0, aq1 = 0;
    uint aidx[16];
-   for (int pass = 0; pass < 2; pass++) {
+   [[dont_unroll]] for (int pass = 0; pass < 2; pass++) {
       int a0 = int(round(lo)), a1 = int(round(hi));
       float err = 0.0, wt[16];
       uint idx[16];
-      for (uint i = 0u; i < 16u; i++) {
+      [[dont_unroll]] for (uint i = 0u; i < 16u; i++) {
          float be = 1e30;
          uint bk = 0u;
          for (uint k = 0u; k < 4u; k++) {
@@ -635,7 +639,7 @@ float encode_m5()
          aidx = idx;
       }
       float aa = 0.0, ab = 0.0, bb = 0.0, ax = 0.0, bx = 0.0;
-      for (uint i = 0u; i < 16u; i++) {
+      [[dont_unroll]] for (uint i = 0u; i < 16u; i++) {
          float w = wt[i];
          aa += (1.0 - w) * (1.0 - w);
          ab += (1.0 - w) * w;
@@ -653,14 +657,14 @@ float encode_m5()
       int t[3] = cq0;
       cq0 = cq1;
       cq1 = t;
-      for (uint i = 0u; i < 16u; i++)
+      [[dont_unroll]] for (uint i = 0u; i < 16u; i++)
          cidx[i] = 3u - cidx[i];
    }
    if (aidx[0] >= 2u) {
       int t = aq0;
       aq0 = aq1;
       aq1 = t;
-      for (uint i = 0u; i < 16u; i++)
+      [[dont_unroll]] for (uint i = 0u; i < 16u; i++)
          aidx[i] = 3u - aidx[i];
    }
    ob[0] = 0u; ob[1] = 0u; ob[2] = 0u; ob[3] = 0u;
@@ -673,9 +677,9 @@ float encode_m5()
    }
    wbits(uint(aq0), 8u);
    wbits(uint(aq1), 8u);
-   for (uint i = 0u; i < 16u; i++)
+   [[dont_unroll]] for (uint i = 0u; i < 16u; i++)
       wbits(cidx[i], i == 0u ? 1u : 2u);
-   for (uint i = 0u; i < 16u; i++)
+   [[dont_unroll]] for (uint i = 0u; i < 16u; i++)
       wbits(aidx[i], i == 0u ? 1u : 2u);
    return best + abest;
 }
@@ -685,12 +689,12 @@ void encode_bc7_modes()
    uint keep[4] = ob;
    float best = bc7_err;
    bool opaque = true;
-   for (uint i = 0u; i < 16u; i++)
+   [[dont_unroll]] for (uint i = 0u; i < 16u; i++)
       opaque = opaque && px[i].a == 255.0;
    if (opaque) {
       uint p0 = 0u, p1 = 0u;
       float r0 = 1e30, r1 = 1e30;
-      for (uint part = 0u; part < 64u; part++) {
+      [[dont_unroll]] for (uint part = 0u; part < 64u; part++) {
          float r = line_residual(subset_mask(part, 0u)) + line_residual(subset_mask(part, 1u));
          if (r < r0) {
             r1 = r0; p1 = p0;
@@ -725,7 +729,7 @@ void encode_bc7()
    fit_line(0xffffu, vec4(1.0), e0, e1);
    float best_err = 1e30;
    uint best[4];
-   for (int pass = 0; pass < 2; pass++) {
+   [[dont_unroll]] for (int pass = 0; pass < 2; pass++) {
       int q0[4], q1[4];
       int p0 = 0, p1 = 0;
       float ep0 = 1e30, ep1 = 1e30;
@@ -748,15 +752,15 @@ void encode_bc7()
          u1[c] = q1[c] * 2 + p1;
       }
       vec4 pal[16];
-      for (int k = 0; k < 16; k++)
+      [[dont_unroll]] for (int k = 0; k < 16; k++)
          pal[k] = vec4((u0 * (64 - w4[k]) + u1 * w4[k] + 32) >> 6);
       uint idx[16];
       float err = 0.0;
       float wt[16];
-      for (uint i = 0u; i < 16u; i++) {
+      [[dont_unroll]] for (uint i = 0u; i < 16u; i++) {
          float be = 1e30;
          uint bk = 0u;
-         for (uint k = 0u; k < 16u; k++) {
+         [[dont_unroll]] for (uint k = 0u; k < 16u; k++) {
             vec4 d = pal[k] - px[i];
             float e = dot(d, d);
             if (e < be) { be = e; bk = k; }
@@ -778,7 +782,7 @@ void encode_bc7()
          }
          wbits(uint(flip ? p1 : p0), 1u);
          wbits(uint(flip ? p0 : p1), 1u);
-         for (uint i = 0u; i < 16u; i++)
+         [[dont_unroll]] for (uint i = 0u; i < 16u; i++)
             wbits(flip ? 15u - idx[i] : idx[i], i == 0u ? 3u : 4u);
          best = ob;
       }
@@ -836,7 +840,7 @@ int fin(int v, bool sgn)
 
 void encode_bc6h(bool sgn)
 {
-   for (uint i = 0u; i < 16u; i++)
+   [[dont_unroll]] for (uint i = 0u; i < 16u; i++)
       px[i] = vec4(float(h_to_x(raw_lo[i] & 0xffffu, sgn)), float(h_to_x(raw_lo[i] >> 16, sgn)),
                    float(h_to_x(raw_hi[i] & 0xffffu, sgn)), 0.0);
    vec4 e0, e1;
@@ -844,7 +848,7 @@ void encode_bc6h(bool sgn)
    fit_line(0xffffu, chm, e0, e1);
    float best_err = 1e30;
    uint best[4];
-   for (int pass = 0; pass < 2; pass++) {
+   [[dont_unroll]] for (int pass = 0; pass < 2; pass++) {
       ivec3 q0, q1, u0, u1;
       for (int c = 0; c < 3; c++) {
          q0[c] = q_of(e0[c], sgn);
@@ -853,7 +857,7 @@ void encode_bc6h(bool sgn)
          u1[c] = unq_of(q1[c], sgn);
       }
       vec3 pal[16];
-      for (int k = 0; k < 16; k++)
+      [[dont_unroll]] for (int k = 0; k < 16; k++)
          for (int c = 0; c < 3; c++) {
             int v = fin((u0[c] * (64 - w4[k]) + u1[c] * w4[k] + 32) >> 6, sgn);
             pal[k][c] = sgn ? float(v) * 32.0 / 31.0 : float(v) * 64.0 / 31.0;
@@ -861,10 +865,10 @@ void encode_bc6h(bool sgn)
       uint idx[16];
       float wt[16];
       float err = 0.0;
-      for (uint i = 0u; i < 16u; i++) {
+      [[dont_unroll]] for (uint i = 0u; i < 16u; i++) {
          float be = 1e30;
          uint bk = 0u;
-         for (uint k = 0u; k < 16u; k++) {
+         [[dont_unroll]] for (uint k = 0u; k < 16u; k++) {
             vec3 d = pal[k] - px[i].rgb;
             float e = dot(d, d);
             if (e < be) { be = e; bk = k; }
@@ -885,7 +889,7 @@ void encode_bc6h(bool sgn)
             wbits(uint(a[c]) & 1023u, 10u);
          for (int c = 0; c < 3; c++)
             wbits(uint(b[c]) & 1023u, 10u);
-         for (uint i = 0u; i < 16u; i++)
+         [[dont_unroll]] for (uint i = 0u; i < 16u; i++)
             wbits(flip ? 15u - idx[i] : idx[i], i == 0u ? 3u : 4u);
          best = ob;
       }
@@ -908,40 +912,40 @@ void main()
    bool sixteen = !(f == 0u || f == 1u || f == 4u || f == 5u);
    ob[0] = 0u; ob[1] = 0u; ob[2] = 0u; ob[3] = 0u;
 
-   if (f == 0u || f == 1u) {
+   if (FMT_CLASS == 1u) {
+      encode_bc6h(f == 9u);
+   } else if (FMT_CLASS == 2u) {
+      encode_bc7();
+      encode_bc7_modes();
+   } else if (f == 0u || f == 1u) {
       uvec2 c = encode_bc1(f == 0u);
       ob[0] = c.x; ob[1] = c.y;
    } else if (f == 2u || f == 3u) {
       uvec2 c = encode_bc1(false);
       ob[2] = c.x; ob[3] = c.y;
       if (f == 2u) {
-         for (uint i = 0u; i < 16u; i++) {
+         [[dont_unroll]] for (uint i = 0u; i < 16u; i++) {
             uint a4 = uint(clamp(round(px[i].a * 15.0 / 255.0), 0.0, 15.0));
             ob[i >> 3] |= a4 << (4u * (i & 7u));
          }
       } else {
          int v[16];
-         for (uint i = 0u; i < 16u; i++) v[i] = int(px[i].a);
+         [[dont_unroll]] for (uint i = 0u; i < 16u; i++) v[i] = int(px[i].a);
          uvec2 a = encode_channel(v, false);
          ob[0] = a.x; ob[1] = a.y;
       }
    } else if (f >= 4u && f <= 7u) {
       bool sgn = f == 5u || f == 7u;
       int v[16];
-      for (uint i = 0u; i < 16u; i++) v[i] = clamp(int(px[i].r), sgn ? -127 : 0, sgn ? 127 : 255);
+      [[dont_unroll]] for (uint i = 0u; i < 16u; i++) v[i] = clamp(int(px[i].r), sgn ? -127 : 0, sgn ? 127 : 255);
       uvec2 r = encode_channel(v, sgn);
       ob[0] = r.x; ob[1] = r.y;
       if (f >= 6u) {
          bool la = (pc.flags & 1u) != 0u;
-         for (uint i = 0u; i < 16u; i++) v[i] = clamp(int(la ? px[i].a : px[i].g), sgn ? -127 : 0, sgn ? 127 : 255);
+         [[dont_unroll]] for (uint i = 0u; i < 16u; i++) v[i] = clamp(int(la ? px[i].a : px[i].g), sgn ? -127 : 0, sgn ? 127 : 255);
          uvec2 g = encode_channel(v, sgn);
          ob[2] = g.x; ob[3] = g.y;
       }
-   } else if (f == 8u || f == 9u) {
-      encode_bc6h(f == 9u);
-   } else {
-      encode_bc7();
-      encode_bc7_modes();
    }
 
    OutWords d = OutWords(pc.dst);

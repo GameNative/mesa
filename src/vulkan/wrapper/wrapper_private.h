@@ -67,6 +67,13 @@ struct wrapper_queue {
 VK_DEFINE_HANDLE_CASTS(wrapper_queue, vk.base, VkQueue,
                        VK_OBJECT_TYPE_QUEUE)
 
+enum {
+   BCN_SLOT_DECODE, BCN_SLOT_ASTC4, BCN_SLOT_ASTC6, BCN_SLOT_ASTC8, BCN_SLOT_HDR,
+   BCN_SLOT_ENC_BC15, BCN_SLOT_ENC_BC6H, BCN_SLOT_ENC_BC7, BCN_SLOT_COUNT
+};
+
+enum { BCN_NONE, BCN_QUEUED, BCN_BUILDING, BCN_BUILT, BCN_TESTED, BCN_FAILED };
+
 struct wrapper_device {
    struct vk_device vk;
 
@@ -110,21 +117,26 @@ struct wrapper_device {
    /* BC decode/encode and ASTC encode compute shaders, lazily initialized. */
    simple_mtx_t bcn_gpu_mutex;
    bool bcn_bda;                         /* bufferDeviceAddress enabled for them */
-   int bcn_tool_state;                   /* 0 not started, 3 building, 2 built, 1 tested, -1 off */
+   int bcn_tool_state;                   /* 0 not started, 1 started, -1 off */
    uint32_t bcn_tool_family;               /* queue family of the self-test */
    pthread_t bcn_tool_thread;
    bool bcn_tool_thread_live;
+   bool bcn_tool_stop;
+   pthread_mutex_t bcn_tool_lock;
+   pthread_cond_t bcn_tool_cond;
+   uint32_t bcn_tool_untested;             /* a pipeline was built since the last check */
    VkPipelineCache bcn_pipeline_cache;
-   VkPipeline bcn_retired[8];              /* dropped by the self-test */
    VkPipelineLayout bcn_tool_layout;
+   VkBuffer bcn_tables;                    /* ASTC encoder tables */
+   VkDeviceMemory bcn_tables_memory;
+   VkDeviceAddress bcn_tables_address;
    VkShaderModule bcn_decode_module;
    VkShaderModule bcn_encode_module;
    VkShaderModule bcn_astc_module;
    VkShaderModule bcn_astc_hdr_module;
-   VkPipeline bcn_decode_pipeline;
-   VkPipeline bcn_encode_pipeline;
-   VkPipeline bcn_astc_pipeline[3];        /* 4x4, 6x6, 8x8 */
-   VkPipeline bcn_astc_hdr_pipeline;       /* 4x4 HDR, for BC6H */
+   VkPipeline bcn_pipe[BCN_SLOT_COUNT];
+   int bcn_slot_state[BCN_SLOT_COUNT];
+   VkPipeline bcn_retired[BCN_SLOT_COUNT]; /* dropped by the self-test */
    struct bcn_hq *bcn_hq;                  /* background astcenc stage */
    uint32_t bcn_hq_active;                 /* its jobs not yet copied or dropped */
 
@@ -185,6 +197,7 @@ struct wrapper_image {
    uint32_t bcn_hq_jobs;                  /* background ASTC jobs for this image */
    VkImageLayout bcn_layout;              /* last layout recorded while it has some */
    struct wrapper_command_buffer *bcn_touch; /* last command buffer that moved it */
+   uint32_t bcn_owner;                    /* queue family owning it after a transfer, + 1 */
 };
 
 struct wrapper_image *
