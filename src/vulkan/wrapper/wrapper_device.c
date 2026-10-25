@@ -1128,7 +1128,7 @@ wrapper_emit_diag(struct wrapper_physical_device *pdev,
      bcn_upload_enabled() ? "on" : "off");
    D("  format diag                   : wrapper-fmtdiag-1\n");
    D("  BCn policy (WRAPPER_BCN_POLICY): %s  BC6H=%s\n", bcn_policy_desc(),
-     is_astc_hdr_4x4(get_format_for_bcn(VK_FORMAT_BC6H_UFLOAT_BLOCK)) ? "ASTC 4x4 HDR" : "decode");
+     is_astc_hdr_4x4(get_format_for_bcn(VK_FORMAT_BC6H_UFLOAT_BLOCK)) ? "ASTC 4x4 HDR" : "decoded");
    D("  VK_EXT_device_fault report    : %s\n",
      !pdev->base_supported_extensions.EXT_device_fault ? "unsupported by base driver" :
      (!getenv("WRAPPER_DEVICE_FAULT") || atoi(getenv("WRAPPER_DEVICE_FAULT")))
@@ -1247,7 +1247,7 @@ wrapper_CreateDevice(VkPhysicalDevice physicalDevice,
       physical_device->base_supported_features.textureCompressionASTC_HDR &&
       (base13 || physical_device->base_supported_extensions.EXT_texture_compression_astc_hdr);
    if (bcn_policy_bc6h_hdr() && !bc6h_hdr)
-      WRAPPER_LOG(info, "BCn policy: bc6h=4x4 ignored, no ASTC HDR on this device");
+      WRAPPER_LOG(info, "BCn: no ASTC HDR on this device, BC6H is decoded");
    if (bc6h_hdr && !base13) {
       bool listed = false;
       for (uint32_t i = 0; i < wrapper_enable_extension_count; i++)
@@ -1453,6 +1453,11 @@ if (pdf2 && pdf2->features.f) { \
    }
 
    bcn_set_astc_hdr(bc6h_hdr && !used_fallback_create);
+   if (physical_device->emulate_bcn > 1) {
+      char storage[512];
+      bcn_describe_storage(storage, sizeof(storage));
+      wrapper_diag_append("[BCN] storage %s\n", storage);
+   }
    if (bc6h_hdr && !used_fallback_create)
       WRAPPER_LOG(info, "BCn policy: BC6H stored as ASTC 4x4 HDR");
    wrapper_emit_diag(physical_device, pCreateInfo, VK_SUCCESS);
@@ -1967,6 +1972,7 @@ wrapper_CreateImageView(VkDevice _device,
 
    if (is_emulated_bcn(device->physical, pCreateInfo->format)) {
       create_info.format = get_format_for_bcn(pCreateInfo->format);
+      bcn_view_swizzle(pCreateInfo->format, &create_info.components);
       if (wrapper_diag_on())
          wrapper_diag_append("[FMT] CreateImageView fmt=%d -> %d type=%d\n",
             pCreateInfo->format, create_info.format, pCreateInfo->viewType);
