@@ -1842,8 +1842,76 @@ wrapper_device_image_memory_requirements(struct wrapper_device *device,
       info.pCreateInfo = &ci;
    }
 
-   device->dispatch_table.GetDeviceImageMemoryRequirements(device->dispatch_handle,
-      &info, pMemoryRequirements);
+   if (device->dispatch_table.GetDeviceImageMemoryRequirements) {
+      device->dispatch_table.GetDeviceImageMemoryRequirements(device->dispatch_handle,
+         &info, pMemoryRequirements);
+      return;
+   }
+
+   VkImage image;
+   if (device->dispatch_table.CreateImage(device->dispatch_handle, info.pCreateInfo,
+                                          NULL, &image) != VK_SUCCESS) {
+      pMemoryRequirements->memoryRequirements = (VkMemoryRequirements){ 0 };
+      return;
+   }
+   VkImageMemoryRequirementsInfo2 image_info = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2,
+      .image = image,
+   };
+   device->dispatch_table.GetImageMemoryRequirements2(device->dispatch_handle,
+      &image_info, pMemoryRequirements);
+   device->dispatch_table.DestroyImage(device->dispatch_handle, image, NULL);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wrapper_GetDeviceBufferMemoryRequirements(VkDevice _device,
+      const VkDeviceBufferMemoryRequirements *pInfo,
+      VkMemoryRequirements2 *pMemoryRequirements)
+{
+   VK_FROM_HANDLE(wrapper_device, device, _device);
+
+   if (device->dispatch_table.GetDeviceBufferMemoryRequirements) {
+      device->dispatch_table.GetDeviceBufferMemoryRequirements(device->dispatch_handle,
+         pInfo, pMemoryRequirements);
+      return;
+   }
+
+   VkBufferCreateInfo create_info = *pInfo->pCreateInfo;
+   const VkBufferUsageFlags2CreateInfo *usage2 = __vk_find_struct(
+      (void *)create_info.pNext, VK_STRUCTURE_TYPE_BUFFER_USAGE_FLAGS_2_CREATE_INFO);
+   if (usage2 && !device->physical->base_supported_extensions.KHR_maintenance5)
+      create_info.usage |= (VkBufferUsageFlags)usage2->usage;
+
+   VkBuffer buffer;
+   if (device->dispatch_table.CreateBuffer(device->dispatch_handle, &create_info,
+                                           NULL, &buffer) != VK_SUCCESS) {
+      pMemoryRequirements->memoryRequirements = (VkMemoryRequirements){ 0 };
+      return;
+   }
+   VkBufferMemoryRequirementsInfo2 buffer_info = {
+      .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_REQUIREMENTS_INFO_2,
+      .buffer = buffer,
+   };
+   device->dispatch_table.GetBufferMemoryRequirements2(device->dispatch_handle,
+      &buffer_info, pMemoryRequirements);
+   device->dispatch_table.DestroyBuffer(device->dispatch_handle, buffer, NULL);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wrapper_GetDeviceImageSparseMemoryRequirements(VkDevice _device,
+      const VkDeviceImageMemoryRequirements *pInfo,
+      uint32_t *pSparseMemoryRequirementCount,
+      VkSparseImageMemoryRequirements2 *pSparseMemoryRequirements)
+{
+   VK_FROM_HANDLE(wrapper_device, device, _device);
+
+   if (device->dispatch_table.GetDeviceImageSparseMemoryRequirements) {
+      device->dispatch_table.GetDeviceImageSparseMemoryRequirements(device->dispatch_handle,
+         pInfo, pSparseMemoryRequirementCount, pSparseMemoryRequirements);
+      return;
+   }
+
+   *pSparseMemoryRequirementCount = 0;
 }
 
 VKAPI_ATTR void VKAPI_CALL
