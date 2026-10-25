@@ -219,6 +219,21 @@ wrapper_core13_init_physical_device(struct wrapper_physical_device *pdevice)
    WRAPPER_LOG(info, "Lowering Vulkan 1.3 core to a %u.%u.%u base driver",
                VK_API_VERSION_MAJOR(base), VK_API_VERSION_MINOR(base),
                VK_API_VERSION_PATCH(base));
+   WRAPPER_LOG(info, "Base update-after-bind limits: per stage samplers %u sampled %u storage img %u "
+               "ubo %u ssbo %u resources %u; per set samplers %u sampled %u storage img %u ubo %u ssbo %u; "
+               "all pools %u",
+               p->maxPerStageDescriptorUpdateAfterBindSamplers,
+               p->maxPerStageDescriptorUpdateAfterBindSampledImages,
+               p->maxPerStageDescriptorUpdateAfterBindStorageImages,
+               p->maxPerStageDescriptorUpdateAfterBindUniformBuffers,
+               p->maxPerStageDescriptorUpdateAfterBindStorageBuffers,
+               p->maxPerStageUpdateAfterBindResources,
+               p->maxDescriptorSetUpdateAfterBindSamplers,
+               p->maxDescriptorSetUpdateAfterBindSampledImages,
+               p->maxDescriptorSetUpdateAfterBindStorageImages,
+               p->maxDescriptorSetUpdateAfterBindUniformBuffers,
+               p->maxDescriptorSetUpdateAfterBindStorageBuffers,
+               p->maxUpdateAfterBindDescriptorsInAllPools);
    WRAPPER_LOG(info, "Base limits: maxBoundDescriptorSets %u maxPerStageResources %u "
                "maxPushConstantsSize %u", pdevice->properties2.properties.limits.maxBoundDescriptorSets,
                pdevice->properties2.properties.limits.maxPerStageResources,
