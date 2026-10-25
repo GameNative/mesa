@@ -4058,6 +4058,7 @@ wrapper_QueueSubmit(VkQueue _queue, uint32_t submitCount,
 
    if (serialise)
       simple_mtx_lock(&queue->device->query_reset_mutex);
+   wrapper_bcn_gpu_submit(queue);
    wrapper_bcn_hq_flush(queue);
    for (int i = 0; i < submitCount; i++) {
       const VkSubmitInfo *submit_info = &pSubmits[i];
@@ -4104,6 +4105,7 @@ wrapper_QueueSubmit2(VkQueue _queue, uint32_t submitCount,
 
    if (serialise)
       simple_mtx_lock(&queue->device->query_reset_mutex);
+   wrapper_bcn_gpu_submit(queue);
    wrapper_bcn_hq_flush(queue);
    for (int i = 0; i < submitCount; i++) {
       const VkSubmitInfo2 *submit_info = &pSubmits[i];

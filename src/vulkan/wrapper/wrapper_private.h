@@ -115,7 +115,12 @@ struct wrapper_device {
    /* BC decode/encode and ASTC encode compute shaders, lazily initialized. */
    simple_mtx_t bcn_gpu_mutex;
    bool bcn_bda;                         /* bufferDeviceAddress enabled for them */
-   int bcn_tool_state;                   /* 0 uninit, 1 ready, -1 disabled */
+   int bcn_tool_state;                   /* 0 not started, 3 building, 2 built, 1 tested, -1 off */
+   uint32_t bcn_tool_family;               /* queue family of the self-test */
+   pthread_t bcn_tool_thread;
+   bool bcn_tool_thread_live;
+   VkPipelineCache bcn_pipeline_cache;
+   VkPipeline bcn_retired[8];              /* dropped by the self-test */
    VkPipelineLayout bcn_tool_layout;
    VkShaderModule bcn_decode_module;
    VkShaderModule bcn_encode_module;
