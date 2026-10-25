@@ -583,3 +583,101 @@ wrapper_bcn_gpu_upload(struct wrapper_command_buffer *wcb, struct wrapper_image 
    }
    return done;
 }
+
+/* One vkCmdCopyImage region with an emulated BC image on either side or both.
+ * The stored texels of an emulated image are not the BC blocks the copy is
+ * defined on, so the blocks move through the shadows: a BC source is read from
+ * its shadow, and a BC destination gets the blocks in its shadow and is decoded
+ * from there. Returns false when the region should go to the driver as is. */
+bool
+wrapper_bcn_copy_image_region(struct wrapper_command_buffer *wcb,
+                              struct wrapper_image *src, bool src_emulated,
+                              VkImageLayout src_layout,
+                              struct wrapper_image *dst, bool dst_emulated,
+                              VkImageLayout dst_layout, const VkImageCopy *c)
+{
+   struct wrapper_device *device = wcb->device;
+   struct wrapper_bcn_shadow *ss = src_emulated ? wrapper_bcn_shadow_get(device, src) : NULL;
+   struct wrapper_bcn_shadow *ds = dst_emulated ? wrapper_bcn_shadow_get(device, dst) : NULL;
+   struct bcn_block_region sr, dr;
+
+   if ((src_emulated && !ss) || (dst_emulated && !ds))
+      return false;
+   if (ss && !bcn_region_from_copy(ss, &c->srcSubresource, c->srcOffset, c->extent, &sr))
+      return false;
+
+   VkExtent3D dst_extent = c->extent;
+   if (ds) {
+      if (!ss) {
+         uint32_t m = c->dstSubresource.mipLevel;
+         dst_extent.width = MIN2(c->extent.width * 4,
+            mip_extent(dst->info.extent.width, m) - (uint32_t)c->dstOffset.x);
+         dst_extent.height = MIN2(c->extent.height * 4,
+            mip_extent(dst->info.extent.height, m) - (uint32_t)c->dstOffset.y);
+      }
+      if (!bcn_region_from_copy(ds, &c->dstSubresource, c->dstOffset, dst_extent, &dr))
+         return false;
+   }
+
+   bcn_barrier(wcb);
+
+   if (ss && ds) {
+      if (sr.nbx != dr.nbx || sr.nby != dr.nby || sr.slices != dr.slices)
+         return false;
+      for (uint32_t z = 0; z < sr.slices; z++) {
+         VkBufferCopy bc[64];
+         uint32_t n = 0;
+         for (uint32_t y = 0; y < sr.nby; y++) {
+            bc[n++] = (VkBufferCopy){
+               shadow_offset(ss, sr.level, sr.slice + z, sr.by + y, sr.bx),
+               shadow_offset(ds, dr.level, dr.slice + z, dr.by + y, dr.bx),
+               (VkDeviceSize)sr.nbx * ss->block_bytes,
+            };
+            if (n == ARRAY_SIZE(bc) || y + 1 == sr.nby) {
+               device->dispatch_table.CmdCopyBuffer(wcb->dispatch_handle, ss->buffer,
+                                                    ds->buffer, n, bc);
+               n = 0;
+            }
+         }
+      }
+      if (bcn_decode_format_id(src->info.format) == bcn_decode_format_id(dst->info.format) &&
+          get_format_for_bcn(src->info.format) == get_format_for_bcn(dst->info.format)) {
+         device->dispatch_table.CmdCopyImage(wcb->dispatch_handle, src->dispatch_handle,
+            src_layout, dst->dispatch_handle, dst_layout, 1, c);
+         return true;
+      }
+   } else if (ss) {
+      VkBufferImageCopy bic = {
+         .bufferOffset = shadow_offset(ss, sr.level, sr.slice, sr.by, sr.bx),
+         .bufferRowLength = ss->blocks_x[sr.level],
+         .bufferImageHeight = ss->blocks_y[sr.level],
+         .imageSubresource = c->dstSubresource,
+         .imageOffset = c->dstOffset,
+         .imageExtent = { sr.nbx, sr.nby, ss->depth[sr.level] > 1 ? sr.slices : 1 },
+      };
+      device->dispatch_table.CmdCopyBufferToImage(wcb->dispatch_handle, ss->buffer,
+         dst->dispatch_handle, dst_layout, 1, &bic);
+      return true;
+   } else {
+      VkBufferImageCopy bic = {
+         .bufferOffset = shadow_offset(ds, dr.level, dr.slice, dr.by, dr.bx),
+         .bufferRowLength = ds->blocks_x[dr.level],
+         .bufferImageHeight = ds->blocks_y[dr.level],
+         .imageSubresource = c->srcSubresource,
+         .imageOffset = c->srcOffset,
+         .imageExtent = { dr.nbx, dr.nby, ds->depth[dr.level] > 1 ? dr.slices : 1 },
+      };
+      device->dispatch_table.CmdCopyImageToBuffer(wcb->dispatch_handle, src->dispatch_handle,
+         src_layout, ds->buffer, 1, &bic);
+   }
+
+   if (!bcn_gpu_decode(wcb, dst, dst_layout, &c->dstSubresource, c->dstOffset, dst_extent,
+                       &dr)) {
+      static bool logged;
+      if (!logged)
+         WRAPPER_LOG(error, "BCn: no GPU decode for a copy into format %d stored as %d",
+                     dst->info.format, get_format_for_bcn(dst->info.format));
+      logged = true;
+   }
+   return true;
+}

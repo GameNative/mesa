@@ -5080,6 +5080,37 @@ wrapper_CmdWaitEvents2(VkCommandBuffer commandBuffer, uint32_t eventCount,
    free(capped);
 }
 
+/* Regions of a copy with an emulated BC image on either side that the BCn
+ * emulation recorded itself; the rest are left for the driver. Returns how
+ * many are left, compacted to the front of keep. */
+static uint32_t
+wrapper_bcn_copy_image(struct wrapper_command_buffer *wcb, VkImage srcImage,
+                       VkImageLayout srcLayout, VkImage dstImage,
+                       VkImageLayout dstLayout, uint32_t count,
+                       const VkImageCopy *regions, bool *keep)
+{
+   struct wrapper_device *device = wcb->device;
+   for (uint32_t i = 0; i < count; i++)
+      keep[i] = true;
+   if (device->physical->emulate_bcn < 2)
+      return count;
+   struct wrapper_image *src = get_wrapper_image_from_handle(device, srcImage);
+   struct wrapper_image *dst = get_wrapper_image_from_handle(device, dstImage);
+   if (!src || !dst || src->mip_drop || dst->mip_drop)
+      return count;
+   bool src_emu = is_emulated_bcn(device->physical, src->info.format);
+   bool dst_emu = is_emulated_bcn(device->physical, dst->info.format);
+   if (!src_emu && !dst_emu)
+      return count;
+   uint32_t left = 0;
+   for (uint32_t i = 0; i < count; i++) {
+      keep[i] = !wrapper_bcn_copy_image_region(wcb, src, src_emu, srcLayout,
+                                               dst, dst_emu, dstLayout, &regions[i]);
+      left += keep[i];
+   }
+   return left;
+}
+
 VKAPI_ATTR void VKAPI_CALL
 wrapper_CmdCopyImage(VkCommandBuffer commandBuffer,
                      VkImage srcImage, VkImageLayout srcImageLayout,
@@ -5108,6 +5139,23 @@ wrapper_CmdCopyImage(VkCommandBuffer commandBuffer,
       }
       regionCount = n;
       pRegions = capped;
+   }
+
+   if (!src_drop && !dst_drop && device->physical->emulate_bcn > 1) {
+      bool keep[regionCount];
+      uint32_t left = wrapper_bcn_copy_image(wcb, srcImage, srcImageLayout, dstImage,
+         dstImageLayout, regionCount, pRegions, keep);
+      if (left < regionCount) {
+         VkImageCopy rest[left ? left : 1];
+         uint32_t n = 0;
+         for (uint32_t i = 0; i < regionCount; i++)
+            if (keep[i])
+               rest[n++] = pRegions[i];
+         if (n)
+            device->dispatch_table.CmdCopyImage(wcb->dispatch_handle, srcImage,
+               srcImageLayout, dstImage, dstImageLayout, n, rest);
+         return;
+      }
    }
 
    device->dispatch_table.CmdCopyImage(wcb->dispatch_handle, srcImage,
@@ -5145,6 +5193,38 @@ wrapper_CmdCopyImage2(VkCommandBuffer commandBuffer,
       capped_info.regionCount = n;
       capped_info.pRegions = capped;
       pCopyImageInfo = &capped_info;
+   }
+
+   if (!src_drop && !dst_drop && device->physical->emulate_bcn > 1 && count) {
+      VkImageCopy regions[count];
+      bool keep[count];
+      for (uint32_t i = 0; i < count; i++) {
+         const VkImageCopy2 *r = &pCopyImageInfo->pRegions[i];
+         regions[i] = (VkImageCopy){
+            .srcSubresource = r->srcSubresource,
+            .srcOffset = r->srcOffset,
+            .dstSubresource = r->dstSubresource,
+            .dstOffset = r->dstOffset,
+            .extent = r->extent,
+         };
+      }
+      uint32_t left = wrapper_bcn_copy_image(wcb, pCopyImageInfo->srcImage,
+         pCopyImageInfo->srcImageLayout, pCopyImageInfo->dstImage,
+         pCopyImageInfo->dstImageLayout, count, regions, keep);
+      if (left < count) {
+         VkImageCopy2 rest[left ? left : 1];
+         uint32_t n = 0;
+         for (uint32_t i = 0; i < count; i++)
+            if (keep[i])
+               rest[n++] = pCopyImageInfo->pRegions[i];
+         if (n) {
+            VkCopyImageInfo2 info = *pCopyImageInfo;
+            info.regionCount = n;
+            info.pRegions = rest;
+            device->dispatch_table.CmdCopyImage2(wcb->dispatch_handle, &info);
+         }
+         return;
+      }
    }
 
    device->dispatch_table.CmdCopyImage2(wcb->dispatch_handle, pCopyImageInfo);

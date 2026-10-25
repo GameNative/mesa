@@ -38,6 +38,13 @@ uint32_t
 wrapper_bcn_gpu_upload(struct wrapper_command_buffer *wcb, struct wrapper_image *wi,
                        VkImageLayout layout, uint32_t count, const VkBufferImageCopy *regions);
 
+bool
+wrapper_bcn_copy_image_region(struct wrapper_command_buffer *wcb,
+                              struct wrapper_image *src, bool src_emulated,
+                              VkImageLayout src_layout,
+                              struct wrapper_image *dst, bool dst_emulated,
+                              VkImageLayout dst_layout, const VkImageCopy *region);
+
 void
 wrapper_bcn_gpu_finish(struct wrapper_device *device);
 
