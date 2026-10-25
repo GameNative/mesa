@@ -1011,6 +1011,8 @@ wrapper_driver_id_str(VkDriverId id)
  * NATIVELY supports vs what the wrapper advertises to the D3D layer, so a
  * failing game on any device can be diagnosed from the report alone. Pair it
  * with app-side VKD3D_DEBUG=warn / DXVK_LOG_LEVEL=info / WINEDEBUG=+vulkan. */
+static int wrapper_diag_stderr = -1;
+
 static void
 wrapper_emit_diag(struct wrapper_physical_device *pdev,
                   const VkDeviceCreateInfo *ci, VkResult result)
@@ -1061,6 +1063,7 @@ wrapper_emit_diag(struct wrapper_physical_device *pdev,
          redirected = 1;
          int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
          if (fd >= 0) {
+            wrapper_diag_stderr = dup(2);
             dup2(fd, 1);   /* stdout: vkd3d/wine 'System.out' errors */
             dup2(fd, 2);   /* stderr */
             if (fd > 2) close(fd);
@@ -4820,6 +4823,14 @@ wrapper_diag_append(const char *fmt, ...)
 {
    if (!wrapper_diag_on())
       return;
+   /* BCn status lines also go to the stderr the process had before it was
+    * redirected into the diag file, where the launcher log sees them */
+   if (wrapper_diag_stderr >= 0 && !strncmp(fmt, "[BCN]", 5)) {
+      va_list ap;
+      va_start(ap, fmt);
+      vdprintf(wrapper_diag_stderr, fmt, ap);
+      va_end(ap);
+   }
    const char *aid = getenv("WRAPPER_DIAG_APPID");
    char tp[256];
    snprintf(tp, sizeof(tp),
