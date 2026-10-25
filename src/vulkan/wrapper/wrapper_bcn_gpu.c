@@ -252,10 +252,210 @@ bcn_create_pipeline(struct wrapper_device *device, const uint32_t *code, size_t 
    return r;
 }
 
-/* Creates the shaders once per device; each one that fails only disables
- * the work that needs it. */
+struct bcn_selftest_buf {
+   VkBuffer buffer;
+   VkDeviceMemory memory;
+   VkDeviceAddress address;
+   void *map;
+};
+
+static bool
+bcn_selftest_buffer(struct wrapper_device *device, VkDeviceSize size,
+                    struct bcn_selftest_buf *b)
+{
+   VkBufferCreateInfo bci = {
+      .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+      .size = size,
+      .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+      .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+   };
+   if (device->dispatch_table.CreateBuffer(device->dispatch_handle, &bci, NULL,
+                                           &b->buffer) != VK_SUCCESS)
+      return false;
+   VkMemoryRequirements mr;
+   device->dispatch_table.GetBufferMemoryRequirements(device->dispatch_handle, b->buffer, &mr);
+   VkMemoryAllocateFlagsInfo flags = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
+      .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT,
+   };
+   VkMemoryAllocateInfo ai = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      .pNext = &flags,
+      .allocationSize = mr.size,
+      .memoryTypeIndex = bcn_memory_type(device, mr.memoryTypeBits,
+         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
+   };
+   if (ai.memoryTypeIndex == UINT32_MAX ||
+       device->dispatch_table.AllocateMemory(device->dispatch_handle, &ai, NULL,
+                                             &b->memory) != VK_SUCCESS)
+      return false;
+   device->dispatch_table.BindBufferMemory(device->dispatch_handle, b->buffer, b->memory, 0);
+   if (device->dispatch_table.MapMemory(device->dispatch_handle, b->memory, 0, VK_WHOLE_SIZE,
+                                        0, &b->map) != VK_SUCCESS)
+      return false;
+   memset(b->map, 0, size);
+   VkBufferDeviceAddressInfo dai = {
+      .sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
+      .buffer = b->buffer,
+   };
+   b->address = device->dispatch_table.GetBufferDeviceAddress(device->dispatch_handle, &dai);
+   return true;
+}
+
+static void
+bcn_selftest_push(struct wrapper_device *device, VkCommandBuffer cb, VkPipeline pipe,
+                  const struct bcn_pc *pc)
+{
+   VkMemoryBarrier mb = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+      .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT,
+      .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+   };
+   device->dispatch_table.CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_HOST_BIT |
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb,
+      0, NULL, 0, NULL);
+   device->dispatch_table.CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+   device->dispatch_table.CmdPushConstants(cb, device->bcn_tool_layout,
+      VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(*pc), pc);
+   device->dispatch_table.CmdDispatch(cb, 1, 1, 1);
+}
+
+static void
+bcn_disable_pipeline(struct wrapper_device *device, VkPipeline *pipeline)
+{
+   if (*pipeline)
+      device->dispatch_table.DestroyPipeline(device->dispatch_handle, *pipeline, NULL);
+   *pipeline = VK_NULL_HANDLE;
+}
+
+/* Runs each shader once on a known block on the device's first queue and
+ * checks the result on the CPU. A shader that does not produce it is
+ * dropped, so the work that needs it stays on the CPU path.
+ * WRAPPER_BCN_GPU_FAIL=decode,bc,astc drops them on purpose. */
+static void
+bcn_selftest(struct wrapper_device *device, uint32_t family, char *report, size_t size)
+{
+   const char *force = getenv("WRAPPER_BCN_GPU_FAIL");
+   struct bcn_selftest_buf blk = { 0 }, rgba = { 0 }, astc = { 0 }, bc = { 0 };
+   VkCommandPool pool = VK_NULL_HANDLE;
+   VkCommandBuffer cb = VK_NULL_HANDLE;
+   VkFence fence = VK_NULL_HANDLE;
+   bool ran = false;
+   int dec_ok = 0, astc_ok = 0, bc_ok = 0;
+
+   VkCommandPoolCreateInfo cpci = {
+      .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+      .queueFamilyIndex = family,
+   };
+   VkCommandBufferAllocateInfo cbai = {
+      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+      .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+      .commandBufferCount = 1,
+   };
+   VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+   if (bcn_selftest_buffer(device, 16, &blk) && bcn_selftest_buffer(device, 64, &rgba) &&
+       bcn_selftest_buffer(device, 16, &astc) && bcn_selftest_buffer(device, 16, &bc) &&
+       device->dispatch_table.CreateCommandPool(device->dispatch_handle, &cpci, NULL,
+                                                &pool) == VK_SUCCESS &&
+       (cbai.commandPool = pool,
+        device->dispatch_table.AllocateCommandBuffers(device->dispatch_handle, &cbai,
+                                                      &cb) == VK_SUCCESS) &&
+       device->dispatch_table.CreateFence(device->dispatch_handle, &fci, NULL,
+                                          &fence) == VK_SUCCESS) {
+      /* BC1: red and blue endpoints, indices 0 1 2 3 on every row */
+      static const uint8_t block[8] = { 0x00, 0xf8, 0x1f, 0x00, 0xe4, 0xe4, 0xe4, 0xe4 };
+      memcpy(blk.map, block, 8);
+      VkCommandBufferBeginInfo bi = {
+         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+      };
+      device->dispatch_table.BeginCommandBuffer(cb, &bi);
+      struct bcn_pc pc = {
+         .src = { (uint32_t)blk.address, (uint32_t)(blk.address >> 32) },
+         .dst = { (uint32_t)rgba.address, (uint32_t)(rgba.address >> 32) },
+         .src_row_pitch = 8, .src_slice_pitch = 8, .dst_row_pitch = 16, .dst_slice_pitch = 64,
+         .blocks_x = 1, .blocks_y = 1, .format = 0, .width = 4, .height = 4,
+      };
+      if (device->bcn_decode_pipeline)
+         bcn_selftest_push(device, cb, device->bcn_decode_pipeline, &pc);
+      struct bcn_pc ac = {
+         .src = { (uint32_t)rgba.address, (uint32_t)(rgba.address >> 32) },
+         .dst = { (uint32_t)astc.address, (uint32_t)(astc.address >> 32) },
+         .src_row_pitch = 16, .src_slice_pitch = 64, .dst_row_pitch = 16, .dst_slice_pitch = 16,
+         .blocks_x = 1, .blocks_y = 1, .format = 4, .flags = 0, .width = 4, .height = 4,
+      };
+      if (device->bcn_decode_pipeline && device->bcn_astc_pipeline)
+         bcn_selftest_push(device, cb, device->bcn_astc_pipeline, &ac);
+      struct bcn_pc ec = ac;
+      ec.dst[0] = (uint32_t)bc.address;
+      ec.dst[1] = (uint32_t)(bc.address >> 32);
+      ec.dst_row_pitch = 8;
+      ec.dst_slice_pitch = 8;
+      ec.format = 0;
+      if (device->bcn_decode_pipeline && device->bcn_encode_pipeline)
+         bcn_selftest_push(device, cb, device->bcn_encode_pipeline, &ec);
+      VkMemoryBarrier mb = {
+         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+         .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+         .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+      };
+      device->dispatch_table.CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+         VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+      device->dispatch_table.EndCommandBuffer(cb);
+      VkQueue queue = VK_NULL_HANDLE;
+      device->dispatch_table.GetDeviceQueue(device->dispatch_handle, family, 0, &queue);
+      VkSubmitInfo si = {
+         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+         .commandBufferCount = 1,
+         .pCommandBuffers = &cb,
+      };
+      ran = queue && device->dispatch_table.QueueSubmit(queue, 1, &si, fence) == VK_SUCCESS &&
+            device->dispatch_table.WaitForFences(device->dispatch_handle, 1, &fence, VK_TRUE,
+                                                 2000000000ull) == VK_SUCCESS;
+   }
+   if (ran) {
+      static const uint8_t pal[4][4] = {
+         { 255, 0, 0, 255 }, { 0, 0, 255, 255 }, { 170, 0, 85, 255 }, { 85, 0, 170, 255 },
+      };
+      const uint8_t *got = rgba.map;
+      dec_ok = 1;
+      for (int i = 0; i < 16; i++)
+         dec_ok &= !memcmp(got + i * 4, pal[i & 3], 4);
+      const uint8_t *a = astc.map;
+      for (int i = 0; i < 16; i++)
+         astc_ok |= a[i] != 0;
+      const uint8_t *b = bc.map;
+      bc_ok = (b[0] | b[1] | b[2] | b[3]) != 0;
+   }
+   if (!dec_ok || (force && strstr(force, "decode")))
+      bcn_disable_pipeline(device, &device->bcn_decode_pipeline);
+   if (!astc_ok || (force && strstr(force, "astc")))
+      bcn_disable_pipeline(device, &device->bcn_astc_pipeline);
+   if (!bc_ok || (force && strstr(force, "bc")))
+      bcn_disable_pipeline(device, &device->bcn_encode_pipeline);
+   const uint8_t *g = ran ? rgba.map : NULL;
+   snprintf(report, size, "self-test ran=%d decode=%s astc=%s bc=%s first=%02x%02x%02x%02x",
+            ran, device->bcn_decode_pipeline ? "ok" : "off",
+            device->bcn_astc_pipeline ? "ok" : "off", device->bcn_encode_pipeline ? "ok" : "off",
+            g ? g[0] : 0, g ? g[1] : 0, g ? g[2] : 0, g ? g[3] : 0);
+
+   if (fence)
+      device->dispatch_table.DestroyFence(device->dispatch_handle, fence, NULL);
+   if (pool)
+      device->dispatch_table.DestroyCommandPool(device->dispatch_handle, pool, NULL);
+   struct bcn_selftest_buf *bufs[4] = { &blk, &rgba, &astc, &bc };
+   for (int i = 0; i < 4; i++) {
+      if (bufs[i]->buffer)
+         device->dispatch_table.DestroyBuffer(device->dispatch_handle, bufs[i]->buffer, NULL);
+      if (bufs[i]->memory)
+         device->dispatch_table.FreeMemory(device->dispatch_handle, bufs[i]->memory, NULL);
+   }
+}
+
+/* Creates the shaders once per device and checks them on a known block;
+ * each one that fails only disables the work that needs it. */
 void
-wrapper_bcn_gpu_init(struct wrapper_device *device)
+wrapper_bcn_gpu_init(struct wrapper_device *device, uint32_t family)
 {
    simple_mtx_lock(&device->bcn_gpu_mutex);
    if (device->bcn_tool_state != 0) {
@@ -285,18 +485,21 @@ wrapper_bcn_gpu_init(struct wrapper_device *device)
       astc = bcn_create_pipeline(device, wrapper_astc_encode_spv, sizeof(wrapper_astc_encode_spv),
                                  &device->bcn_astc_module, &device->bcn_astc_pipeline);
    }
-   WRAPPER_LOG(info, "BCn GPU shaders: bda=%d layout=%d decode=%d bc-encode=%d astc-encode=%d",
-               device->bcn_bda, layout, dec, enc, astc);
-   wrapper_diag_append("[BCN] GPU shaders: bda=%d layout=%d decode=%d bc-encode=%d "
-                       "astc-encode=%d upload=%s\n", device->bcn_bda, layout, dec, enc, astc,
-                       wrapper_bcn_gpu_path() ? "gpu" : "cpu");
+   char report[160] = "self-test not run";
+   if (layout == VK_SUCCESS && family != UINT32_MAX)
+      bcn_selftest(device, family, report, sizeof(report));
+   WRAPPER_LOG(info, "BCn GPU shaders: bda=%d layout=%d decode=%d bc-encode=%d astc-encode=%d %s",
+               device->bcn_bda, layout, dec, enc, astc, report);
+   wrapper_diag_append("[BCN] GPU shaders (VkResult): bda=%d layout=%d decode=%d bc-encode=%d "
+                       "astc-encode=%d, %s, upload=%s\n", device->bcn_bda, layout, dec, enc,
+                       astc, report, wrapper_bcn_gpu_path() ? "gpu" : "cpu");
    simple_mtx_unlock(&device->bcn_gpu_mutex);
 }
 
 static bool
 bcn_tools_ready(struct wrapper_device *device)
 {
-   wrapper_bcn_gpu_init(device);
+   wrapper_bcn_gpu_init(device, UINT32_MAX);
    return device->bcn_tool_state == 1;
 }
 
