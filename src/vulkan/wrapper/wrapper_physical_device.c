@@ -325,11 +325,14 @@ VkResult enumerate_physical_device(struct vk_instance *_instance)
       pdevice->dispatch_table.GetPhysicalDeviceProperties2(
          pdevice->dispatch_handle, &pdevice->properties2);
 
-      /* The raised limit is not real storage: DXVK's independent GPL layouts
-       * push 224 bytes and overrun the driver's command buffer. */
+      /* Only DXVK needs the raised limit; vkd3d-proton works within the real
+       * one. The raised limit is not real storage: DXVK's independent GPL
+       * layouts push 224 bytes and overrun the driver's command buffer. */
+      const char *engine = pdevice->instance->vk.app_info.engine_name;
       pdevice->raises_push_constant_limit =
          pdevice->driver_properties.driverID == VK_DRIVER_ID_SAMSUNG_PROPRIETARY &&
-         pdevice->properties2.properties.limits.maxPushConstantsSize < 256;
+         pdevice->properties2.properties.limits.maxPushConstantsSize < 256 &&
+         !(engine && strstr(engine, "vkd3d"));
       if (pdevice->raises_push_constant_limit &&
           pdevice->vk.supported_extensions.EXT_graphics_pipeline_library) {
          WRAPPER_LOG(info, "Hiding VK_EXT_graphics_pipeline_library: the driver stores only %u bytes of push constants",

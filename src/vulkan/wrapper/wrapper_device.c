@@ -2711,15 +2711,14 @@ wrapper_CmdPushConstants(VkCommandBuffer commandBuffer, VkPipelineLayout layout,
 
    if (pdev->raises_push_constant_limit) {
       uint32_t limit = pdev->properties2.properties.limits.maxPushConstantsSize;
-      if (offset >= limit)
+      if (offset >= limit) {
+         WRAPPER_LOG(error, "Dropping push constants past the driver's %u bytes (offset %u size %u)",
+                     limit, offset, size);
          return;
+      }
       if (offset + size > limit) {
-         static bool warned;
-         if (!warned) {
-            warned = true;
-            WRAPPER_LOG(error, "Dropping push constants past the driver's %u bytes (offset %u size %u)",
-                        limit, offset, size);
-         }
+         WRAPPER_LOG(error, "Dropping push constants past the driver's %u bytes (offset %u size %u)",
+                     limit, offset, size);
          size = limit - offset;
       }
    }
