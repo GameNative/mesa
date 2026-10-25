@@ -145,7 +145,16 @@ fold_merge_get(struct wrapper_device *device, const VkDescriptorSetLayout *handl
    m->next = device->fold_merges;
    device->fold_merges = m;
 
-   uint32_t fixed = MAX2(device->fold_max_pool_count, 262144);
+   uint32_t budget = device->physical->properties2.properties.limits.maxPerStageResources;
+   uint32_t small = 0;
+   for (uint32_t k = 0; k < count; k++) {
+      struct fold_layout *l = fold_layout_lookup(device, handles[k]);
+      for (uint32_t b = 0; b < l->binding_count; b++)
+         if (b != l->variable_binding)
+            small += l->bindings[b].vk.descriptorCount;
+   }
+   uint32_t per_array = budget > small ? (budget - small) / count : 1;
+   uint32_t fixed = MIN2(MAX2(device->fold_max_pool_count, 65536), per_array);
    VkDescriptorSetLayoutCreateFlags flags = 0;
    uint32_t n = 0, base = 0;
    uint64_t total = 0;
@@ -161,6 +170,7 @@ fold_merge_get(struct wrapper_device *device, const VkDescriptorSetLayout *handl
          VkDescriptorBindingFlags bf = l->bindings[b].flags;
          vb.binding += base;
          if (b == l->variable_binding && last) {
+            vb.descriptorCount = MIN2(vb.descriptorCount, per_array);
             m->declared_variable = vb.descriptorCount;
          } else {
             if (b == l->variable_binding) {
@@ -193,9 +203,9 @@ fold_merge_get(struct wrapper_device *device, const VkDescriptorSetLayout *handl
                                                                  &ci, NULL, &m->merged);
    if (r != VK_SUCCESS)
       m->merged = VK_NULL_HANDLE;
-   WRAPPER_LOG(info, "Folded %u bindless set layouts into one: %u bindings, fixed arrays of %u "
-               "(largest view heap seen %u), %llu fixed descriptors, result %d",
-               count, n, fixed, device->fold_max_pool_count, (unsigned long long)total, r);
+   WRAPPER_LOG(info, "Folded %u bindless set layouts into one: %u bindings, arrays of %u "
+               "(largest view heap seen %u, per-stage budget %u), %llu fixed descriptors, result %d",
+               count, n, fixed, device->fold_max_pool_count, budget, (unsigned long long)total, r);
    return m->merged ? m : NULL;
 }
 
@@ -615,6 +625,34 @@ wrapper_fold_remap_updates(struct wrapper_device *device,
    return true;
 }
 
+static struct fold_instance *
+fold_instance_for_member(struct wrapper_device *device, struct fold_merge *m,
+                         VkDescriptorSet set, uint32_t member)
+{
+   struct fold_set *fs = _mesa_hash_table_u64_search(device->fold_set_table, (uint64_t)set);
+   if (!fs || fs->layout_handle != m->handles[member])
+      return NULL;
+   if (fs->instance && fs->instance->merge == m)
+      return fs->instance;
+
+   VkDescriptorSet sets[FOLD_MAX_MEMBERS] = { 0 };
+   sets[member] = set;
+   hash_table_u64_foreach(device->fold_set_table, entry) {
+      struct fold_set *other = entry.data;
+      if (other->pool != fs->pool)
+         continue;
+      for (uint32_t k = 0; k < m->member_count; k++)
+         if (!sets[k] && k != member && other->layout_handle == m->handles[k])
+            sets[k] = (VkDescriptorSet)(uintptr_t)entry.key;
+   }
+   for (uint32_t k = 0; k < m->member_count; k++)
+      if (!sets[k]) {
+         WRAPPER_LOG(error, "Folded set %u has no sibling in its pool", k);
+         return NULL;
+      }
+   return fold_instance_create(device, m, sets);
+}
+
 bool
 wrapper_fold_bind(struct wrapper_command_buffer *wcb, VkPipelineBindPoint bind_point,
                   VkPipelineLayout layout, uint32_t first, uint32_t count,
@@ -634,19 +672,10 @@ wrapper_fold_bind(struct wrapper_command_buffer *wcb, VkPipelineBindPoint bind_p
       uint32_t s = first + i;
       VkDescriptorSet set = sets[i];
       if (s >= pl->run_start && s < run_end) {
-         if (s != pl->run_start || first + count < run_end) {
-            if (s == pl->run_start || i == 0)
-               WRAPPER_LOG(error, "Folded sets bound partially (first %u count %u)", first, count);
+         if (n && idx[n - 1] == pl->run_start)
             continue;
-         }
-         struct fold_set *fs =
-            _mesa_hash_table_u64_search(device->fold_set_table, (uint64_t)set);
-         struct fold_instance *inst = fs ? fs->instance : NULL;
-         if (inst && (inst->merge != pl->merge ||
-                      memcmp(inst->sets, &sets[i], pl->run_len * sizeof(*sets))))
-            inst = NULL;
-         if (!inst)
-            inst = fold_instance_create(device, pl->merge, &sets[i]);
+         struct fold_instance *inst =
+            fold_instance_for_member(device, pl->merge, set, s - pl->run_start);
          if (!inst)
             continue;
          set = inst->set;

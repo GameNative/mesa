@@ -218,10 +218,10 @@ wrapper_core13_init_physical_device(struct wrapper_physical_device *pdevice)
    WRAPPER_LOG(info, "Lowering Vulkan 1.3 core to a %u.%u.%u base driver",
                VK_API_VERSION_MAJOR(base), VK_API_VERSION_MINOR(base),
                VK_API_VERSION_PATCH(base));
-   for (int i = 0; i < VK_DEVICE_EXTENSION_COUNT; i++)
-      if (e->extensions[i])
-         WRAPPER_LOG(info, "Base device extension %s",
-                     vk_device_extensions[i].extensionName);
+   WRAPPER_LOG(info, "Base limits: maxBoundDescriptorSets %u maxPerStageResources %u "
+               "maxPushConstantsSize %u", pdevice->properties2.properties.limits.maxBoundDescriptorSets,
+               pdevice->properties2.properties.limits.maxPerStageResources,
+               pdevice->properties2.properties.limits.maxPushConstantsSize);
 }
 
 #undef QUERY_IF
