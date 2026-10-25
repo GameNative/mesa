@@ -541,7 +541,8 @@ wrapper_create_null_resources(struct wrapper_device *device)
       .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
       .size = 65536,
       .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-               VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT,
+               VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT |
+               VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
       .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
    };
    if (dt->CreateBuffer(dev, &bci, NULL, &device->null_buffer) != VK_SUCCESS)
@@ -683,21 +684,32 @@ wrapper_CmdBindVertexBuffers2(VkCommandBuffer commandBuffer, uint32_t firstBindi
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
    struct wrapper_device *device = wcb->device;
    VkBuffer *bufs = NULL;
+   VkDeviceSize *offsets = NULL, *sizes = NULL;
    if (device->emulate_null_descriptor && pBuffers) {
       bufs = malloc(sizeof(VkBuffer) * bindingCount);
-      for (uint32_t i = 0; i < bindingCount; i++)
+      offsets = malloc(sizeof(VkDeviceSize) * bindingCount);
+      sizes = pSizes ? malloc(sizeof(VkDeviceSize) * bindingCount) : NULL;
+      for (uint32_t i = 0; i < bindingCount; i++) {
          bufs[i] = pBuffers[i] ? pBuffers[i] : device->null_buffer;
+         offsets[i] = pBuffers[i] ? pOffsets[i] : 0;
+         if (sizes)
+            sizes[i] = pBuffers[i] ? pSizes[i] : VK_WHOLE_SIZE;
+      }
+      pBuffers = bufs;
+      pOffsets = offsets;
+      if (sizes)
+         pSizes = sizes;
    }
    if (device->dispatch_table.CmdBindVertexBuffers2)
       device->dispatch_table.CmdBindVertexBuffers2(wcb->dispatch_handle,
-         firstBinding, bindingCount, bufs ? bufs : pBuffers, pOffsets, pSizes,
-         pStrides);
+         firstBinding, bindingCount, pBuffers, pOffsets, pSizes, pStrides);
    else if (wrapper_lowers_core13(device) &&
             device->dispatch_table.CmdBindVertexBuffers2EXT)
       device->dispatch_table.CmdBindVertexBuffers2EXT(wcb->dispatch_handle,
-         firstBinding, bindingCount, bufs ? bufs : pBuffers, pOffsets, pSizes,
-         pStrides);
+         firstBinding, bindingCount, pBuffers, pOffsets, pSizes, pStrides);
    free(bufs);
+   free(offsets);
+   free(sizes);
 }
 
 /* Core 1.3 dynamic state may be supplied by EXT_extended_dynamic_state{,2} on
@@ -892,14 +904,19 @@ wrapper_CmdBindVertexBuffers(VkCommandBuffer commandBuffer, uint32_t firstBindin
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
    struct wrapper_device *device = wcb->device;
    VkBuffer *bufs = NULL;
+   VkDeviceSize *offsets = NULL;
    if (device->emulate_null_descriptor && pBuffers) {
       bufs = malloc(sizeof(VkBuffer) * bindingCount);
-      for (uint32_t i = 0; i < bindingCount; i++)
+      offsets = malloc(sizeof(VkDeviceSize) * bindingCount);
+      for (uint32_t i = 0; i < bindingCount; i++) {
          bufs[i] = pBuffers[i] ? pBuffers[i] : device->null_buffer;
+         offsets[i] = pBuffers[i] ? pOffsets[i] : 0;
+      }
    }
    device->dispatch_table.CmdBindVertexBuffers(wcb->dispatch_handle, firstBinding,
-      bindingCount, bufs ? bufs : pBuffers, pOffsets);
+      bindingCount, bufs ? bufs : pBuffers, offsets ? offsets : pOffsets);
    free(bufs);
+   free(offsets);
 }
 
 
@@ -2264,6 +2281,13 @@ wrapper_CmdBindIndexBuffer2KHR(VkCommandBuffer commandBuffer, VkBuffer buffer,
                                VkIndexType indexType) {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
    struct wrapper_device *device = wcb->device;
+
+   if (buffer == VK_NULL_HANDLE && device->emulate_null_descriptor &&
+       device->null_buffer != VK_NULL_HANDLE) {
+      buffer = device->null_buffer;
+      offset = 0;
+      size = VK_WHOLE_SIZE;
+   }
 
    if (device->dispatch_table.CmdBindIndexBuffer2)
       device->dispatch_table.CmdBindIndexBuffer2(wcb->dispatch_handle, buffer, offset, size, indexType);
