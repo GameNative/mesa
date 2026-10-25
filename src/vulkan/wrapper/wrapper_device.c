@@ -8,6 +8,7 @@
 #include "wrapper_bcdec.h"
 #include "wrapper_bcn_spv.h"
 #include "spirv_patcher.hpp"
+#include "wrapper_spirv_lower.h"
 #include "wrapper_entrypoints.h"
 #include "wrapper_trampolines.h"
 #include "vk_alloc.h"
@@ -4379,6 +4380,19 @@ wrapper_CmdExecuteCommands(VkCommandBuffer commandBuffer,
       wcb->dispatch_handle, commandBufferCount, command_buffers);
 }
 
+static uint32_t
+wrapper_max_spirv_version(const struct wrapper_physical_device *pdevice)
+{
+   uint32_t api = pdevice->properties2.properties.apiVersion;
+   if (api >= VK_API_VERSION_1_3)
+      return 0x00010600;
+   if (api >= VK_API_VERSION_1_2)
+      return 0x00010500;
+   if (pdevice->base_supported_extensions.KHR_spirv_1_4)
+      return 0x00010400;
+   return 0x00010300;
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 wrapper_CreateShaderModule(VkDevice _device,
 						   const VkShaderModuleCreateInfo *pCreateInfo,
@@ -4398,6 +4412,21 @@ wrapper_CreateShaderModule(VkDevice _device,
       wrapper_no_patch_OpConstComp = getenv("WRAPPER_NO_PATCH_OPCONSTCOMP") && atoi(getenv("WRAPPER_NO_PATCH_OPCONSTCOMP"));
       
    VkShaderModuleCreateInfo create_info = *pCreateInfo;
+   uint32_t *lowered = NULL;
+   size_t lowered_words = 0;
+
+   if (create_info.codeSize >= 20 &&
+       create_info.pCode[1] > wrapper_max_spirv_version(device->physical)) {
+      enum wrapper_spirv_lower_result r = wrapper_spirv_lower_to_1_3(
+         create_info.pCode, create_info.codeSize / 4, &lowered, &lowered_words);
+      if (r == WRAPPER_SPIRV_LOWERED) {
+         create_info.pCode = lowered;
+         create_info.codeSize = lowered_words * 4;
+      } else if (r == WRAPPER_SPIRV_FAILED) {
+         WRAPPER_LOG(error, "Cannot lower SPIR-V %u.%u to 1.3 for this driver",
+                     (pCreateInfo->pCode[1] >> 16) & 0xff, (pCreateInfo->pCode[1] >> 8) & 0xff);
+      }
+   }
 
    simple_mtx_lock(&device->resource_mutex);
 
@@ -4422,6 +4451,7 @@ wrapper_CreateShaderModule(VkDevice _device,
        (device->emulate_dynamic_stride || device->emulate_vertex_divisor))
       wrapper_stride_note_module(device, *pShaderModule, create_info.pCode,
                                  create_info.codeSize);
+   free(lowered);
    return result;
 }
 
