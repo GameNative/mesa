@@ -23,7 +23,7 @@ wrapper_bcn_gpu_misaligned(const struct wrapper_image *wi, const VkBufferImageCo
 
 uint32_t
 wrapper_bcn_gpu_upload(struct wrapper_command_buffer *wcb, struct wrapper_image *wi,
-                       VkBuffer src, VkImageLayout layout, uint32_t count,
+                       struct wrapper_buffer *wb, VkImageLayout layout, uint32_t count,
                        const VkBufferImageCopy *regions);
 
 void
@@ -43,5 +43,32 @@ wrapper_cmd_track_push(struct wrapper_command_buffer *wcb, VkPipelineLayout layo
 
 void
 wrapper_cmd_track_reset(struct wrapper_command_buffer *wcb);
+
+void
+wrapper_bcn_hq_capture(struct wrapper_command_buffer *wcb, struct wrapper_image *wi,
+                       struct wrapper_buffer *wb, VkImageLayout layout,
+                       const VkBufferImageCopy *c, uint32_t block);
+
+void
+wrapper_bcn_hq_write(struct wrapper_device *device, struct wrapper_image *wi,
+                     const VkImageSubresourceLayers *sub, VkOffset3D offset, VkExtent3D extent);
+
+void
+wrapper_bcn_hq_layout(struct wrapper_device *device, VkImage image, VkImageLayout layout);
+
+void
+wrapper_bcn_hq_image_destroy(struct wrapper_device *device, struct wrapper_image *wi);
+
+void
+wrapper_bcn_hq_cmd_reset(struct wrapper_command_buffer *wcb);
+
+void
+wrapper_bcn_hq_submitted(struct wrapper_queue *queue, struct wrapper_command_buffer *wcb);
+
+void
+wrapper_bcn_hq_flush(struct wrapper_queue *queue);
+
+void
+wrapper_bcn_hq_finish(struct wrapper_device *device);
 
 #endif

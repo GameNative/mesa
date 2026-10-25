@@ -2316,6 +2316,7 @@ wrapper_DestroyImage(VkDevice _device,
    VK_FROM_HANDLE(wrapper_device, device, _device);
 
    struct wrapper_image *wi = get_wrapper_image_from_handle(device, image);
+   wrapper_bcn_hq_image_destroy(device, wi);
    wrapper_image_destroy(device, wi, pAllocator);
 }
 
@@ -2904,6 +2905,7 @@ static void
 wrapper_bcn_transients_free(struct wrapper_command_buffer *wcb)
 {
    struct wrapper_device *device = wcb->device;
+   wrapper_bcn_hq_cmd_reset(wcb);
    list_for_each_entry_safe(struct wrapper_buffer, wb, &wcb->bcn_transients, link) {
       if (wb->dispatch_handle)
          device->dispatch_table.DestroyBuffer(device->dispatch_handle,
@@ -2915,6 +2917,28 @@ wrapper_bcn_transients_free(struct wrapper_command_buffer *wcb)
       list_del(&wb->link);
       vk_object_free(&device->vk, &device->vk.alloc, wb);
    }
+}
+
+static void
+wrapper_bcn_hq_barriers(struct wrapper_device *device, uint32_t count,
+                        const VkImageMemoryBarrier *barriers)
+{
+   if (!__atomic_load_n(&device->bcn_hq_active, __ATOMIC_RELAXED))
+      return;
+   for (uint32_t i = 0; i < count; i++)
+      if (barriers[i].oldLayout != barriers[i].newLayout)
+         wrapper_bcn_hq_layout(device, barriers[i].image, barriers[i].newLayout);
+}
+
+static void
+wrapper_bcn_hq_barriers2(struct wrapper_device *device, const VkDependencyInfo *dep)
+{
+   if (!__atomic_load_n(&device->bcn_hq_active, __ATOMIC_RELAXED))
+      return;
+   for (uint32_t i = 0; i < dep->imageMemoryBarrierCount; i++)
+      if (dep->pImageMemoryBarriers[i].oldLayout != dep->pImageMemoryBarriers[i].newLayout)
+         wrapper_bcn_hq_layout(device, dep->pImageMemoryBarriers[i].image,
+                               dep->pImageMemoryBarriers[i].newLayout);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -3124,6 +3148,7 @@ wrapper_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
    }
 
    wrapper_pipeline_barrier2(wcb, pDependencyInfo);
+   wrapper_bcn_hq_barriers2(wcb->device, pDependencyInfo);
    wrapper_cap_free(capped, stack);
 }
 
@@ -4029,6 +4054,9 @@ wrapper_QueueSubmit(VkQueue _queue, uint32_t submitCount,
 
    struct wrapper_fence *wf = get_wrapper_fence_from_handle(queue->device, fence);
 
+   if (serialise)
+      simple_mtx_lock(&queue->device->query_reset_mutex);
+   wrapper_bcn_hq_flush(queue);
    for (int i = 0; i < submitCount; i++) {
       const VkSubmitInfo *submit_info = &pSubmits[i];
       command_buffers = malloc(sizeof(VkCommandBuffer) *
@@ -4038,14 +4066,12 @@ wrapper_QueueSubmit(VkQueue _queue, uint32_t submitCount,
                         submit_info->pCommandBuffers[j]);
          wcb->fence = wf;
          command_buffers[j] = wcb->dispatch_handle;
-         
+         wrapper_bcn_hq_submitted(queue, wcb);
       }
       wrapper_submits[i] = pSubmits[i];
       wrapper_submits[i].pCommandBuffers = command_buffers;
    }
 
-   if (serialise)
-      simple_mtx_lock(&queue->device->query_reset_mutex);
    result = queue->device->dispatch_table.QueueSubmit(
       queue->dispatch_handle, submitCount, wrapper_submits, fence);
    if (serialise)
@@ -4074,6 +4100,9 @@ wrapper_QueueSubmit2(VkQueue _queue, uint32_t submitCount,
 
    struct wrapper_fence *wf = get_wrapper_fence_from_handle(queue->device, fence);
 
+   if (serialise)
+      simple_mtx_lock(&queue->device->query_reset_mutex);
+   wrapper_bcn_hq_flush(queue);
    for (int i = 0; i < submitCount; i++) {
       const VkSubmitInfo2 *submit_info = &pSubmits[i];
       command_buffers = malloc(sizeof(VkCommandBufferSubmitInfo) *
@@ -4084,13 +4113,12 @@ wrapper_QueueSubmit2(VkQueue _queue, uint32_t submitCount,
          wcb->fence = wf;
          command_buffers[j] = pSubmits[i].pCommandBufferInfos[j];
          command_buffers[j].commandBuffer = wcb->dispatch_handle;
+         wrapper_bcn_hq_submitted(queue, wcb);
       }
       wrapper_submits[i] = pSubmits[i];
       wrapper_submits[i].pCommandBufferInfos = command_buffers;
    }
 
-   if (serialise)
-      simple_mtx_lock(&queue->device->query_reset_mutex);
    if (queue->device->dispatch_table.QueueSubmit2) {
       result = queue->device->dispatch_table.QueueSubmit2(
          queue->dispatch_handle, submitCount, wrapper_submits, fence);
@@ -4773,8 +4801,10 @@ wrapper_bcn_do_copy_regions(struct wrapper_command_buffer *wcb,
    for (uint32_t i = 0; i < regionCount; i++) {
       /* the GPU path, or a region that has to be merged into whole ASTC blocks */
       if ((gpu || wrapper_bcn_gpu_misaligned(wi, &pRegions[i])) &&
-          wrapper_bcn_gpu_upload(wcb, wi, wb->dispatch_handle, dstLayout, 1, &pRegions[i]))
+          wrapper_bcn_gpu_upload(wcb, wi, wb, dstLayout, 1, &pRegions[i]))
          continue;
+      wrapper_bcn_hq_write(device, wi, &pRegions[i].imageSubresource, pRegions[i].imageOffset,
+                           pRegions[i].imageExtent);
       wrapper_bcn_cpu_copy_regions(wcb, device, wb, wi->dispatch_handle, dstLayout,
                                    wi->info.format, 1, &pRegions[i]);
    }
@@ -5054,6 +5084,7 @@ wrapper_CmdPipelineBarrier(VkCommandBuffer commandBuffer,
       dstStageMask, dependencyFlags, memoryBarrierCount, pMemoryBarriers,
       bufferMemoryBarrierCount, pBufferMemoryBarriers, imageMemoryBarrierCount,
       pImageMemoryBarriers);
+   wrapper_bcn_hq_barriers(device, imageMemoryBarrierCount, pImageMemoryBarriers);
    wrapper_cap_free(capped, stack);
 }
 
@@ -5085,6 +5116,7 @@ wrapper_CmdWaitEvents(VkCommandBuffer commandBuffer, uint32_t eventCount,
       pEvents, srcStageMask, dstStageMask, memoryBarrierCount, pMemoryBarriers,
       bufferMemoryBarrierCount, pBufferMemoryBarriers, imageMemoryBarrierCount,
       pImageMemoryBarriers);
+   wrapper_bcn_hq_barriers(device, imageMemoryBarrierCount, pImageMemoryBarriers);
    wrapper_cap_free(capped, stack);
 }
 
@@ -5120,6 +5152,8 @@ wrapper_CmdWaitEvents2(VkCommandBuffer commandBuffer, uint32_t eventCount,
 
    device->dispatch_table.CmdWaitEvents2(wcb->dispatch_handle, eventCount,
       pEvents, pDependencyInfos);
+   for (uint32_t i = 0; i < eventCount; i++)
+      wrapper_bcn_hq_barriers2(device, &pDependencyInfos[i]);
    free(deps);
    free(capped);
 }
@@ -5530,6 +5564,7 @@ wrapper_DestroyDevice(VkDevice _device, const VkAllocationCallbacks* pAllocator)
       vk_free2(&device->vk.alloc, pAllocator, queue);
    }
    if (device->dispatch_handle != VK_NULL_HANDLE) {
+      wrapper_bcn_hq_finish(device);
       wrapper_bcn_gpu_finish(device);
       device->dispatch_table.DestroyDevice(device->
          dispatch_handle, pAllocator);

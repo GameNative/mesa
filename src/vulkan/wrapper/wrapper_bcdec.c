@@ -995,6 +995,26 @@ bcn_astc_kind(VkFormat format)
    }
 }
 
+/* astcenc encode of tightly packed BC blocks (w x h texels) to the image's
+ * ASTC format, on the given number of threads and at the given quality. */
+int
+wrapper_bcn_astc_encode_cpu(const void *blocks, int w, int h, VkFormat format, uint8_t *out,
+                            size_t len, unsigned threads, float quality)
+{
+   VkFormat img = get_format_for_bcn(format);
+   int hdr = bcn_astc_kind(format) == WRAPPER_ASTC_HDR_RGB;
+   uint8_t *texels = malloc((size_t)w * h * (hdr ? 8 : 4));
+   if (!texels)
+      return -1;
+   bcn_decode_for_astc(blocks, w, h, (w + 3) / 4, format, texels);
+   int srgb = get_decode_format_for_bcn(format) == VK_FORMAT_R8G8B8A8_SRGB;
+   int r = wrapper_astcenc_compress_threads(texels, w, h, is_astc_hdr_4x4(img) ? 4 :
+                                            bcn_astc_block_edge(img), bcn_astc_kind(format),
+                                            srgb, out, len, threads, quality);
+   free(texels);
+   return r;
+}
+
 void
 decompress_bcn_format(void *srcBuffer,
 					  void *dstBuffer,
