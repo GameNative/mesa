@@ -647,9 +647,27 @@ bcn_astc_block(VkFormat stored)
    return is_astc_6x6(stored) ? 6 : is_astc_8x8(stored) ? 8 : is_astc_4x4(stored) ? 4 : 0;
 }
 
+/* Whether a region of an image stored as ASTC does not cover whole ASTC
+ * blocks: BC regions start on 4-texel boundaries, 6x6 and 8x8 blocks do not. */
+bool
+wrapper_bcn_gpu_misaligned(const struct wrapper_image *wi, const VkBufferImageCopy *c)
+{
+   uint32_t astc = bcn_astc_block(get_format_for_bcn(wi->info.format));
+   if (!astc)
+      return false;
+   uint32_t m = c->imageSubresource.mipLevel;
+   uint32_t lw = MAX2(1u, wi->info.extent.width >> m), lh = MAX2(1u, wi->info.extent.height >> m);
+   uint32_t w = c->imageExtent.width, h = c->imageExtent.height;
+   return (c->imageOffset.x % astc) || (c->imageOffset.y % astc) ||
+          ((w % astc) && c->imageOffset.x + w != lw) ||
+          ((h % astc) && c->imageOffset.y + h != lh);
+}
+
 /* GPU upload of one region: the blocks are copied out of the application's
  * buffer, decoded, and either copied in as decoded texels or encoded to ASTC
- * first. */
+ * first. A region that does not cover whole ASTC blocks is merged into the
+ * texels already in the image: the covering blocks are unpacked, overwritten
+ * and encoded again. */
 static bool
 bcn_gpu_upload_region(struct wrapper_command_buffer *wcb, struct wrapper_image *wi,
                       VkBuffer src, VkImageLayout layout, const VkBufferImageCopy *c)
@@ -666,12 +684,19 @@ bcn_gpu_upload_region(struct wrapper_command_buffer *wcb, struct wrapper_image *
    uint32_t w = c->imageExtent.width, h = c->imageExtent.height;
    uint32_t m = c->imageSubresource.mipLevel;
    uint32_t lw = MAX2(1u, wi->info.extent.width >> m), lh = MAX2(1u, wi->info.extent.height >> m);
-   if (astc && ((c->imageOffset.x % astc) || (c->imageOffset.y % astc) ||
-                ((w % astc) && c->imageOffset.x + w != lw) ||
-                ((h % astc) && c->imageOffset.y + h != lh)))
-      return false;
    if (!w || !h || !bcn_tools_ready(device))
       return false;
+   bool merge = astc && wrapper_bcn_gpu_misaligned(wi, c);
+   /* the rectangle written: the region, or the ASTC blocks covering it */
+   uint32_t x0 = c->imageOffset.x, y0 = c->imageOffset.y, ew = w, eh = h;
+   if (merge) {
+      x0 = c->imageOffset.x / astc * astc;
+      y0 = c->imageOffset.y / astc * astc;
+      ew = MIN2((c->imageOffset.x + w + astc - 1) / astc * astc, lw) - x0;
+      eh = MIN2((c->imageOffset.y + h + astc - 1) / astc * astc, lh) - y0;
+      if (!bcn_blit_supported(device, stored, bcn_unpacked_format(format)))
+         return false;
+   }
 
    uint32_t layers = bcn_layers(wi, &c->imageSubresource);
    uint32_t bb = bcn_block_bytes(format);
@@ -739,12 +764,93 @@ bcn_gpu_upload_region(struct wrapper_command_buffer *wcb, struct wrapper_image *
       .imageExtent = c->imageExtent,
    };
    VkBuffer from = texels->dispatch_handle;
+   VkDeviceAddress enc_addr = texels_addr;
+   uint32_t enc_row = nbx * 4 * 4, enc_slice = nbx * 4 * nby * 4 * 4;
+   if (merge) {
+      /* unpack the covering blocks, then lay the new texels over them */
+      VkImage t = bcn_transient_image(wcb, bcn_unpacked_format(format), ew, eh, layers);
+      VkDeviceAddress merged_addr;
+      struct wrapper_buffer *merged = bcn_transient_buffer(wcb,
+         (VkDeviceSize)ew * eh * 4 * layers, &merged_addr);
+      if (!t || !merged)
+         return false;
+      VkImageSubresourceRange range = {
+         VK_IMAGE_ASPECT_COLOR_BIT, m, 1, c->imageSubresource.baseArrayLayer, layers,
+      };
+      VkImageMemoryBarrier to_src = {
+         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+         .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+         .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+         .oldLayout = layout,
+         .newLayout = layout == VK_IMAGE_LAYOUT_GENERAL ? layout : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+         .image = wi->dispatch_handle,
+         .subresourceRange = range,
+      };
+      device->dispatch_table.CmdPipelineBarrier(wcb->dispatch_handle,
+         VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL,
+         1, &to_src);
+      bcn_image_barrier(wcb, t, layers, VK_IMAGE_LAYOUT_UNDEFINED,
+                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
+      VkImageBlit blit = {
+         .srcSubresource = c->imageSubresource,
+         .srcOffsets = { { (int32_t)x0, (int32_t)y0, 0 },
+                         { (int32_t)(x0 + ew), (int32_t)(y0 + eh), 1 } },
+         .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, layers },
+         .dstOffsets = { { 0, 0, 0 }, { (int32_t)ew, (int32_t)eh, 1 } },
+      };
+      blit.srcSubresource.layerCount = layers;
+      device->dispatch_table.CmdBlitImage(wcb->dispatch_handle, wi->dispatch_handle,
+         to_src.newLayout, t, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
+      VkImageMemoryBarrier back = to_src;
+      back.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+      back.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+      back.oldLayout = to_src.newLayout;
+      back.newLayout = layout;
+      device->dispatch_table.CmdPipelineBarrier(wcb->dispatch_handle,
+         VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL,
+         1, &back);
+      bcn_image_barrier(wcb, t, layers, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+                        VK_ACCESS_TRANSFER_READ_BIT);
+      VkBufferImageCopy unpack = {
+         .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, layers },
+         .imageExtent = { ew, eh, 1 },
+      };
+      device->dispatch_table.CmdCopyImageToBuffer(wcb->dispatch_handle, t,
+         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, merged->dispatch_handle, 1, &unpack);
+      bcn_barrier(wcb);
+      uint32_t dx = c->imageOffset.x - x0, dy = c->imageOffset.y - y0;
+      for (uint32_t l = 0; l < layers; l++)
+         for (uint32_t y = 0; y < h; y++) {
+            VkBufferCopy bc = {
+               ((VkDeviceSize)l * nby * 4 + y) * nbx * 4 * 4,
+               (((VkDeviceSize)l * eh + dy + y) * ew + dx) * 4,
+               (VkDeviceSize)w * 4,
+            };
+            device->dispatch_table.CmdCopyBuffer(wcb->dispatch_handle, texels->dispatch_handle,
+                                                 merged->dispatch_handle, 1, &bc);
+         }
+      enc_addr = merged_addr;
+      enc_row = ew * 4;
+      enc_slice = ew * eh * 4;
+      w = ew;
+      h = eh;
+      abx = (w + astc - 1) / astc;
+      aby = (h + astc - 1) / astc;
+      out = bcn_transient_buffer(wcb, (VkDeviceSize)abx * aby * 16 * layers, &out_addr);
+      if (!out)
+         return false;
+      copy.imageOffset = (VkOffset3D){ (int32_t)x0, (int32_t)y0, c->imageOffset.z };
+      copy.imageExtent = (VkExtent3D){ ew, eh, 1 };
+   }
    if (astc) {
       struct bcn_pc ac = {
-         .src = { (uint32_t)texels_addr, (uint32_t)(texels_addr >> 32) },
+         .src = { (uint32_t)enc_addr, (uint32_t)(enc_addr >> 32) },
          .dst = { (uint32_t)out_addr, (uint32_t)(out_addr >> 32) },
-         .src_row_pitch = nbx * 4 * 4,
-         .src_slice_pitch = nbx * 4 * nby * 4 * 4,
+         .src_row_pitch = enc_row,
+         .src_slice_pitch = enc_slice,
          .dst_row_pitch = abx * 16,
          .dst_slice_pitch = abx * aby * 16,
          .blocks_x = abx,
