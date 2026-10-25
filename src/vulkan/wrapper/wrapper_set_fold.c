@@ -132,6 +132,51 @@ fold_layout_lookup(struct wrapper_device *device, VkDescriptorSetLayout handle)
    return _mesa_hash_table_u64_search(device->fold_layout_table, (uint64_t)handle);
 }
 
+enum fold_class {
+   FOLD_CLASS_SAMPLER,
+   FOLD_CLASS_SAMPLED,
+   FOLD_CLASS_STORAGE_IMAGE,
+   FOLD_CLASS_UBO,
+   FOLD_CLASS_SSBO,
+   FOLD_CLASS_COUNT,
+};
+
+static uint32_t
+fold_class_mask(VkDescriptorType type)
+{
+   switch (type) {
+   case VK_DESCRIPTOR_TYPE_SAMPLER:
+      return BITFIELD_BIT(FOLD_CLASS_SAMPLER);
+   case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+      return BITFIELD_BIT(FOLD_CLASS_SAMPLER) | BITFIELD_BIT(FOLD_CLASS_SAMPLED);
+   case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+   case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+      return BITFIELD_BIT(FOLD_CLASS_SAMPLED);
+   case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+   case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
+      return BITFIELD_BIT(FOLD_CLASS_STORAGE_IMAGE);
+   case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+   case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
+      return BITFIELD_BIT(FOLD_CLASS_UBO);
+   case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+   case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
+      return BITFIELD_BIT(FOLD_CLASS_SSBO);
+   default:
+      return 0;
+   }
+}
+
+static uint32_t
+fold_binding_cap(const uint32_t *class_cap, uint32_t resource_cap, VkDescriptorType type)
+{
+   uint32_t cap = resource_cap;
+   uint32_t mask = fold_class_mask(type);
+   for (uint32_t c = 0; c < FOLD_CLASS_COUNT; c++)
+      if (mask & BITFIELD_BIT(c))
+         cap = MIN2(cap, class_cap[c]);
+   return MAX2(cap, 1);
+}
+
 static struct fold_merge *
 fold_merge_get(struct wrapper_device *device, const VkDescriptorSetLayout *handles, uint32_t count)
 {
@@ -147,17 +192,46 @@ fold_merge_get(struct wrapper_device *device, const VkDescriptorSetLayout *handl
    m->next = device->fold_merges;
    device->fold_merges = m;
 
-   uint32_t budget = device->physical->properties2.properties.limits.maxPerStageResources;
-   uint32_t small = 0;
+   const struct vk_properties *p = &device->physical->vk.properties;
+   const uint32_t limits[FOLD_CLASS_COUNT] = {
+      [FOLD_CLASS_SAMPLER] = MIN2(p->maxPerStageDescriptorUpdateAfterBindSamplers,
+                                  p->maxDescriptorSetUpdateAfterBindSamplers),
+      [FOLD_CLASS_SAMPLED] = MIN2(p->maxPerStageDescriptorUpdateAfterBindSampledImages,
+                                  p->maxDescriptorSetUpdateAfterBindSampledImages),
+      [FOLD_CLASS_STORAGE_IMAGE] = MIN2(p->maxPerStageDescriptorUpdateAfterBindStorageImages,
+                                        p->maxDescriptorSetUpdateAfterBindStorageImages),
+      [FOLD_CLASS_UBO] = MIN2(p->maxPerStageDescriptorUpdateAfterBindUniformBuffers,
+                              p->maxDescriptorSetUpdateAfterBindUniformBuffers),
+      [FOLD_CLASS_SSBO] = MIN2(p->maxPerStageDescriptorUpdateAfterBindStorageBuffers,
+                               p->maxDescriptorSetUpdateAfterBindStorageBuffers),
+   };
+   uint64_t small[FOLD_CLASS_COUNT] = {0}, small_total = 0;
+   uint32_t arrays[FOLD_CLASS_COUNT] = {0};
    for (uint32_t k = 0; k < count; k++) {
       struct fold_layout *l = fold_layout_lookup(device, handles[k]);
-      for (uint32_t b = 0; b < l->binding_count; b++)
+      for (uint32_t b = 0; b < l->binding_count; b++) {
+         const VkDescriptorSetLayoutBinding *vb = &l->bindings[b].vk;
+         uint32_t mask = fold_class_mask(vb->descriptorType);
+         for (uint32_t c = 0; c < FOLD_CLASS_COUNT; c++) {
+            if (!(mask & BITFIELD_BIT(c)))
+               continue;
+            if (b == l->variable_binding)
+               arrays[c]++;
+            else
+               small[c] += vb->descriptorCount;
+         }
          if (b != l->variable_binding)
-            small += l->bindings[b].vk.descriptorCount;
+            small_total += vb->descriptorCount;
+      }
    }
-   uint32_t per_array = budget > small ? (budget - small) / count : 1;
-   uint32_t floor = debug_get_num_option("WRAPPER_FOLD_ARRAY_SIZE", 8192);
-   uint32_t fixed = MIN2(MAX2(device->fold_max_pool_count, floor), per_array);
+   uint64_t resources = p->maxPerStageUpdateAfterBindResources;
+   uint32_t resource_cap = resources > small_total ? (resources - small_total) / count : 1;
+   uint32_t class_cap[FOLD_CLASS_COUNT];
+   for (uint32_t c = 0; c < FOLD_CLASS_COUNT; c++) {
+      uint64_t room = limits[c] > small[c] ? limits[c] - small[c] : 0;
+      class_cap[c] = arrays[c] ? MAX2(room / arrays[c], 1) : UINT32_MAX;
+   }
+   uint32_t override = debug_get_num_option("WRAPPER_FOLD_ARRAY_SIZE", 0);
    VkDescriptorSetLayoutCreateFlags flags = 0;
    uint32_t n = 0, base = 0;
    uint64_t total = 0;
@@ -172,14 +246,21 @@ fold_merge_get(struct wrapper_device *device, const VkDescriptorSetLayout *handl
          VkDescriptorSetLayoutBinding vb = l->bindings[b].vk;
          VkDescriptorBindingFlags bf = l->bindings[b].flags;
          vb.binding += base;
-         if (b == l->variable_binding && last) {
-            vb.descriptorCount = MIN2(vb.descriptorCount, per_array);
-            m->declared_variable = vb.descriptorCount;
-         } else {
-            if (b == l->variable_binding) {
-               vb.descriptorCount = MIN2(vb.descriptorCount, fixed);
+         if (b == l->variable_binding) {
+            uint32_t cap = fold_binding_cap(class_cap, resource_cap, vb.descriptorType);
+            if (override)
+               cap = MIN2(cap, override);
+            vb.descriptorCount = MIN2(vb.descriptorCount, cap);
+            if (last) {
+               m->declared_variable = vb.descriptorCount;
+            } else {
                bf &= ~VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT;
+               total += vb.descriptorCount;
             }
+            WRAPPER_LOG(info, "Folded set binding %u (type %d): cap %u from driver limits%s",
+                        vb.binding, vb.descriptorType, vb.descriptorCount,
+                        override ? " and WRAPPER_FOLD_ARRAY_SIZE" : "");
+         } else {
             total += vb.descriptorCount;
          }
          m->bindings[n] = vb;
@@ -206,9 +287,9 @@ fold_merge_get(struct wrapper_device *device, const VkDescriptorSetLayout *handl
                                                                  &ci, NULL, &m->merged);
    if (r != VK_SUCCESS)
       m->merged = VK_NULL_HANDLE;
-   WRAPPER_LOG(info, "Folded %u bindless set layouts into one: %u bindings, arrays of %u "
-               "(largest view heap seen %u, per-stage budget %u), %llu fixed descriptors, result %d",
-               count, n, fixed, device->fold_max_pool_count, budget, (unsigned long long)total, r);
+   WRAPPER_LOG(info, "Folded %u bindless set layouts into one: %u bindings, per-stage resource "
+               "cap %u per array (largest view heap seen %u), %llu fixed descriptors, result %d",
+               count, n, resource_cap, device->fold_max_pool_count, (unsigned long long)total, r);
    return m->merged ? m : NULL;
 }
 
