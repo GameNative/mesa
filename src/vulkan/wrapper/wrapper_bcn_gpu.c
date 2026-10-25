@@ -5,15 +5,31 @@
 #include "wrapper_bcdec.h"
 #include "wrapper_bcn_decode_spv.h"
 #include "wrapper_bcn_encode_spv.h"
+#include "wrapper_astc_encode_spv.h"
 #include "wrapper_log.h"
 #include "util/macros.h"
 
-/* GPU work for emulated BC images that has to happen on the GPU timeline:
- * a readback, or a copy to or from another image, needs BC blocks where the
- * image holds ASTC or decoded texels. The stored texels are blitted to an
- * RGBA image (the driver decodes ASTC) and BC-encoded by a compute shader;
- * blocks copied in are decoded by another. Nothing is kept beyond the
+/* GPU work for emulated BC images. A readback, or a copy to or from another
+ * image, needs BC blocks where the image holds ASTC or decoded texels: the
+ * stored texels are blitted to an RGBA image (the driver decodes ASTC) and
+ * BC-encoded by a compute shader; blocks copied in are decoded by another.
+ * The GPU upload path (bcnEmulationType=compute) decodes uploads and encodes
+ * them to ASTC on the GPU instead of the CPU. Nothing is kept beyond the
  * command buffer: the BC blocks of the original upload are not stored. */
+
+int
+wrapper_bcn_gpu_path(void)
+{
+   static int on = -1;
+   if (on == -1) {
+      const char *gpu = getenv("WRAPPER_BCN_GPU");
+      const char *compute = getenv("ENABLE_BCN_COMPUTE");
+      const char *keep = getenv("WRAPPER_KEEP_BCN_LAYER");
+      on = (gpu && atoi(gpu)) ||
+           (compute && atoi(compute) && !(keep && atoi(keep)));
+   }
+   return on;
+}
 
 struct bcn_pc {
    uint32_t src[2];
@@ -253,12 +269,14 @@ bcn_tools_ready(struct wrapper_device *device)
           bcn_create_pipeline(device, wrapper_bcn_decode_spv, sizeof(wrapper_bcn_decode_spv),
                               &device->bcn_decode_module, &device->bcn_decode_pipeline) &&
           bcn_create_pipeline(device, wrapper_bcn_encode_spv, sizeof(wrapper_bcn_encode_spv),
-                              &device->bcn_encode_module, &device->bcn_encode_pipeline))
+                              &device->bcn_encode_module, &device->bcn_encode_pipeline) &&
+          bcn_create_pipeline(device, wrapper_astc_encode_spv, sizeof(wrapper_astc_encode_spv),
+                              &device->bcn_astc_module, &device->bcn_astc_pipeline))
          device->bcn_tool_state = 1;
       const char *state = device->bcn_tool_state == 1 ? "ready" :
          device->bcn_bda ? "failed to initialise" : "needs bufferDeviceAddress";
-      WRAPPER_LOG(info, "BCn GPU decode/encode %s", state);
-      wrapper_diag_append("[BCN] GPU decode/encode %s\n", state);
+      WRAPPER_LOG(info, "BCn GPU shaders %s", state);
+      wrapper_diag_append("[BCN] GPU shaders %s\n", state);
    }
    bool ready = device->bcn_tool_state == 1;
    simple_mtx_unlock(&device->bcn_gpu_mutex);
@@ -273,6 +291,10 @@ wrapper_bcn_gpu_finish(struct wrapper_device *device)
       device->dispatch_table.DestroyPipeline(d, device->bcn_decode_pipeline, NULL);
    if (device->bcn_encode_pipeline)
       device->dispatch_table.DestroyPipeline(d, device->bcn_encode_pipeline, NULL);
+   if (device->bcn_astc_pipeline)
+      device->dispatch_table.DestroyPipeline(d, device->bcn_astc_pipeline, NULL);
+   if (device->bcn_astc_module)
+      device->dispatch_table.DestroyShaderModule(d, device->bcn_astc_module, NULL);
    if (device->bcn_decode_module)
       device->dispatch_table.DestroyShaderModule(d, device->bcn_decode_module, NULL);
    if (device->bcn_encode_module)
@@ -617,4 +639,139 @@ wrapper_bcn_gpu_copy_image_region(struct wrapper_command_buffer *wcb,
    device->dispatch_table.CmdCopyBufferToImage(wcb->dispatch_handle, texels->dispatch_handle,
       dst->dispatch_handle, dst_layout, 1, &unpack);
    return true;
+}
+
+static uint32_t
+bcn_astc_block(VkFormat stored)
+{
+   return is_astc_6x6(stored) ? 6 : is_astc_8x8(stored) ? 8 : is_astc_4x4(stored) ? 4 : 0;
+}
+
+/* GPU upload of one region: the blocks are copied out of the application's
+ * buffer, decoded, and either copied in as decoded texels or encoded to ASTC
+ * first. */
+static bool
+bcn_gpu_upload_region(struct wrapper_command_buffer *wcb, struct wrapper_image *wi,
+                      VkBuffer src, VkImageLayout layout, const VkBufferImageCopy *c)
+{
+   struct wrapper_device *device = wcb->device;
+   VkFormat format = wi->info.format;
+   VkFormat stored = get_format_for_bcn(format);
+   int id = bcn_format_id(format);
+   uint32_t astc = bcn_astc_block(stored);
+   bool decoded = stored == get_decode_format_for_bcn(format);
+   if (id < 0 || id == 8 || id == 9 || (!astc && !decoded) ||
+       wi->info.imageType != VK_IMAGE_TYPE_2D)
+      return false;
+   uint32_t w = c->imageExtent.width, h = c->imageExtent.height;
+   uint32_t m = c->imageSubresource.mipLevel;
+   uint32_t lw = MAX2(1u, wi->info.extent.width >> m), lh = MAX2(1u, wi->info.extent.height >> m);
+   if (astc && ((c->imageOffset.x % astc) || (c->imageOffset.y % astc) ||
+                ((w % astc) && c->imageOffset.x + w != lw) ||
+                ((h % astc) && c->imageOffset.y + h != lh)))
+      return false;
+   if (!w || !h || !bcn_tools_ready(device))
+      return false;
+
+   uint32_t layers = bcn_layers(wi, &c->imageSubresource);
+   uint32_t bb = bcn_block_bytes(format);
+   uint32_t nbx = (w + 3) / 4, nby = (h + 3) / 4;
+   uint32_t ts = astc ? 4 : get_texel_size_for_format(stored);
+   uint32_t row_len = c->bufferRowLength ? c->bufferRowLength : w;
+   uint32_t img_h = c->bufferImageHeight ? c->bufferImageHeight : h;
+   VkDeviceSize src_row = (VkDeviceSize)((row_len + 3) / 4) * bb;
+   VkDeviceSize src_slice = src_row * ((img_h + 3) / 4);
+   VkDeviceSize tight = (VkDeviceSize)nbx * bb;
+
+   VkDeviceAddress blocks_addr, texels_addr;
+   struct wrapper_buffer *blocks = bcn_transient_buffer(wcb, tight * nby * layers, &blocks_addr);
+   struct wrapper_buffer *texels = bcn_transient_buffer(wcb,
+      (VkDeviceSize)nbx * 4 * nby * 4 * ts * layers, &texels_addr);
+   if (!blocks || !texels)
+      return false;
+   struct wrapper_buffer *out = NULL;
+   VkDeviceAddress out_addr = 0;
+   uint32_t abx = 0, aby = 0;
+   if (astc) {
+      abx = (w + astc - 1) / astc;
+      aby = (h + astc - 1) / astc;
+      out = bcn_transient_buffer(wcb, (VkDeviceSize)abx * aby * 16 * layers, &out_addr);
+      if (!out)
+         return false;
+   }
+
+   bcn_barrier(wcb);
+   for (uint32_t l = 0; l < layers; l++) {
+      if (src_row == tight) {
+         VkBufferCopy bc = { c->bufferOffset + l * src_slice, (VkDeviceSize)l * tight * nby,
+                             tight * nby };
+         device->dispatch_table.CmdCopyBuffer(wcb->dispatch_handle, src, blocks->dispatch_handle,
+                                              1, &bc);
+         continue;
+      }
+      for (uint32_t y = 0; y < nby; y++) {
+         VkBufferCopy bc = { c->bufferOffset + l * src_slice + y * src_row,
+                             ((VkDeviceSize)l * nby + y) * tight, tight };
+         device->dispatch_table.CmdCopyBuffer(wcb->dispatch_handle, src, blocks->dispatch_handle,
+                                              1, &bc);
+      }
+   }
+
+   struct bcn_pc pc = {
+      .src = { (uint32_t)blocks_addr, (uint32_t)(blocks_addr >> 32) },
+      .dst = { (uint32_t)texels_addr, (uint32_t)(texels_addr >> 32) },
+      .src_row_pitch = (uint32_t)tight,
+      .src_slice_pitch = (uint32_t)(tight * nby),
+      .dst_row_pitch = nbx * 4 * ts,
+      .dst_slice_pitch = nbx * 4 * nby * 4 * ts,
+      .blocks_x = nbx,
+      .blocks_y = nby,
+      .format = (uint32_t)id,
+      .flags = astc ? 1 : 0,
+   };
+   bcn_dispatch(wcb, device->bcn_decode_pipeline, &pc, layers);
+
+   VkBufferImageCopy copy = {
+      .bufferRowLength = nbx * 4,
+      .bufferImageHeight = nby * 4,
+      .imageSubresource = c->imageSubresource,
+      .imageOffset = c->imageOffset,
+      .imageExtent = c->imageExtent,
+   };
+   VkBuffer from = texels->dispatch_handle;
+   if (astc) {
+      struct bcn_pc ac = {
+         .src = { (uint32_t)texels_addr, (uint32_t)(texels_addr >> 32) },
+         .dst = { (uint32_t)out_addr, (uint32_t)(out_addr >> 32) },
+         .src_row_pitch = nbx * 4 * 4,
+         .src_slice_pitch = nbx * 4 * nby * 4 * 4,
+         .dst_row_pitch = abx * 16,
+         .dst_slice_pitch = abx * aby * 16,
+         .blocks_x = abx,
+         .blocks_y = aby,
+         .format = astc,
+         .flags = format == VK_FORMAT_BC4_UNORM_BLOCK ? 1 :
+                  format == VK_FORMAT_BC5_UNORM_BLOCK ? 2 : 0,
+         .width = w,
+         .height = h,
+      };
+      bcn_dispatch(wcb, device->bcn_astc_pipeline, &ac, layers);
+      copy.bufferRowLength = abx * astc;
+      copy.bufferImageHeight = aby * astc;
+      from = out->dispatch_handle;
+   }
+   device->dispatch_table.CmdCopyBufferToImage(wcb->dispatch_handle, from, wi->dispatch_handle,
+                                               layout, 1, &copy);
+   return true;
+}
+
+uint32_t
+wrapper_bcn_gpu_upload(struct wrapper_command_buffer *wcb, struct wrapper_image *wi,
+                       VkBuffer src, VkImageLayout layout, uint32_t count,
+                       const VkBufferImageCopy *regions)
+{
+   uint32_t done = 0;
+   while (done < count && bcn_gpu_upload_region(wcb, wi, src, layout, &regions[done]))
+      done++;
+   return done;
 }
