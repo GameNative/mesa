@@ -10,6 +10,7 @@
  *
  * format: 0 BC1, 1 BC1 without alpha, 2 BC2, 3 BC3, 4 BC4, 5 BC4 SNORM,
  *         6 BC5, 7 BC5 SNORM, 8 BC6H UF16, 9 BC6H SF16, 10 BC7
+ * flags bit 0: write BC4/BC5 as RGBA8 texels (for the ASTC encoder)
  */
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Words { uint w[]; };
@@ -24,6 +25,7 @@ layout(push_constant) uniform PC {
    uint blocks_x;
    uint blocks_y;
    uint format;
+   uint flags;
 } pc;
 const uint bc6h_fields[246] = uint[](
    2070u, 2074u, 2075u, 160u, 164u, 168u, 81u, 2071u,
@@ -466,6 +468,8 @@ void main()
    blk = uvec4(s.w[base], s.w[base + 1u], bb == 16u ? s.w[base + 2u] : 0u, bb == 16u ? s.w[base + 3u] : 0u);
 
    uint tsize = fmt == 4u || fmt == 5u ? 1u : (fmt == 6u || fmt == 7u ? 2u : (fmt == 8u || fmt == 9u ? 8u : 4u));
+   if ((pc.flags & 1u) != 0u && fmt >= 4u && fmt <= 7u)
+      tsize = 4u;
    if (fmt <= 1u) {
       decode_color(blk.x, blk.y, false);
       if (fmt == 1u)

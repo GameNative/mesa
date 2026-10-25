@@ -112,23 +112,17 @@ struct wrapper_device {
    VkImageView null_image_view;
    VkSampler null_sampler;
 
-   /* BCn->ASTC GPU transcode (compute), lazily initialized. */
+   /* BC decode/encode and ASTC encode compute shaders, lazily initialized. */
    simple_mtx_t bcn_gpu_mutex;
-   int bcn_gpu_state;                    /* 0 uninit, 1 ready, -1 disabled */
-   VkShaderModule bcn_shader;
-   VkDescriptorSetLayout bcn_set_layout;
-   VkPipelineLayout bcn_pipe_layout;
-   VkPipeline bcn_pipeline;
-   VkDeviceSize bcn_gpu_inflight;        /* transient GPU-transcode bytes not yet freed */
-
-   /* BC decode/encode compute shaders for readbacks and copies. */
    bool bcn_bda;                         /* bufferDeviceAddress enabled for them */
    int bcn_tool_state;                   /* 0 uninit, 1 ready, -1 disabled */
    VkPipelineLayout bcn_tool_layout;
    VkShaderModule bcn_decode_module;
    VkShaderModule bcn_encode_module;
+   VkShaderModule bcn_astc_module;
    VkPipeline bcn_decode_pipeline;
    VkPipeline bcn_encode_pipeline;
+   VkPipeline bcn_astc_pipeline;
 
    /* Private queue and synchronous command buffer for host query reset. */
    simple_mtx_t query_reset_mutex;
@@ -156,10 +150,6 @@ struct wrapper_buffer {
    int is_mapped;
    VkDeviceMemory memory;
    struct wrapper_command_buffer *wcb;
-   /* For transient GPU-transcode buffers: a descriptor pool destroyed with it,
-    * and bytes to release from the device's in-flight counter when freed. */
-   VkDescriptorPool desc_pool;
-   VkDeviceSize bcn_inflight;
    VkImage bcn_image;                    /* transient BCn image freed with the command buffer */
    VkExternalMemoryHandleTypeFlags handle_types;
 };

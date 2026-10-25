@@ -15,6 +15,14 @@ wrapper_bcn_gpu_copy_image_region(struct wrapper_command_buffer *wcb,
                                   struct wrapper_image *dst, bool dst_emulated,
                                   VkImageLayout dst_layout, const VkImageCopy *region);
 
+int
+wrapper_bcn_gpu_path(void);
+
+uint32_t
+wrapper_bcn_gpu_upload(struct wrapper_command_buffer *wcb, struct wrapper_image *wi,
+                       VkBuffer src, VkImageLayout layout, uint32_t count,
+                       const VkBufferImageCopy *regions);
+
 void
 wrapper_bcn_gpu_finish(struct wrapper_device *device);
 
