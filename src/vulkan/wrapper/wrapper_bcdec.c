@@ -479,9 +479,18 @@ decompression_routine(void *args)
                bcdec_bc5(src, scratch, pitch, is_signed);
                break;
             case VK_FORMAT_BC6H_SFLOAT_BLOCK:
-            case VK_FORMAT_BC6H_UFLOAT_BLOCK:
-               bcdec_bc6h_half(src, scratch, pitch / 2, is_signed);
+            case VK_FORMAT_BC6H_UFLOAT_BLOCK: {
+               uint16_t rgb[48];
+               uint16_t *rgba = (uint16_t *)scratch;
+               bcdec_bc6h_half(src, rgb, 12, is_signed);
+               for (int i = 0; i < 16; i++) {
+                  rgba[i * 4 + 0] = rgb[i * 3 + 0];
+                  rgba[i * 4 + 1] = rgb[i * 3 + 1];
+                  rgba[i * 4 + 2] = rgb[i * 3 + 2];
+                  rgba[i * 4 + 3] = 0x3c00;
+               }
                break;
+            }
             case VK_FORMAT_BC7_SRGB_BLOCK:
             case VK_FORMAT_BC7_UNORM_BLOCK:
                bcdec_bc7(src, scratch, pitch);
@@ -523,7 +532,7 @@ get_decode_format_for_bcn(VkFormat bcn_format)
          return VK_FORMAT_R8G8_SNORM;
       case VK_FORMAT_BC6H_SFLOAT_BLOCK:
       case VK_FORMAT_BC6H_UFLOAT_BLOCK:
-         return VK_FORMAT_R16G16B16_SFLOAT;
+         return VK_FORMAT_R16G16B16A16_SFLOAT;
       default:
          return VK_FORMAT_R8G8B8A8_UNORM;
    }
@@ -596,8 +605,8 @@ int
 get_texel_size_for_format(VkFormat format) 
 {
    switch (format) {
-      case VK_FORMAT_R16G16B16_SFLOAT:
-         return 6;
+      case VK_FORMAT_R16G16B16A16_SFLOAT:
+         return 8;
       case VK_FORMAT_R8G8_UNORM:
       case VK_FORMAT_R8G8_SNORM:
          return 2;
@@ -722,8 +731,8 @@ bcn_cache_out_tag(VkFormat image_format)
       return "r8";
    case VK_FORMAT_R8_SNORM:
       return "r8s";
-   case VK_FORMAT_R16G16B16_SFLOAT:
-      return "rgb16f";
+   case VK_FORMAT_R16G16B16A16_SFLOAT:
+      return "rgba16f";
    default:
       return NULL;
    }
