@@ -11,7 +11,9 @@
  * decoder's infill, refines the endpoints by least squares, and keeps the
  * mode with the smallest error. Constant blocks become void-extent blocks.
  *
- * kind: 0 RGBA, 1 luminance (red), 2 luminance + alpha (red, alpha)
+ * kind: 0 RGBA, 1 luminance (red), 2 luminance + alpha (red, alpha); bit 2
+ * set: the source BC blocks are at bc (format id in bits 8-15), and a 4x4
+ * block that maps directly from them is written without the search.
  */
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 /* block edge, one pipeline per block size so the per-texel arrays fit */
@@ -34,6 +36,7 @@ layout(push_constant) uniform PC {
    uint width;
    uint height;
    uvec2 tables;
+   uvec2 bc;
 } pc;
 const uint astc_qr[21] = uint[](65538u, 16777219u, 131076u, 268435461u, 16842758u, 196616u, 268501002u, 16908300u, 262160u, 268566548u, 16973848u, 327712u, 268632104u, 17039408u, 393280u, 268697680u, 17104992u, 458880u, 268763296u, 17170624u, 524544u);
 const uint astc_cand[18] = uint[](5907027u, 5907027u, 19014723u, 5907027u, 4858450u, 17966146u, 2306316u, 1782040u, 16985197u, 1257736u, 1257736u, 16985197u, 279876u, 279876u, 16985197u, 279876u, 279876u, 16985197u);
@@ -353,6 +356,78 @@ float block_error(uint planes)
    return err;
 }
 
+uint kind;
+vec4 lo, hi;
+
+void setrev(uint pos, uint n, uint v)
+{
+   [[dont_unroll]] for (uint b = 0u; b < n; b++)
+      if (((v >> b) & 1u) != 0u)
+         setbits(127u - pos - b, 1u, 1u);
+}
+
+/* BC2/BC3 with constant alpha: RGBA direct, the BC1 indices as 2-bit weights.
+ * BC5 with one constant channel: luminance + alpha direct, the varying
+ * channel's indices as 3-bit weights (4-bit for six-value blocks without
+ * their 0 and 1 entries). */
+bool direct_block(uint fid, uvec4 w)
+{
+   ob[0] = 0u; ob[1] = 0u; ob[2] = 0u; ob[3] = 0u;
+   if (fid == 2u || fid == 3u) {
+      if (lo.a != hi.a)
+         return false;
+      uint c0 = w.z & 0xffffu, c1 = w.z >> 16;
+      uvec3 e0 = uvec3((c0 >> 11) & 31u, (c0 >> 5) & 63u, c0 & 31u);
+      uvec3 e1 = uvec3((c1 >> 11) & 31u, (c1 >> 5) & 63u, c1 & 31u);
+      e0 = uvec3((e0.r << 3) | (e0.r >> 2), (e0.g << 2) | (e0.g >> 4), (e0.b << 3) | (e0.b >> 2));
+      e1 = uvec3((e1.r << 3) | (e1.r >> 2), (e1.g << 2) | (e1.g >> 4), (e1.b << 3) | (e1.b >> 2));
+      bool sw = e1.r + e1.g + e1.b < e0.r + e0.g + e0.b;
+      if (sw) {
+         uvec3 t = e0; e0 = e1; e1 = t;
+      }
+      uint a = uint(lo.a);
+      setbits(0u, 11u, 0x42u);
+      setbits(13u, 4u, 12u);
+      setbits(17u, 8u, e0.r); setbits(25u, 8u, e1.r);
+      setbits(33u, 8u, e0.g); setbits(41u, 8u, e1.g);
+      setbits(49u, 8u, e0.b); setbits(57u, 8u, e1.b);
+      setbits(65u, 8u, a); setbits(73u, 8u, a);
+      [[dont_unroll]] for (uint i = 0u; i < 16u; i++) {
+         uint k = (w.w >> (2u * i)) & 3u;
+         uint q = k == 0u ? 0u : k == 1u ? 3u : k - 1u;
+         setrev(2u * i, 2u, sw ? 3u - q : q);
+      }
+      return true;
+   }
+   if (fid == 6u) {
+      bool rc = lo.r == hi.r, gc = lo.a == hi.a;
+      if (rc == gc)
+         return false;
+      uvec2 v = rc ? w.zw : w.xy;
+      uint e0 = v.x & 255u, e1 = (v.x >> 8) & 255u;
+      uint l32 = (v.x >> 16) | (v.y << 16), h16 = v.y >> 16;
+      bool eight = e0 > e1;
+      uint wb = eight ? 3u : 4u;
+      setbits(0u, 11u, eight ? 0x53u : 0x242u);
+      setbits(13u, 4u, 4u);
+      uint l = uint(lo.r), g = uint(lo.a);
+      setbits(17u, 8u, rc ? l : e0); setbits(25u, 8u, rc ? l : e1);
+      setbits(33u, 8u, gc ? g : e0); setbits(41u, 8u, gc ? g : e1);
+      [[dont_unroll]] for (uint i = 0u; i < 16u; i++) {
+         uint p = 3u * i;
+         uint k = p < 30u ? (l32 >> p) & 7u : p == 30u ? ((l32 >> 30) | (h16 << 2)) & 7u
+                : (h16 >> (p - 32u)) & 7u;
+         if (!eight && k >= 6u)
+            return false;
+         uint q = eight ? (k == 0u ? 0u : k == 1u ? 7u : k - 1u)
+                : (k == 0u ? 0u : k == 1u ? 15u : 3u * (k - 1u));
+         setrev(wb * i, wb, q);
+      }
+      return true;
+   }
+   return false;
+}
+
 uint mode_bits_cem(uint cls) { return cls == 0u ? 0u : cls <= 2u ? 4u : cls == 3u ? 8u : 12u; }
 uint nvals(uint cls) { return cls == 0u ? 2u : cls <= 2u ? 4u : cls == 3u ? 6u : 8u; }
 
@@ -364,16 +439,18 @@ void main()
       return;
    B = BLOCK;
    N = NT;
+   kind = pc.kind & 3u;
    Words s = Words(pc.src);
-   vec4 lo = vec4(255.0), hi = vec4(0.0);
+   lo = vec4(255.0);
+   hi = vec4(0.0);
    [[dont_unroll]] for (uint i = 0u; i < N; i++) {
       uint x = min(gid.x * B + i % B, pc.width - 1u);
       uint y = min(gid.y * B + i / B, pc.height - 1u);
       uint v = s.w[(gid.z * pc.src_slice_pitch + y * pc.src_row_pitch + x * 4u) >> 2];
       vec4 t = vec4(float(v & 255u), float((v >> 8) & 255u), float((v >> 16) & 255u), float(v >> 24));
-      if (pc.kind == 1u)
+      if (kind == 1u)
          t = vec4(t.r, 0.0, 0.0, 255.0);
-      else if (pc.kind == 2u)
+      else if (kind == 2u)
          t = vec4(t.r, 0.0, 0.0, t.a);
       tex[i] = t;
       lo = min(lo, t);
@@ -384,7 +461,7 @@ void main()
    uint off = (gid.z * pc.dst_slice_pitch + gid.y * pc.dst_row_pitch + gid.x * 16u) >> 2;
 
    if (all(equal(lo, hi))) {
-      vec4 c = pc.kind == 1u ? vec4(lo.r, lo.r, lo.r, 255.0) : pc.kind == 2u ? vec4(lo.r, lo.r, lo.r, lo.a) : lo;
+      vec4 c = kind == 1u ? vec4(lo.r, lo.r, lo.r, 255.0) : kind == 2u ? vec4(lo.r, lo.r, lo.r, lo.a) : lo;
       uvec4 u = uvec4(c) * 257u;
       d.w[off] = 0xfffffdfcu;
       d.w[off + 1u] = 0xffffffffu;
@@ -393,11 +470,23 @@ void main()
       return;
    }
 
+   if (BLOCK == 4u && (pc.kind & 4u) != 0u) {
+      Words bc = Words(pc.bc);
+      uint bo = ((gid.z * pc.blocks_y + gid.y) * pc.blocks_x + gid.x) * 4u;
+      if (direct_block((pc.kind >> 8) & 255u, uvec4(bc.w[bo], bc.w[bo + 1u], bc.w[bo + 2u], bc.w[bo + 3u]))) {
+         d.w[off] = ob[0];
+         d.w[off + 1u] = ob[1];
+         d.w[off + 2u] = ob[2];
+         d.w[off + 3u] = ob[3];
+         return;
+      }
+   }
+
    /* classes: 0 L, 1 LA, 2 LA dual, 3 RGB, 4 RGBA, 5 RGBA dual */
    uint cls0, cls1;
-   if (pc.kind == 1u) {
+   if (kind == 1u) {
       cls0 = 0u; cls1 = 0u;
-   } else if (pc.kind == 2u) {
+   } else if (kind == 2u) {
       cls0 = 1u; cls1 = 2u;
    } else if (lo.a == 255.0) {
       cls0 = 3u; cls1 = 3u;

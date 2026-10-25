@@ -52,6 +52,7 @@ struct bcn_pc {
    uint32_t width;
    uint32_t height;
    uint32_t tables[2];
+   uint32_t bc[2];
 };
 
 static uint32_t
@@ -709,6 +710,18 @@ bcn_retire(struct wrapper_device *device, int slot)
    __atomic_store_n(&device->bcn_slot_state[slot], BCN_FAILED, __ATOMIC_RELEASE);
 }
 
+/* BC3: alpha 255, colour yellow and blue with indices 0 1 2 3 on every row */
+static const uint8_t bcn_selftest_bc3[16] = {
+   0xff, 0xff, 0, 0, 0, 0, 0, 0, 0xe0, 0xff, 0x1f, 0x00, 0xe4, 0xe4, 0xe4, 0xe4,
+};
+
+static bool
+bcn_direct_enabled(void)
+{
+   const char *e = getenv("WRAPPER_BCN_DIRECT");
+   return !e || strcmp(e, "0");
+}
+
 /* Runs each pipeline built since the last check once on a known input and
  * checks the result on the CPU. WRAPPER_BCN_GPU_FAIL=decode,astc,hdr,bc drops
  * them on purpose. */
@@ -802,6 +815,16 @@ bcn_selftest(struct wrapper_device *device, VkQueue queue, uint32_t family)
                         s == BCN_SLOT_ENC_BC7 ? 10 : 0;
          }
          bcn_selftest_push(device, cb, device->bcn_pipe[s], &pc);
+         if (s == BCN_SLOT_ASTC4 && device->bcn_slot_group[s] == 8) {
+            memcpy(src + 64, bcn_selftest_bc3, 16);
+            VkDeviceAddress ba = in[s].address + 64, da = out[s].address + 16;
+            pc.dst[0] = (uint32_t)da;
+            pc.dst[1] = (uint32_t)(da >> 32);
+            pc.flags = 4 | (3 << 8);
+            pc.bc[0] = (uint32_t)ba;
+            pc.bc[1] = (uint32_t)(ba >> 32);
+            bcn_selftest_push(device, cb, device->bcn_pipe[s], &pc);
+         }
       }
       VkMemoryBarrier mb = {
          .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
@@ -844,6 +867,12 @@ bcn_selftest(struct wrapper_device *device, VkQueue queue, uint32_t family)
          for (int i = 0; i < 8; i++)
             ok = ok || o[i] != 0;
       }
+      bool direct = false;
+      if (ok && s == BCN_SLOT_ASTC4 && device->bcn_slot_group[s] == 8) {
+         uint8_t want[16];
+         wrapper_bcn_astc4_direct(VK_FORMAT_BC3_UNORM_BLOCK, bcn_selftest_bc3, want);
+         direct = !memcmp(o + 16, want, 16) && !(force && strstr(force, "direct"));
+      }
       const char *tag = s == BCN_SLOT_DECODE ? "decode" : s == BCN_SLOT_HDR ? "hdr" :
                         s <= BCN_SLOT_ASTC8 ? "astc" : "bc";
       if (force && strstr(force, tag))
@@ -851,6 +880,8 @@ bcn_selftest(struct wrapper_device *device, VkQueue queue, uint32_t family)
       bool retry = false;
       pthread_mutex_lock(&device->bcn_tool_lock);
       if (ok) {
+         if (s == BCN_SLOT_ASTC4)
+            device->bcn_direct = direct && bcn_direct_enabled();
          device->bcn_slot_state[s] = BCN_TESTED;
       } else {
          bcn_retire(device, s);
@@ -870,6 +901,12 @@ bcn_selftest(struct wrapper_device *device, VkQueue queue, uint32_t family)
       at += snprintf(report + at, sizeof(report) - MIN2(at, sizeof(report)), ok ? " %s=ok" :
                      " %s=off(%08x %08x %08x %08x%s)", bcn_slot_names[s], w[0], w[1], w[2], w[3],
                      retry ? ", block encoder next" : "");
+      if (ok && s == BCN_SLOT_ASTC4 && device->bcn_slot_group[s] == 8 && at < sizeof(report)) {
+         uint32_t dw[4];
+         memcpy(dw, o + 16, 16);
+         at += snprintf(report + at, sizeof(report) - at, direct ? " direct=ok" :
+                        " direct=off(%08x %08x %08x %08x)", dw[0], dw[1], dw[2], dw[3]);
+      }
       if (at >= sizeof(report))
          at = sizeof(report) - 1;
    }
@@ -1502,6 +1539,12 @@ bcn_gpu_upload_region(struct wrapper_command_buffer *wcb, struct wrapper_image *
          .width = w,
          .height = h,
       };
+      if (astc == 4 && !merge && (id == 2 || id == 3 || id == 6) &&
+          __atomic_load_n(&device->bcn_direct, __ATOMIC_RELAXED)) {
+         ac.flags |= 4 | ((uint32_t)id << 8);
+         ac.bc[0] = (uint32_t)blocks_addr;
+         ac.bc[1] = (uint32_t)(blocks_addr >> 32);
+      }
       bcn_dispatch(wcb, encoder, &ac, layers);
       copy.bufferRowLength = abx * astc;
       copy.bufferImageHeight = aby * astc;

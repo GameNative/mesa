@@ -81,6 +81,9 @@ bcn_cache_note_source(void *srcBuffer, int w, int h, int src_w,
                       VkFormat format, int offset);
 
 int
+wrapper_bcn_astc4_direct(VkFormat format, const uint8_t *blk, uint8_t out[16]);
+
+int
 wrapper_bcn_astc_encode_cpu(const void *blocks, int w, int h, VkFormat format, uint8_t *out,
                             size_t len, unsigned threads, float quality);
 
