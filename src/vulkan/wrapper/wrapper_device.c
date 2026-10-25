@@ -2701,6 +2701,25 @@ wrapper_DestroyDescriptorSetLayout(VkDevice _device,
       descriptorSetLayout, pAllocator);
 }
 
+void wrapper_i32_note(const char *fmt, ...);
+
+VKAPI_ATTR void VKAPI_CALL
+wrapper_CmdPushConstants(VkCommandBuffer commandBuffer, VkPipelineLayout layout,
+                         VkShaderStageFlags stageFlags, uint32_t offset,
+                         uint32_t size, const void *pValues)
+{
+   VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   static uint32_t logged_end;
+   uint32_t limit = wcb->device->physical->properties2.properties.limits.maxPushConstantsSize;
+   if (offset + size > logged_end) {
+      logged_end = offset + size;
+      wrapper_i32_note("CmdPushConstants offset %u size %u stages 0x%x (base limit %u)",
+                       offset, size, stageFlags, limit);
+   }
+   wcb->device->dispatch_table.CmdPushConstants(wcb->dispatch_handle, layout,
+                                                stageFlags, offset, size, pValues);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 wrapper_CreatePipelineLayout(VkDevice _device,
                             const VkPipelineLayoutCreateInfo *pCreateInfo,
@@ -2708,6 +2727,19 @@ wrapper_CreatePipelineLayout(VkDevice _device,
                             VkPipelineLayout *pPipelineLayout)
 {
    VK_FROM_HANDLE(wrapper_device, device, _device);
+   {
+      static uint32_t logged_end;
+      uint32_t limit = device->physical->properties2.properties.limits.maxPushConstantsSize;
+      uint32_t end = 0;
+      for (uint32_t i = 0; i < pCreateInfo->pushConstantRangeCount; i++)
+         end = MAX2(end, pCreateInfo->pPushConstantRanges[i].offset +
+                         pCreateInfo->pPushConstantRanges[i].size);
+      if (end > logged_end) {
+         logged_end = end;
+         wrapper_i32_note("pipeline layout push range end %u (base limit %u) sets %u",
+                          end, limit, pCreateInfo->setLayoutCount);
+      }
+   }
    VkResult r = device->dispatch_table.CreatePipelineLayout(
       device->dispatch_handle, pCreateInfo, pAllocator, pPipelineLayout);
    if (r != VK_SUCCESS || !device->emulate_push_descriptor)

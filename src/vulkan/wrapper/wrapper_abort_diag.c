@@ -8,6 +8,8 @@
 #include <stdarg.h>
 #include <stdio.h>
 
+void wrapper_i32_note(const char *fmt, ...);
+
 static void
 emit(const char *fmt, ...)
 {
@@ -83,4 +85,15 @@ wrapper_abort_diag_init(void)
    sigemptyset(&sa.sa_mask);
    sigaction(SIGABRT, &sa, &prev_abrt);
    emit("abort backtrace handler installed");
+}
+
+void
+wrapper_i32_note(const char *fmt, ...)
+{
+   char line[400];
+   va_list ap;
+   va_start(ap, fmt);
+   vsnprintf(line, sizeof(line), fmt, ap);
+   va_end(ap);
+   emit("%s", line);
 }
