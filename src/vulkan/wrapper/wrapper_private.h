@@ -120,6 +120,8 @@ struct wrapper_device {
    VkPipeline bcn_encode_pipeline;
    VkPipeline bcn_astc_pipeline[3];        /* 4x4, 6x6, 8x8 */
    VkPipeline bcn_astc_hdr_pipeline;       /* 4x4 HDR, for BC6H */
+   struct bcn_hq *bcn_hq;                  /* background astcenc stage */
+   uint32_t bcn_hq_active;                 /* its jobs not yet copied or dropped */
 
    /* Private queue and synchronous command buffer for host query reset. */
    simple_mtx_t query_reset_mutex;
@@ -175,6 +177,8 @@ struct wrapper_image {
    bool is_wsi_image;
    VkExternalMemoryHandleTypeFlags handle_types;
    uint32_t mip_drop;
+   uint32_t bcn_hq_jobs;                  /* background ASTC jobs for this image */
+   VkImageLayout bcn_layout;              /* last layout recorded while it has some */
 };
 
 struct wrapper_image *

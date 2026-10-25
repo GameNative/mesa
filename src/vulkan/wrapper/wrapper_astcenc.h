@@ -22,6 +22,13 @@ wrapper_astcenc_compress(const void *texels, int w, int h, int block,
                          enum wrapper_astc_kind kind, int srgb, uint8_t *out,
                          size_t len);
 
+/* The same on a given number of threads (0: one per core, up to 8) and at a
+ * given astcenc quality (negative: WRAPPER_ASTC_PRESET, fastest by default). */
+int
+wrapper_astcenc_compress_threads(const void *texels, int w, int h, int block,
+                                 enum wrapper_astc_kind kind, int srgb, uint8_t *out,
+                                 size_t len, unsigned threads, float quality);
+
 #ifdef __cplusplus
 }
 #endif

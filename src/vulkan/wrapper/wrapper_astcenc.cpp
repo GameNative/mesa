@@ -14,6 +14,7 @@ struct slot {
    bool used;
    int block, kind, srgb;
    unsigned threads;
+   float quality;
    astcenc_context *ctx;
    pthread_mutex_t lock;
 };
@@ -44,12 +45,13 @@ core_threads()
 }
 
 slot *
-get_slot(int block, int kind, int srgb, unsigned threads)
+get_slot(int block, int kind, int srgb, unsigned threads, float quality)
 {
    pthread_mutex_lock(&slots_lock);
    slot *found = nullptr, *free_slot = nullptr;
    for (slot &s : slots) {
-      if (s.used && s.block == block && s.kind == kind && s.srgb == srgb && s.threads == threads) {
+      if (s.used && s.block == block && s.kind == kind && s.srgb == srgb && s.threads == threads &&
+          s.quality == quality) {
          found = &s;
          break;
       }
@@ -60,7 +62,7 @@ get_slot(int block, int kind, int srgb, unsigned threads)
       astcenc_profile prf = kind == WRAPPER_ASTC_HDR_RGB ? ASTCENC_PRF_HDR_RGB_LDR_A
                             : srgb ? ASTCENC_PRF_LDR_SRGB : ASTCENC_PRF_LDR;
       astcenc_config cfg;
-      if (astcenc_config_init(prf, block, block, 1, preset(), 0, &cfg) == ASTCENC_SUCCESS) {
+      if (astcenc_config_init(prf, block, block, 1, quality, 0, &cfg) == ASTCENC_SUCCESS) {
          if (kind == WRAPPER_ASTC_L) {
             cfg.cw_g_weight = 0.0f;
             cfg.cw_b_weight = 0.0f;
@@ -76,6 +78,7 @@ get_slot(int block, int kind, int srgb, unsigned threads)
             free_slot->kind = kind;
             free_slot->srgb = srgb;
             free_slot->threads = threads;
+            free_slot->quality = quality;
             free_slot->ctx = ctx;
             pthread_mutex_init(&free_slot->lock, nullptr);
             found = free_slot;
@@ -110,9 +113,21 @@ extern "C" int
 wrapper_astcenc_compress(const void *texels, int w, int h, int block,
                          enum wrapper_astc_kind kind, int srgb, uint8_t *out, size_t len)
 {
+   return wrapper_astcenc_compress_threads(texels, w, h, block, kind, srgb, out, len, 0, -1.0f);
+}
+
+extern "C" int
+wrapper_astcenc_compress_threads(const void *texels, int w, int h, int block,
+                                 enum wrapper_astc_kind kind, int srgb, uint8_t *out,
+                                 size_t len, unsigned threads, float quality)
+{
    size_t blocks = (size_t)((w + block - 1) / block) * ((h + block - 1) / block);
-   unsigned threads = blocks >= 256 ? core_threads() : 1;
-   slot *s = get_slot(block, kind, srgb, threads);
+   if (blocks < 256)
+      threads = 1;
+   else if (!threads)
+      threads = core_threads();
+   threads = threads > max_threads ? max_threads : threads;
+   slot *s = get_slot(block, kind, srgb, threads, quality < 0.0f ? preset() : quality);
    if (!s)
       return -1;
 

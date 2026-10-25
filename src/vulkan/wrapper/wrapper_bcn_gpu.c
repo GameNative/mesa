@@ -809,7 +809,8 @@ wrapper_bcn_gpu_readback(struct wrapper_command_buffer *wcb, struct wrapper_imag
 
 static bool
 bcn_gpu_upload_region(struct wrapper_command_buffer *wcb, struct wrapper_image *wi,
-                      VkBuffer src, VkImageLayout layout, const VkBufferImageCopy *c);
+                      struct wrapper_buffer *wb, VkBuffer src, VkImageLayout layout,
+                      const VkBufferImageCopy *c);
 
 /* One vkCmdCopyImage region with an emulated BC image on one side or both.
  * Returns false when the region should go to the driver as it is. */
@@ -891,7 +892,7 @@ wrapper_bcn_gpu_copy_image_region(struct wrapper_command_buffer *wcb,
       .imageExtent = { MIN2(nbx * 4, lw - (uint32_t)c->dstOffset.x),
                        MIN2(nby * 4, lh - (uint32_t)c->dstOffset.y), 1 },
    };
-   if (!bcn_gpu_upload_region(wcb, dst, blocks->dispatch_handle, dst_layout, &up)) {
+   if (!bcn_gpu_upload_region(wcb, dst, NULL, blocks->dispatch_handle, dst_layout, &up)) {
       static bool logged;
       if (!logged)
          WRAPPER_LOG(error, "BCn: GPU path cannot store a copy into format %d",
@@ -930,7 +931,8 @@ wrapper_bcn_gpu_misaligned(const struct wrapper_image *wi, const VkBufferImageCo
  * and encoded again. */
 static bool
 bcn_gpu_upload_region(struct wrapper_command_buffer *wcb, struct wrapper_image *wi,
-                      VkBuffer src, VkImageLayout layout, const VkBufferImageCopy *c)
+                      struct wrapper_buffer *wb, VkBuffer src, VkImageLayout layout,
+                      const VkBufferImageCopy *c)
 {
    struct wrapper_device *device = wcb->device;
    VkFormat format = wi->info.format;
@@ -1134,16 +1136,22 @@ bcn_gpu_upload_region(struct wrapper_command_buffer *wcb, struct wrapper_image *
    }
    device->dispatch_table.CmdCopyBufferToImage(wcb->dispatch_handle, from, wi->dispatch_handle,
                                                layout, 1, &copy);
+   if (astc && !merge)
+      wrapper_bcn_hq_capture(wcb, wi, wb, layout, c, astc);
+   else
+      wrapper_bcn_hq_write(device, wi, &copy.imageSubresource, copy.imageOffset,
+                           copy.imageExtent);
    return true;
 }
 
 uint32_t
 wrapper_bcn_gpu_upload(struct wrapper_command_buffer *wcb, struct wrapper_image *wi,
-                       VkBuffer src, VkImageLayout layout, uint32_t count,
+                       struct wrapper_buffer *wb, VkImageLayout layout, uint32_t count,
                        const VkBufferImageCopy *regions)
 {
    uint32_t done = 0;
-   while (done < count && bcn_gpu_upload_region(wcb, wi, src, layout, &regions[done]))
+   while (done < count && bcn_gpu_upload_region(wcb, wi, wb, wb->dispatch_handle, layout,
+                                                &regions[done]))
       done++;
    return done;
 }
