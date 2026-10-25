@@ -192,7 +192,6 @@ struct wrapper_fence {
 	struct wrapper_device *device;
 	struct list_head link;
 	VkFence dispatch_handle;
-	struct list_head staging_buffers_list;
 };
 
 /* One chunked descriptor pool used to service emulated push-descriptor sets for
@@ -222,6 +221,7 @@ struct wrapper_command_buffer {
    VkPipeline stride_bound;
    uint32_t vertex_strides[32];
    uint32_t vertex_strides_valid;
+   struct list_head bcn_transients;
 };
 
 VK_DEFINE_HANDLE_CASTS(wrapper_command_buffer, vk.base, VkCommandBuffer,
