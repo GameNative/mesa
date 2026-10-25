@@ -36,6 +36,12 @@ bcn_set_astc_hdr(int on);
 int
 bcn_scan_shader(const uint32_t *code, size_t size);
 
+void
+bcn_describe_storage(char *buf, size_t size);
+
+void
+bcn_view_swizzle(VkFormat bcn_format, VkComponentMapping *m);
+
 size_t
 bcn_upload_size(VkFormat bcn_format, int w, int h);
 
