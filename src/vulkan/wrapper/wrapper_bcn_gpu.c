@@ -554,22 +554,29 @@ bcn_tools_build(void *arg)
    VkResult layout = device->dispatch_table.CreatePipelineLayout(d, &plci, NULL,
                                                                  &device->bcn_tool_layout);
    VkResult dec = layout, enc = layout, astc = layout, hdr = layout;
+   double ms[6] = { 0 };
+   wrapper_diag_append("[BCN] GPU shaders: building on a worker\n");
+#define BCN_TIMED(k, expr) do { struct timespec a_, b_; clock_gettime(CLOCK_MONOTONIC, &a_); expr; \
+   clock_gettime(CLOCK_MONOTONIC, &b_); \
+   ms[k] = (b_.tv_sec - a_.tv_sec) * 1e3 + (b_.tv_nsec - a_.tv_nsec) / 1e6; } while (0)
    if (layout == VK_SUCCESS) {
-      dec = bcn_create_pipeline(device, wrapper_bcn_decode_spv, sizeof(wrapper_bcn_decode_spv),
-                                &device->bcn_decode_module, &device->bcn_decode_pipeline);
-      enc = bcn_create_pipeline(device, wrapper_bcn_encode_spv, sizeof(wrapper_bcn_encode_spv),
-                                &device->bcn_encode_module, &device->bcn_encode_pipeline);
+      BCN_TIMED(0, dec = bcn_create_pipeline(device, wrapper_bcn_decode_spv,
+         sizeof(wrapper_bcn_decode_spv), &device->bcn_decode_module, &device->bcn_decode_pipeline));
+      BCN_TIMED(1, enc = bcn_create_pipeline(device, wrapper_bcn_encode_spv,
+         sizeof(wrapper_bcn_encode_spv), &device->bcn_encode_module, &device->bcn_encode_pipeline));
       for (uint32_t i = 0; i < 3; i++) {
-         VkResult r = bcn_create_pipeline_spec(device, wrapper_astc_encode_spv,
+         VkResult r;
+         BCN_TIMED(2 + i, r = bcn_create_pipeline_spec(device, wrapper_astc_encode_spv,
             sizeof(wrapper_astc_encode_spv), &device->bcn_astc_module,
-            &device->bcn_astc_pipeline[i], 4 + 2 * i);
+            &device->bcn_astc_pipeline[i], 4 + 2 * i));
          if (i == 0 || r != VK_SUCCESS)
             astc = r;
       }
-      hdr = bcn_create_pipeline(device, wrapper_astc_hdr_encode_spv,
-                                sizeof(wrapper_astc_hdr_encode_spv), &device->bcn_astc_hdr_module,
-                                &device->bcn_astc_hdr_pipeline);
+      BCN_TIMED(5, hdr = bcn_create_pipeline(device, wrapper_astc_hdr_encode_spv,
+         sizeof(wrapper_astc_hdr_encode_spv), &device->bcn_astc_hdr_module,
+         &device->bcn_astc_hdr_pipeline));
    }
+#undef BCN_TIMED
    size_t out = 0;
    bool saved = false;
    if (device->bcn_pipeline_cache &&
@@ -592,9 +599,10 @@ bcn_tools_build(void *arg)
    clock_gettime(CLOCK_MONOTONIC, &t1);
    wrapper_diag_append("[BCN] GPU shaders built in %.0f ms on a worker (pipeline cache %zu bytes "
                        "in, %zu out%s): layout=%d decode=%d bc-encode=%d astc-encode=%d "
-                       "astc-hdr-encode=%d\n",
+                       "astc-hdr-encode=%d; ms decode %.0f bc-encode %.0f astc %.0f/%.0f/%.0f hdr %.0f\n",
                        (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6, len,
-                       out, saved ? ", saved" : "", layout, dec, enc, astc, hdr);
+                       out, saved ? ", saved" : "", layout, dec, enc, astc, hdr, ms[0], ms[1], ms[2],
+                       ms[3], ms[4], ms[5]);
    __atomic_store_n(&device->bcn_tool_state, layout == VK_SUCCESS ? 2 : -1, __ATOMIC_RELEASE);
    return NULL;
 }
