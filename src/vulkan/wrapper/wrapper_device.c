@@ -3415,9 +3415,26 @@ wrapper_patches_spirv(const struct wrapper_device *device)
 }
 
 static bool
+wrapper_tracks_shader_code(const struct wrapper_device *device)
+{
+   return device->emulate_dynamic_stride || device->emulate_vertex_divisor;
+}
+
+static bool
 wrapper_lowers_inline_shaders(const struct wrapper_device *device)
 {
-   return wrapper_lowers_maintenance5(device) || wrapper_patches_spirv(device);
+   return wrapper_lowers_maintenance5(device) || wrapper_patches_spirv(device) ||
+          wrapper_tracks_shader_code(device);
+}
+
+static void
+wrapper_scan_inline_shader(const VkPipelineShaderStageCreateInfo *stage)
+{
+   const VkShaderModuleCreateInfo *module_info;
+
+   if (stage->module == VK_NULL_HANDLE &&
+       (module_info = vk_find_struct_const(stage->pNext, SHADER_MODULE_CREATE_INFO)))
+      bcn_scan_shader(module_info->pCode, module_info->codeSize);
 }
 
 static VkPipelineCreateFlags
@@ -3461,7 +3478,7 @@ wrapper_destroy_lowered_modules(struct wrapper_device *device,
                                 VkShaderModule *modules, uint32_t count)
 {
    for (uint32_t i = 0; i < count; i++) {
-      if (device->emulate_dynamic_stride)
+      if (wrapper_tracks_shader_code(device))
          wrapper_stride_forget_module(device, modules[i]);
       device->dispatch_table.DestroyShaderModule(device->dispatch_handle,
                                                  modules[i], NULL);
@@ -3477,6 +3494,9 @@ wrapper_CreateComputePipelines(VkDevice _device, VkPipelineCache pipelineCache,
                                VkPipeline *pPipelines)
 {
    VK_FROM_HANDLE(wrapper_device, device, _device);
+
+   for (uint32_t i = 0; i < createInfoCount; i++)
+      wrapper_scan_inline_shader(&pCreateInfos[i].stage);
 
    if (!wrapper_lowers_inline_shaders(device) || !createInfoCount)
       return device->dispatch_table.CreateComputePipelines(device->dispatch_handle,
@@ -3528,6 +3548,10 @@ wrapper_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
    VkPipelineShaderStageCreateInfo *m5_stages = NULL;
    VkShaderModule *m5_modules = NULL;
    uint32_t m5_module_count = 0;
+
+   for (uint32_t i = 0; i < createInfoCount; i++)
+      for (uint32_t j = 0; j < pCreateInfos[i].stageCount; j++)
+         wrapper_scan_inline_shader(&pCreateInfos[i].pStages[j]);
 
    if (wrapper_lowers_inline_shaders(device) && createInfoCount) {
       uint32_t stage_count = 0;
@@ -4385,6 +4409,32 @@ wrapper_CmdExecuteCommands(VkCommandBuffer commandBuffer,
       wcb->dispatch_handle, commandBufferCount, command_buffers);
 }
 
+static uint32_t *
+wrapper_patch_spirv(struct wrapper_device *device, const void *code, size_t *size)
+{
+   static int wrapper_no_remove_clip_distance = -1;
+   static int wrapper_no_patch_OpConstComp = -1;
+
+   if (!wrapper_patches_spirv(device))
+      return NULL;
+
+   if (wrapper_no_remove_clip_distance == -1)
+      wrapper_no_remove_clip_distance = getenv("WRAPPER_NO_REMOVE_CLIP_DISTANCE") && atoi(getenv("WRAPPER_NO_REMOVE_CLIP_DISTANCE"));
+
+   if (wrapper_no_patch_OpConstComp == -1)
+      wrapper_no_patch_OpConstComp = getenv("WRAPPER_NO_PATCH_OPCONSTCOMP") && atoi(getenv("WRAPPER_NO_PATCH_OPCONSTCOMP"));
+
+   uint32_t *patched = malloc(*size);
+   if (!patched)
+      return NULL;
+   memcpy(patched, code, *size);
+   if (!wrapper_no_patch_OpConstComp)
+      patch_OpConstantComposite_to_OpSpecConstantComposite(patched, *size / sizeof(uint32_t));
+   if (!wrapper_no_remove_clip_distance)
+      remove_ClipDistance(patched, size);
+   return patched;
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 wrapper_CreateShaderModule(VkDevice _device,
 						   const VkShaderModuleCreateInfo *pCreateInfo,
@@ -4392,42 +4442,67 @@ wrapper_CreateShaderModule(VkDevice _device,
 						   VkShaderModule *pShaderModule)
 {
    VK_FROM_HANDLE(wrapper_device, device, _device);
-   static int wrapper_no_remove_clip_distance = -1;
-   static int wrapper_no_patch_OpConstComp = -1;
 
    bcn_scan_shader(pCreateInfo->pCode, pCreateInfo->codeSize);
 
-   if (wrapper_no_remove_clip_distance == -1)
-      wrapper_no_remove_clip_distance = getenv("WRAPPER_NO_REMOVE_CLIP_DISTANCE") && atoi(getenv("WRAPPER_NO_REMOVE_CLIP_DISTANCE"));
-
-   if (wrapper_no_patch_OpConstComp == -1)
-      wrapper_no_patch_OpConstComp = getenv("WRAPPER_NO_PATCH_OPCONSTCOMP") && atoi(getenv("WRAPPER_NO_PATCH_OPCONSTCOMP"));
-      
    VkShaderModuleCreateInfo create_info = *pCreateInfo;
-
-   simple_mtx_lock(&device->resource_mutex);
-
-   if (device->physical->driver_properties.driverID == VK_DRIVER_ID_ARM_PROPRIETARY) {
-      uint32_t *code = malloc(create_info.codeSize);
-      if (code) {
-         memcpy(code, create_info.pCode, create_info.codeSize);
-         if (!wrapper_no_patch_OpConstComp) patch_OpConstantComposite_to_OpSpecConstantComposite(code, create_info.codeSize / sizeof(uint32_t));
-         if (!wrapper_no_remove_clip_distance) remove_ClipDistance(code, &create_info.codeSize);
-         create_info.pCode = code;
-      }
-   }
-
-   simple_mtx_unlock(&device->resource_mutex);
+   uint32_t *patched = wrapper_patch_spirv(device, pCreateInfo->pCode, &create_info.codeSize);
+   if (patched)
+      create_info.pCode = patched;
 
    if (WRAPPER_LOG_LEVEL(shader))
       dump_shader_code(create_info.pCode, create_info.codeSize);
    
    VkResult result = device->dispatch_table.CreateShaderModule(
       device->dispatch_handle, &create_info, pAllocator, pShaderModule);
-   if (result == VK_SUCCESS &&
-       (device->emulate_dynamic_stride || device->emulate_vertex_divisor))
+   if (result == VK_SUCCESS && wrapper_tracks_shader_code(device))
       wrapper_stride_note_module(device, *pShaderModule, create_info.pCode,
                                  create_info.codeSize);
+   free(patched);
+   return result;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+wrapper_CreateShadersEXT(VkDevice _device, uint32_t createInfoCount,
+                         const VkShaderCreateInfoEXT *pCreateInfos,
+                         const VkAllocationCallbacks *pAllocator,
+                         VkShaderEXT *pShaders)
+{
+   VK_FROM_HANDLE(wrapper_device, device, _device);
+   VkShaderCreateInfoEXT *infos = NULL;
+   uint32_t **patched = NULL;
+
+   for (uint32_t i = 0; i < createInfoCount; i++)
+      if (pCreateInfos[i].codeType == VK_SHADER_CODE_TYPE_SPIRV_EXT)
+         bcn_scan_shader(pCreateInfos[i].pCode, pCreateInfos[i].codeSize);
+
+   if (wrapper_patches_spirv(device) && createInfoCount) {
+      infos = malloc(createInfoCount * sizeof(*infos));
+      patched = calloc(createInfoCount, sizeof(*patched));
+      if (!infos || !patched) {
+         free(infos);
+         free(patched);
+         return VK_ERROR_OUT_OF_HOST_MEMORY;
+      }
+      memcpy(infos, pCreateInfos, createInfoCount * sizeof(*infos));
+      for (uint32_t i = 0; i < createInfoCount; i++) {
+         if (infos[i].codeType != VK_SHADER_CODE_TYPE_SPIRV_EXT)
+            continue;
+         patched[i] = wrapper_patch_spirv(device, infos[i].pCode, &infos[i].codeSize);
+         if (patched[i])
+            infos[i].pCode = patched[i];
+      }
+      pCreateInfos = infos;
+   }
+
+   VkResult result = device->dispatch_table.CreateShadersEXT(
+      device->dispatch_handle, createInfoCount, pCreateInfos, pAllocator, pShaders);
+
+   if (patched)
+      for (uint32_t i = 0; i < createInfoCount; i++)
+         free(patched[i]);
+   free(patched);
+   free(infos);
    return result;
 }
 
@@ -4436,7 +4511,7 @@ wrapper_DestroyShaderModule(VkDevice _device, VkShaderModule shaderModule,
                             const VkAllocationCallbacks *pAllocator)
 {
    VK_FROM_HANDLE(wrapper_device, device, _device);
-   if (device->emulate_dynamic_stride || device->emulate_vertex_divisor)
+   if (wrapper_tracks_shader_code(device))
       wrapper_stride_forget_module(device, shaderModule);
    device->dispatch_table.DestroyShaderModule(device->dispatch_handle, shaderModule,
                                               pAllocator);
