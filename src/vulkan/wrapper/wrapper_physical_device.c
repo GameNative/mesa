@@ -884,6 +884,9 @@ wrapper_GetPhysicalDeviceImageFormatProperties(VkPhysicalDevice physicalDevice,
              
       if (pdevice->emulate_bcn < 1)
          break;
+
+      if (pdevice->emulate_bcn > 1 && tiling != VK_IMAGE_TILING_OPTIMAL)
+         return VK_ERROR_FORMAT_NOT_SUPPORTED;
       
       if (type & VK_IMAGE_TYPE_1D) {
          pImageFormatProperties->maxExtent.width = pdevice->properties2.properties.limits.maxImageDimension1D;
@@ -962,6 +965,9 @@ wrapper_GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice physicalDevice,
          
       if (pdevice->emulate_bcn < 1)
          break;
+
+      if (pdevice->emulate_bcn > 1 && pImageFormatInfo->tiling != VK_IMAGE_TILING_OPTIMAL)
+         return VK_ERROR_FORMAT_NOT_SUPPORTED;
       
       if (pImageFormatInfo->type & VK_IMAGE_TYPE_1D) {
          pImageFormatProperties->imageFormatProperties.maxExtent.width = pdevice->properties2.properties.limits.maxImageDimension1D;
