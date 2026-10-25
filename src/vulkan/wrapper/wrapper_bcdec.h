@@ -33,6 +33,9 @@ bcn_policy_bc6h_hdr(void);
 void
 bcn_set_astc_hdr(int on);
 
+void
+bcn_set_vendor(uint32_t vendor);
+
 int
 bcn_scan_shader(const uint32_t *code, size_t size);
 

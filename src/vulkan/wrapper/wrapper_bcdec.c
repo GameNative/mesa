@@ -34,7 +34,17 @@ astc_enabled(void)
  * Selected by WRAPPER_ASTC_BLOCK ("4x4" default, "8x8"). */
 /* bcnEmulationType=compute (ENABLE_BCN_COMPUTE=1, the app's default) means
  * the parity policy whatever the quality setting; 8x8 is taken only with
- * bcnEmulationType=cpu and quality=low. */
+ * bcnEmulationType=cpu and quality=low. The app leaves compute off on
+ * Samsung's Xclipse driver, so a Samsung GPU gets the parity policy too
+ * unless WRAPPER_BCN_KEEP_8X8=1. */
+static uint32_t bcn_vendor;
+
+void
+bcn_set_vendor(uint32_t vendor)
+{
+   __atomic_store_n(&bcn_vendor, vendor, __ATOMIC_RELAXED);
+}
+
 static int
 astc_block8(void)
 {
@@ -43,9 +53,18 @@ astc_block8(void)
       const char *e = getenv("WRAPPER_ASTC_BLOCK");
       const char *compute = getenv("ENABLE_BCN_COMPUTE");
       const char *keep = getenv("WRAPPER_KEEP_BCN_LAYER");
-      b = (e && strstr(e, "8x8")) ? 1 : 0;
+      const char *keep8 = getenv("WRAPPER_BCN_KEEP_8X8");
+      int v = (e && strstr(e, "8x8")) ? 1 : 0;
       if (compute && atoi(compute) && !(keep && atoi(keep)))
-         b = 0;
+         v = 0;
+      if (v && !(compute && atoi(compute)) && !(keep8 && atoi(keep8)) &&
+          __atomic_load_n(&bcn_vendor, __ATOMIC_RELAXED) == 0x144d) {
+         v = 0;
+         wrapper_diag_append("[BCN] Samsung GPU without bcnEmulationType=compute (the app "
+                             "excludes Xclipse): parity storage instead of 8x8 "
+                             "(WRAPPER_BCN_KEEP_8X8=1 keeps 8x8)\n");
+      }
+      b = v;
    }
    return b;
 }
