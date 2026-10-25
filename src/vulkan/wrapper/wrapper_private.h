@@ -116,6 +116,15 @@ struct wrapper_device {
    VkPipeline bcn_pipeline;
    VkDeviceSize bcn_gpu_inflight;        /* transient GPU-transcode bytes not yet freed */
 
+   /* BC decode/encode compute shaders for readbacks and copies. */
+   bool bcn_bda;                         /* bufferDeviceAddress enabled for them */
+   int bcn_tool_state;                   /* 0 uninit, 1 ready, -1 disabled */
+   VkPipelineLayout bcn_tool_layout;
+   VkShaderModule bcn_decode_module;
+   VkShaderModule bcn_encode_module;
+   VkPipeline bcn_decode_pipeline;
+   VkPipeline bcn_encode_pipeline;
+
    /* Private queue and synchronous command buffer for host query reset. */
    simple_mtx_t query_reset_mutex;
    VkCommandPool query_reset_pool;
@@ -146,6 +155,7 @@ struct wrapper_buffer {
     * and bytes to release from the device's in-flight counter when freed. */
    VkDescriptorPool desc_pool;
    VkDeviceSize bcn_inflight;
+   VkImage bcn_image;                    /* transient BCn image freed with the command buffer */
    VkExternalMemoryHandleTypeFlags handle_types;
 };
 
@@ -200,6 +210,14 @@ struct wrapper_push_pool {
    uint32_t remaining;             /* sets left before this pool is exhausted */
 };
 
+struct wrapper_push_record {
+   VkPipelineLayout layout;
+   VkShaderStageFlags stages;
+   uint32_t offset;
+   uint32_t size;
+   uint8_t data[256];
+};
+
 struct wrapper_command_buffer {
    struct vk_command_buffer vk;
 
@@ -212,6 +230,11 @@ struct wrapper_command_buffer {
    struct list_head dynamic_render_objects;
    bool dynamic_rendering_active;
    struct list_head bcn_transients;
+   /* Compute pipeline and push constants the application set, put back after
+    * a BCn shader dispatch. */
+   VkPipeline compute_pipeline;
+   uint32_t push_count;
+   struct wrapper_push_record push[8];
 };
 
 VK_DEFINE_HANDLE_CASTS(wrapper_command_buffer, vk.base, VkCommandBuffer,
