@@ -2894,7 +2894,7 @@ wrapper_DestroyDescriptorPool(VkDevice _device, VkDescriptorPool descriptorPool,
 {
    VK_FROM_HANDLE(wrapper_device, device, _device);
    if (device->fold_sets && descriptorPool)
-      wrapper_fold_reset_pool(device, descriptorPool, true);
+      wrapper_fold_reset_pool(device, descriptorPool);
    device->dispatch_table.DestroyDescriptorPool(device->dispatch_handle, descriptorPool,
                                                 pAllocator);
 }
@@ -2905,7 +2905,7 @@ wrapper_ResetDescriptorPool(VkDevice _device, VkDescriptorPool descriptorPool,
 {
    VK_FROM_HANDLE(wrapper_device, device, _device);
    if (device->fold_sets)
-      wrapper_fold_reset_pool(device, descriptorPool, false);
+      wrapper_fold_reset_pool(device, descriptorPool);
    return device->dispatch_table.ResetDescriptorPool(device->dispatch_handle, descriptorPool,
                                                      flags);
 }
@@ -2915,11 +2915,11 @@ wrapper_AllocateDescriptorSets(VkDevice _device, const VkDescriptorSetAllocateIn
                                VkDescriptorSet *pDescriptorSets)
 {
    VK_FROM_HANDLE(wrapper_device, device, _device);
-   VkResult r;
-   if (device->fold_sets && wrapper_fold_allocate(device, pAllocateInfo, pDescriptorSets, &r))
-      return r;
-   return device->dispatch_table.AllocateDescriptorSets(device->dispatch_handle, pAllocateInfo,
-                                                        pDescriptorSets);
+   VkResult r = device->dispatch_table.AllocateDescriptorSets(device->dispatch_handle,
+                                                              pAllocateInfo, pDescriptorSets);
+   if (r == VK_SUCCESS && device->fold_sets)
+      wrapper_fold_note_sets(device, pAllocateInfo, pDescriptorSets);
+   return r;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -2927,18 +2927,10 @@ wrapper_FreeDescriptorSets(VkDevice _device, VkDescriptorPool descriptorPool,
                            uint32_t descriptorSetCount, const VkDescriptorSet *pDescriptorSets)
 {
    VK_FROM_HANDLE(wrapper_device, device, _device);
-   if (!device->fold_sets)
-      return device->dispatch_table.FreeDescriptorSets(device->dispatch_handle, descriptorPool,
-                                                       descriptorSetCount, pDescriptorSets);
-   VkDescriptorSet *real = malloc(MAX2(descriptorSetCount, 1) * sizeof(*real));
-   if (!real)
-      return VK_ERROR_OUT_OF_HOST_MEMORY;
-   uint32_t n = wrapper_fold_free_sets(device, descriptorSetCount, pDescriptorSets, real);
-   VkResult r = n ? device->dispatch_table.FreeDescriptorSets(device->dispatch_handle,
-                                                              descriptorPool, n, real)
-                  : VK_SUCCESS;
-   free(real);
-   return r;
+   if (device->fold_sets)
+      wrapper_fold_free_sets(device, descriptorSetCount, pDescriptorSets);
+   return device->dispatch_table.FreeDescriptorSets(device->dispatch_handle, descriptorPool,
+                                                    descriptorSetCount, pDescriptorSets);
 }
 
 VKAPI_ATTR void VKAPI_CALL

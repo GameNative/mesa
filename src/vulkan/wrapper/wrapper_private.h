@@ -95,8 +95,7 @@ struct wrapper_device {
    struct hash_table_u64 *fold_layout_table;
    struct hash_table_u64 *fold_pl_table;
    struct hash_table_u64 *fold_set_table;
-   struct hash_table_u64 *fold_pool_table;
-   struct fold_group *fold_open_group;
+   struct fold_merge *fold_merges;
    uint32_t fold_max_pool_count;
    uint32_t max_viewports;
    struct hash_table_u64 *divisor_pipeline_table;
@@ -392,11 +391,11 @@ uint32_t wrapper_fold_set_index(struct wrapper_device *device, VkPipelineLayout 
                                 uint32_t set);
 uint32_t *wrapper_fold_remap_spirv(struct wrapper_device *device, VkPipelineLayout layout,
                                    const uint32_t *code, size_t words);
-bool wrapper_fold_allocate(struct wrapper_device *device, const VkDescriptorSetAllocateInfo *info,
-                           VkDescriptorSet *sets, VkResult *result);
-uint32_t wrapper_fold_free_sets(struct wrapper_device *device, uint32_t count,
-                                const VkDescriptorSet *sets, VkDescriptorSet *real);
-void wrapper_fold_reset_pool(struct wrapper_device *device, VkDescriptorPool pool, bool destroy);
+void wrapper_fold_note_sets(struct wrapper_device *device, const VkDescriptorSetAllocateInfo *info,
+                            const VkDescriptorSet *sets);
+void wrapper_fold_free_sets(struct wrapper_device *device, uint32_t count,
+                            const VkDescriptorSet *sets);
+void wrapper_fold_reset_pool(struct wrapper_device *device, VkDescriptorPool pool);
 bool wrapper_fold_remap_updates(struct wrapper_device *device,
                                 uint32_t *write_count, VkWriteDescriptorSet **writes,
                                 uint32_t *copy_count, VkCopyDescriptorSet **copies);
