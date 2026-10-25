@@ -1014,6 +1014,118 @@ bcn_astc_kind(VkFormat format)
    }
 }
 
+static void
+astc_bits(uint8_t *o, unsigned pos, unsigned n, uint32_t v)
+{
+   for (unsigned i = 0; i < n; i++)
+      if ((v >> i) & 1)
+         o[(pos + i) >> 3] |= (uint8_t)(1u << ((pos + i) & 7));
+}
+
+static int
+bcn_channel_constant(const uint8_t *v, int stride)
+{
+   for (int i = 1; i < 16; i++)
+      if (v[i * stride] != v[0])
+         return 0;
+   return 1;
+}
+
+/* An ASTC 4x4 block taken straight from the endpoints and indices of a BC2 or
+ * BC3 block with constant alpha (RGBA direct, 2-bit weights) or a BC5 block
+ * with one constant channel (luminance + alpha direct, 3-bit weights, or
+ * 4-bit for a six-value block without its 0 and 1 entries). Returns 0 when the
+ * block does not map, and for a constant block. */
+int
+wrapper_bcn_astc4_direct(VkFormat format, const uint8_t *blk, uint8_t out[16])
+{
+   uint8_t t[64];
+   uint32_t ev[8], wt[16], mode, cem, nv, wbits;
+   switch (format) {
+   case VK_FORMAT_BC2_UNORM_BLOCK:
+   case VK_FORMAT_BC2_SRGB_BLOCK:
+   case VK_FORMAT_BC3_UNORM_BLOCK:
+   case VK_FORMAT_BC3_SRGB_BLOCK: {
+      if (format == VK_FORMAT_BC2_UNORM_BLOCK || format == VK_FORMAT_BC2_SRGB_BLOCK)
+         bcdec_bc2(blk, t, 16);
+      else
+         bcdec_bc3(blk, t, 16);
+      if (!bcn_channel_constant(t + 3, 4) ||
+          (bcn_channel_constant(t, 4) && bcn_channel_constant(t + 1, 4) &&
+           bcn_channel_constant(t + 2, 4)))
+         return 0;
+      const uint8_t *c = blk + 8;
+      uint32_t col[2] = { c[0] | (uint32_t)c[1] << 8, c[2] | (uint32_t)c[3] << 8 };
+      uint32_t idx = c[4] | (uint32_t)c[5] << 8 | (uint32_t)c[6] << 16 | (uint32_t)c[7] << 24;
+      uint32_t e[2][3];
+      for (int k = 0; k < 2; k++) {
+         uint32_t r = (col[k] >> 11) & 31, g = (col[k] >> 5) & 63, b = col[k] & 31;
+         e[k][0] = (r << 3) | (r >> 2);
+         e[k][1] = (g << 2) | (g >> 4);
+         e[k][2] = (b << 3) | (b >> 2);
+      }
+      int swap = e[1][0] + e[1][1] + e[1][2] < e[0][0] + e[0][1] + e[0][2];
+      static const uint8_t q4[4] = { 0, 3, 1, 2 };
+      for (int i = 0; i < 16; i++) {
+         uint32_t q = q4[(idx >> (2 * i)) & 3];
+         wt[i] = swap ? 3 - q : q;
+      }
+      for (int ch = 0; ch < 3; ch++) {
+         ev[ch * 2] = e[swap][ch];
+         ev[ch * 2 + 1] = e[!swap][ch];
+      }
+      ev[6] = ev[7] = t[3];
+      mode = 0x042;
+      cem = 12;
+      nv = 8;
+      wbits = 2;
+      break;
+   }
+   case VK_FORMAT_BC5_UNORM_BLOCK: {
+      uint8_t r[16], g[16];
+      bcdec_bc4(blk, r, 4, 0);
+      bcdec_bc4(blk + 8, g, 4, 0);
+      int rc = bcn_channel_constant(r, 1), gc = bcn_channel_constant(g, 1);
+      if (rc == gc)
+         return 0;
+      const uint8_t *v = rc ? blk + 8 : blk;
+      uint32_t e0 = v[0], e1 = v[1];
+      uint64_t bits = 0;
+      for (int i = 0; i < 6; i++)
+         bits |= (uint64_t)v[2 + i] << (8 * i);
+      int eight = e0 > e1;
+      static const uint8_t q16[6] = { 0, 15, 3, 6, 9, 12 };
+      for (int i = 0; i < 16; i++) {
+         uint32_t k = (bits >> (3 * i)) & 7;
+         if (!eight && k >= 6)
+            return 0;
+         wt[i] = eight ? (k == 0 ? 0 : k == 1 ? 7 : k - 1) : q16[k];
+      }
+      ev[0] = rc ? r[0] : e0;
+      ev[1] = rc ? r[0] : e1;
+      ev[2] = gc ? g[0] : e0;
+      ev[3] = gc ? g[0] : e1;
+      mode = eight ? 0x053 : 0x242;
+      cem = 4;
+      nv = 4;
+      wbits = eight ? 3 : 4;
+      break;
+   }
+   default:
+      return 0;
+   }
+   memset(out, 0, 16);
+   astc_bits(out, 0, 11, mode);
+   astc_bits(out, 13, 4, cem);
+   for (uint32_t i = 0; i < nv; i++)
+      astc_bits(out, 17 + 8 * i, 8, ev[i]);
+   for (uint32_t i = 0; i < 16; i++)
+      for (uint32_t b = 0; b < wbits; b++)
+         if ((wt[i] >> b) & 1)
+            astc_bits(out, 127 - (i * wbits + b), 1, 1);
+   return 1;
+}
+
 /* astcenc encode of tightly packed BC blocks (w x h texels) to the image's
  * ASTC format, on the given number of threads and at the given quality. */
 int

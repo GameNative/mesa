@@ -144,6 +144,7 @@ struct wrapper_device {
    VkPipeline bcn_pipe[BCN_SLOT_COUNT];
    uint32_t bcn_slot_group[BCN_SLOT_COUNT]; /* blocks per workgroup edge */
    uint32_t bcn_astc_block_only;           /* slots whose workgroup encoder failed */
+   bool bcn_direct;                        /* the ASTC 4x4 encoder maps BC blocks directly */
    bool bcn_cache_warm;                    /* the pipeline cache file had data */
    VkQueue bcn_queue;                      /* where the worker runs the self-test */
    uint32_t bcn_queue_family;
