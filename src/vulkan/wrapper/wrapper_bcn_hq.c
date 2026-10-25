@@ -182,6 +182,10 @@ hq_worker(void *arg)
       size_t out_row = (size_t)((w + job->block - 1) / job->block) * 16;
       for (uint32_t l = 0; l < job->sub.layerCount && ok; l++) {
          for (uint32_t y = 0; y < h && ok; y += 96) {
+            if (__atomic_load_n(&hq->stop, __ATOMIC_RELAXED)) {
+               ok = false;
+               break;
+            }
             while (__atomic_load_n(&wrapper_bcn_fg_busy, __ATOMIC_RELAXED) &&
                    !__atomic_load_n(&hq->stop, __ATOMIC_RELAXED))
                usleep(2000);
