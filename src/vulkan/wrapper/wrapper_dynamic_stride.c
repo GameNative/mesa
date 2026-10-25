@@ -525,6 +525,7 @@ wrapper_stride_create(struct wrapper_device *device, VkPipelineCache cache,
    struct wrapper_variant_key key;
    base_key(sp, &key);
    *pipeline = create_variant(device, sp, &key);
+   sp->cache = VK_NULL_HANDLE;
    if (*pipeline == VK_NULL_HANDLE) {
       free_record(device, sp);
       return VK_ERROR_UNKNOWN;
