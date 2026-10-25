@@ -10,7 +10,7 @@
  * decoder's infill, refines the endpoints by least squares, and keeps the
  * mode with the smallest error. Constant blocks become void-extent blocks.
  *
- * kind: 0 RGBA, 1 luminance (red), 2 luminance + alpha (red, green)
+ * kind: 0 RGBA, 1 luminance (red), 2 luminance + alpha (red, alpha)
  */
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Words { uint w[]; };
@@ -363,7 +363,7 @@ void main()
       if (pc.kind == 1u)
          t = vec4(t.r, 0.0, 0.0, 255.0);
       else if (pc.kind == 2u)
-         t = vec4(t.r, 0.0, 0.0, t.g);
+         t = vec4(t.r, 0.0, 0.0, t.a);
       tex[i] = t;
       lo = min(lo, t);
       hi = max(hi, t);

@@ -18,6 +18,9 @@ wrapper_bcn_gpu_copy_image_region(struct wrapper_command_buffer *wcb,
 int
 wrapper_bcn_gpu_path(void);
 
+bool
+wrapper_bcn_gpu_misaligned(const struct wrapper_image *wi, const VkBufferImageCopy *c);
+
 uint32_t
 wrapper_bcn_gpu_upload(struct wrapper_command_buffer *wcb, struct wrapper_image *wi,
                        VkBuffer src, VkImageLayout layout, uint32_t count,
