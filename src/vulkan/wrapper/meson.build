@@ -75,6 +75,7 @@ adrenotools_dep = declare_dependency(
 
 wrapper_files = files(
   'wrapper_device.c',
+  'wrapper_core13.c',
   'wrapper_dynamic_stride.c',
   'wrapper_divisor.c',
   'wrapper_device_memory.c',

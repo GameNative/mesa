@@ -325,19 +325,11 @@ VkResult enumerate_physical_device(struct vk_instance *_instance)
       pdevice->dispatch_table.GetPhysicalDeviceProperties2(
          pdevice->dispatch_handle, &pdevice->properties2);
 
-      /* Raising the reported core version above the base ICD requires
-       * substantial lowering. Keep it opt-in and select it from the actual API
-       * gap, not from a vendor ID. */
       pdevice->emulate_vulkan13 =
-         getenv("WRAPPER_EMULATE_VULKAN_1_3") &&
-         atoi(getenv("WRAPPER_EMULATE_VULKAN_1_3")) &&
-         pdevice->properties2.properties.apiVersion < VK_API_VERSION_1_3;
+         wrapper_core13_wanted(pdevice, instance->vk.app_info.engine_name);
       if (pdevice->emulate_vulkan13)
-         WRAPPER_LOG(info, "Lowering Vulkan 1.3 core calls for a %u.%u base driver "
-                           "(WRAPPER_EMULATE_VULKAN_1_3)",
-                     VK_API_VERSION_MAJOR(pdevice->properties2.properties.apiVersion),
-                     VK_API_VERSION_MINOR(pdevice->properties2.properties.apiVersion));
-         
+         wrapper_core13_init_physical_device(pdevice);
+
       pdevice->dispatch_table.GetPhysicalDeviceMemoryProperties(
          pdevice->dispatch_handle, &pdevice->memory_properties);
       wrapper_setup_coherent_memory_types(pdevice);
@@ -367,7 +359,7 @@ VkResult enumerate_physical_device(struct vk_instance *_instance)
 
       if (!pdevice->base_supported_features.hostQueryReset &&
           debug_get_bool_option("WRAPPER_EMULATE_HOST_QUERY_RESET",
-                                nvidia_proprietary)) {
+                                nvidia_proprietary || pdevice->emulate_vulkan13)) {
          WRAPPER_LOG(info, "Emulating VK_EXT_host_query_reset "
                            "(base driver lacks it; resets go through a command buffer)");
          pdevice->vk.supported_extensions.EXT_host_query_reset = true;

@@ -325,6 +325,14 @@ wrapper_device_memory_destroy(struct wrapper_device_memory *mem);
 int wrapper_diag_on(void);
 void wrapper_diag_append(const char *fmt, ...);
 
+bool wrapper_core13_wanted(const struct wrapper_physical_device *pdevice,
+                           const char *engine_name);
+void wrapper_core13_init_physical_device(struct wrapper_physical_device *pdevice);
+void *wrapper_core13_lower_device_create(struct wrapper_device *device,
+                                         VkDeviceCreateInfo *info,
+                                         const char **exts, uint32_t *ext_count);
+void wrapper_core13_free_device_create(void *storage);
+
 struct wrapper_stride_pipeline;
 
 void wrapper_stride_note_module(struct wrapper_device *device, VkShaderModule module,

@@ -1298,6 +1298,13 @@ if (pdf2 && pdf2->features.f) { \
                               (VkPhysicalDeviceFeatures *)wrapper_create_info.pEnabledFeatures,
                               (void *)wrapper_create_info.pNext);
 
+   void *core13_storage = NULL;
+   if (physical_device->emulate_vulkan13) {
+      core13_storage = wrapper_core13_lower_device_create(device, &wrapper_create_info,
+         wrapper_enable_extensions, &wrapper_enable_extension_count);
+      wrapper_create_info.enabledExtensionCount = wrapper_enable_extension_count;
+   }
+
    device->emulate_dynamic_stride = debug_get_bool_option("WRAPPER_EMULATE_DYNAMIC_STRIDE",
       physical_device->driver_properties.driverID == VK_DRIVER_ID_ARM_PROPRIETARY &&
       VK_API_VERSION_MAJOR(physical_device->properties2.properties.driverVersion) < 44);
@@ -1373,6 +1380,7 @@ if (pdf2 && pdf2->features.f) { \
    result = physical_device->dispatch_table.CreateDevice(
       physical_device->dispatch_handle, &wrapper_create_info,
          pAllocator, &device->dispatch_handle);
+   wrapper_core13_free_device_create(core13_storage);
 
    if (result != VK_SUCCESS) {
       if (wrapper_safe_create_device) {
