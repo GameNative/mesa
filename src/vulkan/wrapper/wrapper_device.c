@@ -2834,6 +2834,29 @@ wrapper_DestroyDescriptorUpdateTemplate(VkDevice _device,
    wrapper_destroy_update_template(device, descriptorUpdateTemplate, pAllocator);
 }
 
+/* Buffers the BCn emulation records into a command buffer. They are freed when
+ * the command buffer is begun, reset or freed again, when it cannot be pending. */
+static void
+wrapper_bcn_transients_free(struct wrapper_command_buffer *wcb)
+{
+   struct wrapper_device *device = wcb->device;
+   list_for_each_entry_safe(struct wrapper_buffer, wb, &wcb->bcn_transients, link) {
+      if (wb->desc_pool)
+         device->dispatch_table.DestroyDescriptorPool(device->dispatch_handle,
+            wb->desc_pool, NULL);
+      if (wb->bcn_inflight) {
+         simple_mtx_lock(&device->bcn_gpu_mutex);
+         device->bcn_gpu_inflight -= wb->bcn_inflight;
+         simple_mtx_unlock(&device->bcn_gpu_mutex);
+      }
+      device->dispatch_table.DestroyBuffer(device->dispatch_handle,
+         wb->dispatch_handle, NULL);
+      device->dispatch_table.FreeMemory(device->dispatch_handle, wb->memory, NULL);
+      list_del(&wb->link);
+      vk_object_free(&device->vk, &device->vk.alloc, wb);
+   }
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 wrapper_BeginCommandBuffer(VkCommandBuffer commandBuffer,
                           const VkCommandBufferBeginInfo *pBeginInfo)
@@ -2841,6 +2864,7 @@ wrapper_BeginCommandBuffer(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
    wrapper_dynamic_render_objects_reset(wcb);
    wrapper_stride_reset(wcb);
+   wrapper_bcn_transients_free(wcb);
    if (wcb->device->emulate_push_descriptor)
       wrapper_push_pool_reset_all(wcb);
    VkResult begin_result =
@@ -3799,6 +3823,7 @@ wrapper_ResetCommandBuffer(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
    wrapper_dynamic_render_objects_reset(wcb);
    wrapper_stride_reset(wcb);
+   wrapper_bcn_transients_free(wcb);
    if (wcb->device->emulate_push_descriptor)
       wrapper_push_pool_reset_all(wcb);
    return wcb->device->dispatch_table.ResetCommandBuffer(wcb->dispatch_handle,
@@ -3814,12 +3839,14 @@ wrapper_ResetCommandPool(VkDevice _device, VkCommandPool commandPool,
     * so do it only when something can have put objects there. */
    if (device->emulate_push_descriptor ||
        device->physical->emulate_imageless_framebuffer ||
-       device->physical->emulate_vulkan13) {
+       device->physical->emulate_vulkan13 ||
+       device->physical->emulate_bcn > 1) {
       simple_mtx_lock(&device->resource_mutex);
       list_for_each_entry(struct wrapper_command_buffer, wcb,
                           &device->command_buffer_list, link) {
          if (wcb->pool == commandPool) {
             wrapper_dynamic_render_objects_reset(wcb);
+            wrapper_bcn_transients_free(wcb);
             if (device->emulate_push_descriptor)
                wrapper_push_pool_reset_all(wcb);
          }
@@ -4205,8 +4232,6 @@ wrapper_CreateFence(VkDevice _device,
    wf->device = device;
    wf->dispatch_handle = *pFence;
 
-   list_inithead(&wf->staging_buffers_list);
-
    list_add(&wf->link, &device->fence_list);
    _mesa_hash_table_u64_insert(device->fence_table, (uint64_t)wf->dispatch_handle, wf);
 
@@ -4227,29 +4252,6 @@ wrapper_WaitForFences(VkDevice _device,
 
    res = device->dispatch_table.WaitForFences(device->dispatch_handle,
      fenceCount, pFences, waitAll, timeout);
-
-   if (res != VK_SUCCESS || device->physical->emulate_bcn < 2)
-      return res;
-
-   for (uint32_t i = 0; i < fenceCount; i++) {
-      struct wrapper_fence *wf = get_wrapper_fence_from_handle(device, pFences[i]);
-      list_for_each_entry_safe(struct wrapper_buffer, wb,
-                               &wf->staging_buffers_list, link)
-      {
-         VkDeviceMemory memory = wb->memory;
-         if (wb->desc_pool)
-            device->dispatch_table.DestroyDescriptorPool(device->dispatch_handle,
-               wb->desc_pool, NULL);
-         if (wb->bcn_inflight) {
-            simple_mtx_lock(&device->bcn_gpu_mutex);
-            device->bcn_gpu_inflight -= wb->bcn_inflight;
-            simple_mtx_unlock(&device->bcn_gpu_mutex);
-         }
-         wrapper_buffer_destroy(device, wb, NULL);
-         device->dispatch_table.FreeMemory(device->dispatch_handle,
-            memory, NULL);
-      }
-   }
 
    return res;
 }
@@ -4365,6 +4367,7 @@ wrapper_command_buffer_create(struct wrapper_device *device,
    wcb->pool = pool;
    wcb->dispatch_handle = dispatch_handle;
    list_inithead(&wcb->dynamic_render_objects);
+   list_inithead(&wcb->bcn_transients);
    list_add(&wcb->link, &device->command_buffer_list);
 
    *pCommandBuffers = wrapper_command_buffer_to_handle(wcb);
@@ -4381,6 +4384,7 @@ wrapper_command_buffer_destroy(struct wrapper_device *device,
    if (device->emulate_push_descriptor)
       wrapper_push_pool_destroy_all(wcb);
    wrapper_dynamic_render_objects_reset(wcb);
+   wrapper_bcn_transients_free(wcb);
 
    device->dispatch_table.FreeCommandBuffers(
       device->dispatch_handle, wcb->pool, 1, &wcb->dispatch_handle);
@@ -4749,10 +4753,8 @@ wrapper_bcn_gpu_copy(struct wrapper_command_buffer *wcb,
       srcb->wcb = wcb;
       dstb->wcb = wcb;
       dstb->desc_pool = pool;
-      if (wcb->fence) {
-         list_add(&srcb->link, &wcb->fence->staging_buffers_list);
-         list_add(&dstb->link, &wcb->fence->staging_buffers_list);
-      }
+      list_addtail(&srcb->link, &wcb->bcn_transients);
+      list_addtail(&dstb->link, &wcb->bcn_transients);
    }
    return true;
 }
@@ -4874,7 +4876,8 @@ wrapper_bcn_staging_create(struct wrapper_device *device, VkDeviceSize upload_si
    return staging_wb;
 }
 
-/* Copy a tightly packed staging upload into the image; freed with the fence. */
+/* Copy a tightly packed staging upload into the image; freed with the command
+ * buffer. */
 static void
 wrapper_bcn_staging_submit(struct wrapper_command_buffer *wcb,
                            struct wrapper_device *device,
@@ -4890,9 +4893,7 @@ wrapper_bcn_staging_submit(struct wrapper_command_buffer *wcb,
 
    staging_wb->wcb = wcb;
    staging_wb->device = device;
-
-   if (wcb->fence)
-      list_add(&staging_wb->link, &wcb->fence->staging_buffers_list);
+   list_addtail(&staging_wb->link, &wcb->bcn_transients);
 }
 
 static void
