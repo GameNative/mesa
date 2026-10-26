@@ -39,6 +39,7 @@ struct wrapper_physical_device {
    int dma_heap_fd;
    int emulate_bcn;
    bool is_vkd3d;
+   uint32_t queue_family_count;
    bool emulate_imageless_framebuffer;
    bool emulate_vulkan13;
    bool emulate_vertex_divisor;
