@@ -29,6 +29,11 @@ wrapper_astcenc_compress_threads(const void *texels, int w, int h, int block,
                                  enum wrapper_astc_kind kind, int srgb, uint8_t *out,
                                  size_t len, unsigned threads, float quality);
 
+/* mean squared error per channel of a 4x4 LDR ASTC block against 16 RGBA8
+ * texels, or a negative value when the block cannot be decoded */
+float
+wrapper_astc4_block_mse(const uint8_t block[16], const uint8_t rgba[64]);
+
 #ifdef __cplusplus
 }
 #endif

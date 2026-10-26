@@ -171,3 +171,34 @@ wrapper_astcenc_compress_threads(const void *texels, int w, int h, int block,
          return -1;
    return 0;
 }
+
+extern "C" float
+wrapper_astc4_block_mse(const uint8_t block[16], const uint8_t rgba[64])
+{
+   astcenc_config cfg;
+   if (astcenc_config_init(ASTCENC_PRF_LDR, 4, 4, 1, ASTCENC_PRE_FASTEST,
+                           ASTCENC_FLG_DECOMPRESS_ONLY, &cfg) != ASTCENC_SUCCESS)
+      return -1.0f;
+   astcenc_context *ctx = nullptr;
+   if (astcenc_context_alloc(&cfg, 1, &ctx, nullptr) != ASTCENC_SUCCESS)
+      return -1.0f;
+   uint8_t out[64];
+   void *slice = out;
+   astcenc_image image;
+   image.dim_x = 4;
+   image.dim_y = 4;
+   image.dim_z = 1;
+   image.data_type = ASTCENC_TYPE_U8;
+   image.data = &slice;
+   astcenc_swizzle swz = { ASTCENC_SWZ_R, ASTCENC_SWZ_G, ASTCENC_SWZ_B, ASTCENC_SWZ_A };
+   astcenc_error e = astcenc_decompress_image(ctx, block, 16, &image, &swz, 0);
+   astcenc_context_free(ctx);
+   if (e != ASTCENC_SUCCESS)
+      return -1.0f;
+   float sum = 0.0f;
+   for (int i = 0; i < 64; i++) {
+      float d = (float)out[i] - (float)rgba[i];
+      sum += d * d;
+   }
+   return sum / 64.0f;
+}
