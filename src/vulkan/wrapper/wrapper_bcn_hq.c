@@ -45,6 +45,8 @@ struct bcn_hq_job {
    size_t layer_in, layer_out;
    uint8_t *in;
    uint8_t *out;
+   VkFormat stored;
+   bool whole;
    int state;
    double t_capture, encode_ms;
 };
@@ -205,6 +207,10 @@ hq_worker(void *arg)
          }
       }
       double t1 = now_ms();
+      if (ok && job->whole)
+         wrapper_bcn_cache_store(job->format, job->stored, w, h, job->in,
+                                 (size_t)((w + 3) / 4) * bb, (h + 3) / 4, job->out,
+                                 job->layer_out);
       pthread_mutex_lock(&hq->lock);
       job->encode_ms = t1 - t0;
       free(job->in);
@@ -221,6 +227,18 @@ hq_worker(void *arg)
    }
    pthread_mutex_unlock(&hq->lock);
    return NULL;
+}
+
+/* the encoder settings the cached results depend on */
+const char *
+wrapper_bcn_hq_settings(void)
+{
+   static char s[32];
+   if (!s[0]) {
+      const char *q = getenv("WRAPPER_BCN_HQ_QUALITY");
+      snprintf(s, sizeof(s), "q%g", q ? atof(q) : 60.0);
+   }
+   return s;
 }
 
 static struct bcn_hq *
@@ -353,6 +371,10 @@ wrapper_bcn_hq_capture(struct wrapper_command_buffer *wcb, struct wrapper_image 
    j->block = block;
    j->layer_in = layer_in;
    j->layer_out = layer_out;
+   j->stored = get_format_for_bcn(format);
+   j->whole = layers == 1 && !c->imageOffset.x && !c->imageOffset.y && !c->imageOffset.z &&
+              w == MAX2(1u, wi->info.extent.width >> c->imageSubresource.mipLevel) &&
+              h == MAX2(1u, wi->info.extent.height >> c->imageSubresource.mipLevel);
    j->in = in;
    j->out = out;
    j->t_capture = now_ms();

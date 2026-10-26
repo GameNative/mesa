@@ -60,6 +60,25 @@ void
 wrapper_bcn_hq_barrier(struct wrapper_command_buffer *wcb, VkImage image, VkImageLayout old_layout,
                        VkImageLayout new_layout, uint32_t src_family, uint32_t dst_family);
 
+const char *
+wrapper_bcn_hq_settings(void);
+
+bool
+wrapper_bcn_cache_on(void);
+
+bool
+wrapper_bcn_cache_load(VkFormat bc, VkFormat stored, uint32_t w, uint32_t h,
+                       const uint8_t *src, size_t row_bytes, size_t stride, uint32_t rows,
+                       uint8_t *out, size_t out_len);
+
+void
+wrapper_bcn_cache_store(VkFormat bc, VkFormat stored, uint32_t w, uint32_t h,
+                        const uint8_t *src, size_t row_bytes, uint32_t rows,
+                        const uint8_t *data, size_t len);
+
+void
+wrapper_bcn_cache_report(void);
+
 /* CPU BCn work the application is waiting for; the background stage yields to it */
 extern uint32_t wrapper_bcn_fg_busy;
 

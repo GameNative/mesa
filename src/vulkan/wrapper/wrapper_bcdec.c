@@ -1,4 +1,5 @@
 #include "wrapper_bcdec.h"
+#include "wrapper_bcn_gpu.h"
 #include "wrapper_log.h"
 #include "wrapper_util.h"
 
@@ -1270,6 +1271,11 @@ decompress_bcn_format(void *srcBuffer,
     * compressed source. Skips decode+encode on subsequent loads. Only touched
     * when explicitly enabled, so there is zero overhead by default. */
    char *cache_filename = NULL;
+   if (wrapper_use_bcn_cache && astc &&
+       wrapper_bcn_cache_load(format, img, w, h, (const uint8_t *)src,
+                              (size_t)block_x * block_size, (size_t)block_x_src * block_size,
+                              block_y, dst, uncompressed_size))
+      return;
    if (wrapper_use_bcn_cache) {
       CREATE_FOLDER(wrapper_cache_path, 0700);
       cache_filename = bcn_cache_filename(wrapper_cache_path, format,
