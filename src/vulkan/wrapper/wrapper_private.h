@@ -146,6 +146,7 @@ struct wrapper_device {
    pthread_t bcn_tool_thread;
    bool bcn_tool_thread_live;
    bool bcn_tool_stop;
+   bool bcn_tool_exited;
    pthread_mutex_t bcn_tool_lock;
    pthread_cond_t bcn_tool_cond;
    uint32_t bcn_tool_untested;             /* a pipeline was built since the last check */
@@ -181,6 +182,7 @@ struct wrapper_device {
    bool bcn_queue_shares_query_reset;
    simple_mtx_t bcn_queue_mutex;
    int bcn_slot_state[BCN_SLOT_COUNT];
+   bool bcn_slot_late[BCN_SLOT_COUNT];     /* a wait for its build timed out */
    VkPipeline bcn_retired[BCN_SLOT_COUNT]; /* dropped by the self-test */
    struct bcn_hq *bcn_hq;                  /* background astcenc stage */
    uint32_t bcn_hq_active;                 /* its jobs not yet copied or dropped */
