@@ -1286,6 +1286,19 @@ wrapper_emit_diag(struct wrapper_physical_device *pdev,
 #undef D
 }
 
+static bool
+wrapper_mali_csf_before_r36(const struct wrapper_physical_device *pdevice)
+{
+   static const char *const csf_gpus[] = { "G310", "G510", "G610", "G710" };
+   if (pdevice->driver_properties.driverID != VK_DRIVER_ID_ARM_PROPRIETARY ||
+       VK_API_VERSION_MAJOR(pdevice->properties2.properties.driverVersion) >= 36)
+      return false;
+   for (unsigned i = 0; i < ARRAY_SIZE(csf_gpus); i++)
+      if (strstr(pdevice->properties2.properties.deviceName, csf_gpus[i]))
+         return true;
+   return false;
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 wrapper_CreateDevice(VkPhysicalDevice physicalDevice,
                      const VkDeviceCreateInfo* pCreateInfo,
@@ -1481,6 +1494,13 @@ if (pdf2 && pdf2->features.f) { \
       WRAPPER_LOG(info, "Emulating vertex attribute divisors");
    else if (device->emulate_zero_divisor)
       WRAPPER_LOG(info, "Emulating the zero vertex attribute divisor");
+
+   device->split_instance_rate = device->emulate_vertex_divisor &&
+      device->emulate_dynamic_stride &&
+      debug_get_bool_option("WRAPPER_SPLIT_INSTANCE_RATE",
+                            wrapper_mali_csf_before_r36(physical_device));
+   if (device->split_instance_rate)
+      WRAPPER_LOG(info, "Drawing instance-rate bindings of vkd3d-shader vertex shaders one instance at a time");
 
    device->cmdbuf_entry_barrier = debug_get_bool_option("WRAPPER_CMDBUF_ENTRY_BARRIER",
       physical_device->driver_properties.driverID == VK_DRIVER_ID_IMAGINATION_PROPRIETARY);
