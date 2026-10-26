@@ -88,9 +88,8 @@ get_driver_version(const uint32_t driverVersion)
 	return driver_version;
 }
 
-/* DXVK uploads textures on a compute-only family when the driver has one, and
- * Xclipse 960 loses those uploads. Report only the families up to the last
- * graphics one so DXVK records its uploads on the graphics queue. */
+/* DXVK 2.5+ uploads textures on a family without graphics when one exists;
+ * Xclipse 960 loses those uploads. Keep DXVK on the graphics queue. */
 static void
 wrapper_hide_compute_queue_families(struct wrapper_physical_device *pdevice)
 {
@@ -484,10 +483,11 @@ VkResult enumerate_physical_device(struct vk_instance *_instance)
             WRAPPER_LOG(info, "Faking VK_EXT_dynamic_rendering_unused_attachments for Xclipse");
             pdevice->vk.supported_extensions.EXT_dynamic_rendering_unused_attachments = true;
          }
-         if (strstr(engine_name, "DXVK") &&
-             debug_get_bool_option("WRAPPER_GRAPHICS_QUEUE_FAMILY_ONLY", true))
-            wrapper_hide_compute_queue_families(pdevice);
       }
+
+      if (strstr(engine_name, "DXVK") &&
+          debug_get_bool_option("WRAPPER_GRAPHICS_QUEUE_FAMILY_ONLY", true))
+         wrapper_hide_compute_queue_families(pdevice);
 
       /* DXVK > 2.4.1 requires VK_KHR_maintenance5. Some drivers (e.g. Xclipse)
        * don't expose it. Emulate it for any D3D client whose base driver lacks
