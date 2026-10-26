@@ -1617,6 +1617,8 @@ bcn_gpu_upload_region(struct wrapper_command_buffer *wcb, struct wrapper_image *
    uint32_t lw = MAX2(1u, wi->info.extent.width >> m), lh = MAX2(1u, wi->info.extent.height >> m);
    if (!w || !h)
       return false;
+   if (astc && bcn_upload_cached(wcb, wi, wb, layout, c, stored, astc))
+      return true;
    VkPipeline decoder = bcn_pipe(device, BCN_SLOT_DECODE, wait);
    VkPipeline encoder = hdr ? bcn_pipe(device, BCN_SLOT_HDR, wait) :
                         astc ? bcn_pipe(device, astc == 4 ? BCN_SLOT_ASTC4 :
@@ -1624,8 +1626,6 @@ bcn_gpu_upload_region(struct wrapper_command_buffer *wcb, struct wrapper_image *
                         VK_NULL_HANDLE;
    if (!decoder || (astc && !encoder))
       return false;
-   if (astc && bcn_upload_cached(wcb, wi, wb, layout, c, stored, astc))
-      return true;
    bool merge = astc && wrapper_bcn_gpu_misaligned(wi, c);
    /* the rectangle written: the region, or the ASTC blocks covering it */
    uint32_t x0 = c->imageOffset.x, y0 = c->imageOffset.y, ew = w, eh = h;
