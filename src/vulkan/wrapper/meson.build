@@ -112,6 +112,9 @@ libwrapper_astcenc = static_library(
 
 wrapper_files = files(
   'wrapper_device.c',
+  'wrapper_core13.c',
+  'wrapper_spirv_lower.c',
+  'wrapper_set_fold.c',
   'wrapper_dynamic_stride.c',
   'wrapper_divisor.c',
   'wrapper_device_memory.c',

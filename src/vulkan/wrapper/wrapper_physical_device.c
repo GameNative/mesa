@@ -385,15 +385,18 @@ VkResult enumerate_physical_device(struct vk_instance *_instance)
        * substantial lowering. Keep it opt-in and select it from the actual API
        * gap, not from a vendor ID. */
       pdevice->emulate_vulkan13 =
-         getenv("WRAPPER_EMULATE_VULKAN_1_3") &&
-         atoi(getenv("WRAPPER_EMULATE_VULKAN_1_3")) &&
-         pdevice->properties2.properties.apiVersion < VK_API_VERSION_1_3;
+         wrapper_core13_wanted(pdevice, instance->vk.app_info.engine_name);
       if (pdevice->emulate_vulkan13)
-         WRAPPER_LOG(info, "Lowering Vulkan 1.3 core calls for a %u.%u base driver "
-                           "(WRAPPER_EMULATE_VULKAN_1_3)",
-                     VK_API_VERSION_MAJOR(pdevice->properties2.properties.apiVersion),
-                     VK_API_VERSION_MINOR(pdevice->properties2.properties.apiVersion));
-         
+         wrapper_core13_init_physical_device(pdevice);
+      pdevice->fold_sets = pdevice->emulate_vulkan13 &&
+         instance->vk.app_info.engine_name &&
+         strstr(instance->vk.app_info.engine_name, "vkd3d") &&
+         pdevice->properties2.properties.limits.maxBoundDescriptorSets < 8 &&
+         debug_get_bool_option("WRAPPER_FOLD_DESCRIPTOR_SETS", true);
+      if (pdevice->fold_sets)
+         WRAPPER_LOG(info, "Reporting 8 descriptor sets (driver has %u); bindless sets are folded",
+                     pdevice->properties2.properties.limits.maxBoundDescriptorSets);
+
       pdevice->dispatch_table.GetPhysicalDeviceMemoryProperties(
          pdevice->dispatch_handle, &pdevice->memory_properties);
       wrapper_setup_coherent_memory_types(pdevice);
@@ -423,7 +426,7 @@ VkResult enumerate_physical_device(struct vk_instance *_instance)
 
       if (!pdevice->base_supported_features.hostQueryReset &&
           debug_get_bool_option("WRAPPER_EMULATE_HOST_QUERY_RESET",
-                                nvidia_proprietary)) {
+                                nvidia_proprietary || pdevice->emulate_vulkan13)) {
          WRAPPER_LOG(info, "Emulating VK_EXT_host_query_reset "
                            "(base driver lacks it; resets go through a command buffer)");
          pdevice->vk.supported_extensions.EXT_host_query_reset = true;
@@ -485,6 +488,10 @@ VkResult enumerate_physical_device(struct vk_instance *_instance)
             !pdevice->base_supported_features.vertexAttributeInstanceRateZeroDivisor;
          pdevice->vk.supported_extensions.EXT_vertex_attribute_divisor = true;
          pdevice->vk.supported_extensions.KHR_vertex_attribute_divisor = true;
+         if (pdevice->emulate_vertex_divisor) {
+            supported_features->vertexAttributeInstanceRateDivisor = true;
+            supported_features->vertexAttributeInstanceRateZeroDivisor = true;
+         }
          WRAPPER_LOG(info, "Disabling VK_EXT_calibrated_timestamps");
          pdevice->vk.supported_extensions.EXT_calibrated_timestamps = false;
          if (!is_d3d) {
@@ -541,6 +548,15 @@ VkResult enumerate_physical_device(struct vk_instance *_instance)
             WRAPPER_LOG(info, "Faking shaderInt64 (base driver lacks it)");
             supported_features->shaderInt64 = true;
          }
+      }
+
+      if (strstr(engine_name, "vkd3d") && pdevice->emulate_vulkan13 &&
+          !pdevice->base_supported_features.shaderInt64 &&
+          debug_get_bool_option("WRAPPER_FAKE_SHADER_INT64", false)) {
+         WRAPPER_LOG(info, "Faking shaderInt64 for vkd3d; 64-bit widening before a float "
+                     "conversion is lowered, other 64-bit integer shaders are refused");
+         supported_features->shaderInt64 = true;
+         pdevice->lower_int64 = true;
       }
 
       /* VK_KHR_push_descriptor: vkd3d/DXVK effectively require it, but some
@@ -712,6 +728,8 @@ wrapper_GetPhysicalDeviceProperties(VkPhysicalDevice physicalDevice,
 
    if (api_version > 0)
       pProperties->apiVersion = api_version;
+   if (pdevice->fold_sets)
+      pProperties->limits.maxBoundDescriptorSets = 8;
 
    /* See wrapper_GetPhysicalDeviceProperties2: bump push constant size to the
     * DXVK-required minimum on Xclipse. */
@@ -743,6 +761,23 @@ wrapper_GetPhysicalDeviceProperties(VkPhysicalDevice physicalDevice,
    if ((p)->maxDescriptorSetUpdateAfterBindSampledImages < _t)     (p)->maxDescriptorSetUpdateAfterBindSampledImages = _t; \
    if ((p)->maxDescriptorSetUpdateAfterBindStorageImages < _t)     (p)->maxDescriptorSetUpdateAfterBindStorageImages = _t; \
 } while (0)
+
+static void
+wrapper_keep_real_ubo_limits(struct wrapper_physical_device *pdevice,
+                             uint32_t *per_stage, uint32_t *per_set)
+{
+   static bool logged;
+   if (!pdevice->fold_sets)
+      return;
+   *per_stage = pdevice->vk.properties.maxPerStageDescriptorUpdateAfterBindUniformBuffers;
+   *per_set = pdevice->vk.properties.maxDescriptorSetUpdateAfterBindUniformBuffers;
+   if (!logged) {
+      logged = true;
+      WRAPPER_LOG(info, "Reporting the driver's update-after-bind uniform buffer limits "
+                  "(%u per stage, %u per set) so heap CBVs go to storage buffers",
+                  *per_stage, *per_set);
+   }
+}
 
 VKAPI_ATTR void VKAPI_CALL
 wrapper_GetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice,
@@ -779,6 +814,8 @@ wrapper_GetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice,
 
    if (api_version > 0)
       pProperties->properties.apiVersion = api_version;
+   if (pdevice->fold_sets)
+      pProperties->properties.limits.maxBoundDescriptorSets = 8;
 
    /* DXVK 2.6+ requires maxPushConstantsSize >= 256 (its unified "push data"
     * model) and skips the adapter otherwise. Xclipse reports less; the RDNA
@@ -788,6 +825,9 @@ wrapper_GetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice,
     * vkCreatePipelineLayout this will surface as pipeline-creation failures. */
    if (pdevice->raises_push_constant_limit)
       pProperties->properties.limits.maxPushConstantsSize = 256;
+
+   if (pdevice->emulate_vulkan13)
+      wrapper_core13_fill_properties(pdevice, pProperties);
 
    vk_foreach_struct(prop, pProperties->pNext) {
       switch (prop->sType) {
@@ -896,15 +936,24 @@ wrapper_GetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice,
          strcpy(vk12_prop->driverName, "Wrapper driver");
 
          /* Vulkan12Properties folds in the descriptor-indexing limits. */
-         if (is_d3d)
+         if (is_d3d) {
             BUMP_UAB(vk12_prop, WRAPPER_D3D_BINDLESS_LIMIT);
+            wrapper_keep_real_ubo_limits(pdevice,
+               &vk12_prop->maxPerStageDescriptorUpdateAfterBindUniformBuffers,
+               &vk12_prop->maxDescriptorSetUpdateAfterBindUniformBuffers);
+         }
          break;
       }
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_PROPERTIES:
       {
-         if (is_d3d)
-            BUMP_UAB((VkPhysicalDeviceDescriptorIndexingProperties *)prop,
-                     WRAPPER_D3D_BINDLESS_LIMIT);
+         if (is_d3d) {
+            VkPhysicalDeviceDescriptorIndexingProperties *di =
+               (VkPhysicalDeviceDescriptorIndexingProperties *)prop;
+            BUMP_UAB(di, WRAPPER_D3D_BINDLESS_LIMIT);
+            wrapper_keep_real_ubo_limits(pdevice,
+               &di->maxPerStageDescriptorUpdateAfterBindUniformBuffers,
+               &di->maxDescriptorSetUpdateAfterBindUniformBuffers);
+         }
          break;
       }
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES:
@@ -1161,6 +1210,9 @@ wrapper_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice,
 
    pdevice->dispatch_table.GetPhysicalDeviceFormatProperties2(pdevice->dispatch_handle,
       format, pFormatProperties);
+   if (pdevice->properties2.properties.apiVersion < VK_API_VERSION_1_3 &&
+       !pdevice->base_supported_extensions.KHR_format_feature_flags2)
+      wrapper_format_properties3_from_legacy(pdevice, format, pFormatProperties);
 
    switch (format) {
    case VK_FORMAT_BC1_RGB_UNORM_BLOCK:
