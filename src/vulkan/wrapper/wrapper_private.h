@@ -152,6 +152,7 @@ struct wrapper_device {
    uint32_t bcn_gate_pending[64][6];
    uint32_t bcn_gate_pending_count;
    bool bcn_cache_warm;                    /* the pipeline cache file had data */
+   bool bcn_cache_tainted;                 /* a build failed: the cache is not saved */
    VkQueue bcn_queue;                      /* where the worker runs the self-test */
    uint32_t bcn_queue_family;
    uint32_t bcn_queue_index;
