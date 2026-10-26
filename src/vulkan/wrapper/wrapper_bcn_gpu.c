@@ -487,7 +487,7 @@ bcn_cache_save(struct wrapper_device *device)
    VkDevice d = device->dispatch_handle;
    size_t out = 0;
    void *data;
-   if (!device->bcn_pipeline_cache ||
+   if (!device->bcn_pipeline_cache || device->bcn_cache_tainted ||
        device->dispatch_table.GetPipelineCacheData(d, device->bcn_pipeline_cache, &out, NULL) !=
           VK_SUCCESS || !out || !(data = malloc(out)))
       return;
@@ -536,7 +536,9 @@ bcn_tools_worker(void *arg)
       VkPipeline p = VK_NULL_HANDLE;
       VkResult r = bcn_build_slot(device, slot, &p);
       clock_gettime(CLOCK_MONOTONIC, &t1);
-      if (r == VK_SUCCESS)
+      if (r != VK_SUCCESS)
+         device->bcn_cache_tainted = true;
+      else
          bcn_cache_save(device);
       wrapper_diag_append("[BCN] GPU shader %s built in %.0f ms (VkResult %d)\n",
                           bcn_slot_names[slot],
