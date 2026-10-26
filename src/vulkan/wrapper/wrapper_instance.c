@@ -10,6 +10,27 @@
 #include "vk_extensions.h"
 #include "adrenotools/driver.h"
 
+/* bcnEmulationType=compute sets ENABLE_BCN_COMPUTE=1, which turns on the
+ * implicit BCn compute layer above the wrapper. The wrapper emulates BC
+ * formats itself, on the GPU (wrapper_bcn_gpu_path), so it
+ * switches the layer off through its disable variable before the loader
+ * decides which implicit layers to enable: the loader opens the ICDs first,
+ * in vkEnumerateInstanceExtensionProperties and in vkCreateInstance.
+ * WRAPPER_KEEP_BCN_LAYER=1 leaves the layer on. */
+static void __attribute__((constructor))
+wrapper_bcn_layer_setting(void)
+{
+   const char *compute = getenv("ENABLE_BCN_COMPUTE");
+   const char *keep = getenv("WRAPPER_KEEP_BCN_LAYER");
+   const char *emulate = getenv("WRAPPER_EMULATE_BCN");
+   if (!compute || !atoi(compute) || (keep && atoi(keep)) || (emulate && !atoi(emulate)) ||
+       getenv("DISABLE_BCN_COMPUTE"))
+      return;
+   setenv("DISABLE_BCN_COMPUTE", "1", 1);
+   wrapper_diag_append("[BCN] bcnEmulationType=compute: BCn layer off (DISABLE_BCN_COMPUTE=1), "
+                       "wrapper GPU path on\n");
+}
+
 const struct vk_instance_extension_table wrapper_instance_extensions = {
    .KHR_get_surface_capabilities2 = true,
    .EXT_surface_maintenance1 = true,

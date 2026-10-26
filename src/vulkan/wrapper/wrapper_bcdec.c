@@ -1,4 +1,5 @@
 #include "wrapper_bcdec.h"
+#include "wrapper_bcn_gpu.h"
 #include "wrapper_log.h"
 #include "wrapper_util.h"
 
@@ -6,6 +7,7 @@
 #define XXH_IMPLEMENTATION
 #include "util/xxhash.h"
 
+#include <math.h>
 #include <time.h>
 #include <pthread.h>
 #include <unistd.h>
@@ -15,11 +17,11 @@
 #define BCDEC_IMPLEMENTATION
 
 #include "bcdec.h"
-#include "wrapper_astc.h"
+#include "wrapper_astcenc.h"
 
-/* Transcode BCn to ASTC 4x4 (Mali-native, stays compressed) instead of
- * decoding to RGBA8 (4-8x larger). Default on; WRAPPER_BCN_ASTC=0 falls back
- * to the RGBA decode path. */
+/* Emulated BC formats are stored as ASTC no larger than the BC data, as a
+ * driver with native BC would hold them. WRAPPER_BCN_ASTC=0 decodes them
+ * exactly to RGBA instead. */
 static int
 astc_enabled(void)
 {
@@ -31,21 +33,46 @@ astc_enabled(void)
 
 /* ASTC block footprint: 0 = 4x4 (8bpp, crisp), 1 = 8x8 (2bpp, 4x smaller/softer).
  * Selected by WRAPPER_ASTC_BLOCK ("4x4" default, "8x8"). */
+/* bcnEmulationType=compute (ENABLE_BCN_COMPUTE=1, the app's default) means
+ * the parity policy whatever the quality setting; 8x8 is taken only with
+ * bcnEmulationType=cpu and quality=low. The app leaves compute off on
+ * Samsung's Xclipse driver, so a Samsung GPU gets the parity policy too
+ * unless WRAPPER_BCN_KEEP_8X8=1. */
+static uint32_t bcn_vendor;
+
+void
+bcn_set_vendor(uint32_t vendor)
+{
+   __atomic_store_n(&bcn_vendor, vendor, __ATOMIC_RELAXED);
+}
+
 static int
 astc_block8(void)
 {
    static int b = -1;
    if (b == -1) {
       const char *e = getenv("WRAPPER_ASTC_BLOCK");
-      b = (e && strstr(e, "8x8")) ? 1 : 0;
+      const char *compute = getenv("ENABLE_BCN_COMPUTE");
+      const char *keep = getenv("WRAPPER_KEEP_BCN_LAYER");
+      const char *keep8 = getenv("WRAPPER_BCN_KEEP_8X8");
+      int v = (e && strstr(e, "8x8")) ? 1 : 0;
+      if (compute && atoi(compute) && !(keep && atoi(keep)))
+         v = 0;
+      if (v && !(compute && atoi(compute)) && !(keep8 && atoi(keep8)) &&
+          __atomic_load_n(&bcn_vendor, __ATOMIC_RELAXED) == 0x144d) {
+         v = 0;
+         wrapper_diag_append("[BCN] Samsung GPU without bcnEmulationType=compute (the app "
+                             "excludes Xclipse): parity storage instead of 8x8 "
+                             "(WRAPPER_BCN_KEEP_8X8=1 keeps 8x8)\n");
+      }
+      b = v;
    }
    return b;
 }
 
-/* WRAPPER_BCN_POLICY=bc1=6x6,bc2=4x4,...,bc6h=4x4,maxdim=1024
+/* WRAPPER_BCN_POLICY=bc1=6x6,bc2=4x4,...,maxdim=1024
  * Per-format ASTC block (4x4, 6x6, 8x8) and a base-level cap. A key left out
- * keeps the stock behaviour (WRAPPER_ASTC_BLOCK, no cap). 6x6 has an encoder
- * for bc1 only; bc6h takes 4x4 only (ASTC HDR, when the device has it). */
+ * keeps the stock behaviour (bcn_astc_edge, no cap). bc6h takes 4x4 only. */
 enum {
    BCN_POL_BC1, BCN_POL_BC2, BCN_POL_BC3, BCN_POL_BC4, BCN_POL_BC5,
    BCN_POL_BC7, BCN_POL_BC6H, BCN_POL_COUNT
@@ -109,8 +136,7 @@ bcn_policy_parse(void)
          WRAPPER_LOG(info, "BCn policy: ignoring %s=%s", it, val);
          continue;
       }
-      if ((b == 6 && idx != BCN_POL_BC1) ||
-          ((idx == BCN_POL_BC6H || idx == BCN_POL_BC4 || idx == BCN_POL_BC5) && b != 4)) {
+      if (idx == BCN_POL_BC6H && b != 4) {
          WRAPPER_LOG(info, "BCn policy: no %dx%d encoder for %s, stock", b, b, it);
          continue;
       }
@@ -144,7 +170,7 @@ bcn_policy_block(int idx)
 int
 bcn_policy_bc6h_hdr(void)
 {
-   return astc_enabled() && bcn_policy_block(BCN_POL_BC6H) == 4;
+   return astc_enabled() != 0;
 }
 
 /* Set per device: BC6H goes to ASTC 4x4 HDR only when the device enabled it. */
@@ -154,14 +180,19 @@ bcn_set_astc_hdr(int on)
    __atomic_store_n(&bcn_astc_hdr, on, __ATOMIC_RELAXED);
 }
 
-/* ASTC block edge for a BCn format: the policy entry, else WRAPPER_ASTC_BLOCK. */
+/* ASTC block edge for a BCn format: the policy entry, else the largest block
+ * that is not bigger than the BC block in bits per texel. BC1 and BC4 hold
+ * 4 bits per texel, so they take 6x6 (3.56); the 8-bit formats take 4x4.
+ * WRAPPER_ASTC_BLOCK=8x8 (quality=low) takes 8x8, except for BC5. */
 static int
 bcn_astc_edge(int idx)
 {
-   if (idx == BCN_POL_BC4 || idx == BCN_POL_BC5)
-      return 4; /* one/two-channel maps are too lossy at 8x8 */
    int b = bcn_policy_block(idx);
-   return b ? b : (astc_block8() ? 8 : 4);
+   if (b)
+      return b;
+   if (astc_block8())
+      return idx == BCN_POL_BC5 ? 4 : 8;
+   return idx == BCN_POL_BC1 || idx == BCN_POL_BC4 ? 6 : 4;
 }
 
 int
@@ -197,23 +228,6 @@ is_astc_hdr_4x4(VkFormat format)
    return format == VK_FORMAT_ASTC_4x4_SFLOAT_BLOCK;
 }
 
-static int
-bcn_has_alpha(VkFormat bcn_format)
-{
-   switch (bcn_format) {
-   case VK_FORMAT_BC2_UNORM_BLOCK:
-   case VK_FORMAT_BC2_SRGB_BLOCK:
-   case VK_FORMAT_BC3_UNORM_BLOCK:
-   case VK_FORMAT_BC3_SRGB_BLOCK:
-   case VK_FORMAT_BC7_UNORM_BLOCK:
-   case VK_FORMAT_BC7_SRGB_BLOCK:
-      return 1;
-   default:
-      /* BC1 is treated as opaque (bcdec emits alpha=255). */
-      return 0;
-   }
-}
-
 #define WRAPPER_CACHE_DIR "/data/data/app.gamenative/files/imagefs/usr/cache"
 
 struct decompression_params {
@@ -223,15 +237,8 @@ struct decompression_params {
    int block_y_start;
    int stride;
    int texel_size;
-   int astc;
-   int astc8;
-   int bc_bx;      /* BC grid width in blocks (astc8 bounds) */
-   int bc_by;      /* BC grid height in blocks (astc8 bounds) */
-   int astc6;
-   int astc_by;    /* ASTC 6x6 grid height (astc6 bounds) */
    int w;
    int h;
-   int has_alpha;
    VkFormat format;
    char *src;
    char *dst;
@@ -253,9 +260,45 @@ get_block_size(VkFormat format)
     }
 }
 
-/* BC4/BC5 into an RGBA scratch with the channel layout the shaders expect
- * without a view swizzle: BC4 replicates its value over RGB (A=255), BC5 keeps
- * R/G from the block with B=0, A=255. */
+/* An RGB half texel as B10G11R11 (5-bit exponents, 6/6/5-bit mantissas,
+ * rounded to nearest). Negative values and NaN become 0. */
+static uint32_t
+bcn_half_to_b10g11r11(const uint16_t rgb[3])
+{
+   static const int mbits[3] = { 6, 6, 5 };
+   uint32_t out = 0, shift = 0;
+   for (int c = 0; c < 3; c++) {
+      uint32_t h = rgb[c];
+      uint32_t drop = 10 - mbits[c];
+      uint32_t maxv = (30u << mbits[c]) | ((1u << mbits[c]) - 1);
+      uint32_t v;
+      if ((h & 0x8000) || (h & 0x7fff) > 0x7c00)
+         v = 0;
+      else
+         v = MIN2(((h & 0x7fff) + (1u << (drop - 1))) >> drop, maxv);
+      out |= v << shift;
+      shift += mbits[c] + 5;
+   }
+   return out;
+}
+
+static const char *
+bcn_format_name(VkFormat format)
+{
+   switch (format) {
+   case VK_FORMAT_BC1_RGB_UNORM_BLOCK: case VK_FORMAT_BC1_RGB_SRGB_BLOCK:
+   case VK_FORMAT_BC1_RGBA_UNORM_BLOCK: case VK_FORMAT_BC1_RGBA_SRGB_BLOCK: return "bc1";
+   case VK_FORMAT_BC2_UNORM_BLOCK: case VK_FORMAT_BC2_SRGB_BLOCK: return "bc2";
+   case VK_FORMAT_BC3_UNORM_BLOCK: case VK_FORMAT_BC3_SRGB_BLOCK: return "bc3";
+   case VK_FORMAT_BC4_UNORM_BLOCK: case VK_FORMAT_BC4_SNORM_BLOCK: return "bc4";
+   case VK_FORMAT_BC5_UNORM_BLOCK: case VK_FORMAT_BC5_SNORM_BLOCK: return "bc5";
+   case VK_FORMAT_BC6H_UFLOAT_BLOCK: case VK_FORMAT_BC6H_SFLOAT_BLOCK: return "bc6h";
+   default: return "bc7";
+   }
+}
+
+/* BC4/BC5 into an RGBA scratch with the layout D3D and GL sample them with:
+ * BC4 as (r, 0, 0, 1), BC5 as (r, g, 0, 1). */
 static void
 bcn_decode_rg_rgba(VkFormat format, const char *src, unsigned char *dst, int stride)
 {
@@ -277,7 +320,8 @@ bcn_decode_rg_rgba(VkFormat format, const char *src, unsigned char *dst, int str
       for (int y = 0; y < 4; y++) {
          for (int x = 0; x < 4; x++) {
             unsigned char *p = dst + y * stride + x * 4;
-            p[0] = p[1] = p[2] = tmp[y * 4 + x];
+            p[0] = tmp[y * 4 + x];
+            p[1] = p[2] = 0;
             p[3] = 255;
          }
       }
@@ -292,110 +336,6 @@ decompression_routine(void *args)
    char *dst_base = params->dst;
    int block_size = get_block_size(params->format);
 
-   /* 6x6 ASTC (BC1 only): a 3x3 group of BC blocks (12x12 texels) covers 2x2
-    * ASTC blocks. BC blocks past the grid are clamped to the last one and texels
-    * past the mip edge replicate the edge texel. block_y_start/count are group
-    * rows. */
-   if (params->astc6) {
-      int gx_count = (params->block_x + 1) / 2;
-      for (int gy = params->block_y_start;
-           gy < params->block_y_start + params->block_y_count; gy++) {
-         for (int gx = 0; gx < gx_count; gx++) {
-            unsigned char scratch[12 * 48];
-            for (int dy = 0; dy < 3; dy++) {
-               int bcy = 3 * gy + dy;
-               if (bcy >= params->bc_by)
-                  bcy = params->bc_by - 1;
-               for (int dx = 0; dx < 3; dx++) {
-                  int bcx = 3 * gx + dx;
-                  if (bcx >= params->bc_bx)
-                     bcx = params->bc_bx - 1;
-                  char *sblk = params->src +
-                     ((size_t)bcy * params->block_x_src + bcx) * block_size;
-                  bcdec_bc1(sblk, scratch + (dy * 4) * 48 + (dx * 4) * 4, 48);
-               }
-            }
-            for (int sy = 0; sy < 2; sy++) {
-               int BY = 2 * gy + sy;
-               if (BY >= params->astc_by)
-                  continue;
-               for (int sx = 0; sx < 2; sx++) {
-                  int BX = 2 * gx + sx;
-                  if (BX >= params->block_x)
-                     continue;
-                  uint8_t texels[144];
-                  for (int y = 0; y < 6; y++) {
-                     int py = BY * 6 + y;
-                     if (py >= params->h)
-                        py = params->h - 1;
-                     py -= gy * 12;
-                     for (int x = 0; x < 6; x++) {
-                        int px = BX * 6 + x;
-                        if (px >= params->w)
-                           px = params->w - 1;
-                        px -= gx * 12;
-                        memcpy(texels + (y * 6 + x) * 4, scratch + py * 48 + px * 4, 4);
-                     }
-                  }
-                  unsigned char *blk = (unsigned char *)dst_base +
-                     ((size_t)BY * params->block_x + BX) * 16;
-                  astc_encode_block_6x6(texels, params->has_alpha, blk);
-               }
-            }
-         }
-      }
-      return NULL;
-   }
-
-   /* 8x8 ASTC: one block per 2x2 group of BC blocks. Decode the 4 BC blocks into
-    * an 8x8 RGBA scratch (row stride 32 bytes), then encode one ASTC 8x8 block. */
-   if (params->astc8) {
-      for (int by = 0; by < params->block_y_count; by++) {
-         int BY = params->block_y_start + by;
-         for (int BX = 0; BX < params->block_x; BX++) {
-            unsigned char scratch[256];
-            memset(scratch, 0, sizeof(scratch));
-            for (int dy = 0; dy < 2; dy++) {
-               for (int dx = 0; dx < 2; dx++) {
-                  int bcx = 2 * BX + dx, bcy = 2 * BY + dy;
-                  if (bcx >= params->bc_bx || bcy >= params->bc_by)
-                     continue;
-                  char *sblk = params->src +
-                     ((size_t)bcy * params->block_x_src + bcx) * block_size;
-                  unsigned char *dsub = scratch + (dy * 4) * 32 + (dx * 4) * 4;
-                  switch (params->format) {
-                  case VK_FORMAT_BC1_RGB_UNORM_BLOCK:
-                  case VK_FORMAT_BC1_RGB_SRGB_BLOCK:
-                  case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
-                  case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
-                     bcdec_bc1(sblk, dsub, 32); break;
-                  case VK_FORMAT_BC2_SRGB_BLOCK:
-                  case VK_FORMAT_BC2_UNORM_BLOCK:
-                     bcdec_bc2(sblk, dsub, 32); break;
-                  case VK_FORMAT_BC3_UNORM_BLOCK:
-                  case VK_FORMAT_BC3_SRGB_BLOCK:
-                     bcdec_bc3(sblk, dsub, 32); break;
-                  case VK_FORMAT_BC7_SRGB_BLOCK:
-                  case VK_FORMAT_BC7_UNORM_BLOCK:
-                     bcdec_bc7(sblk, dsub, 32); break;
-                  case VK_FORMAT_BC4_UNORM_BLOCK:
-                  case VK_FORMAT_BC5_UNORM_BLOCK:
-                     bcn_decode_rg_rgba(params->format, sblk, dsub, 32); break;
-                  default: break;
-                  }
-               }
-            }
-            unsigned char *blk = (unsigned char *)dst_base +
-               ((size_t)BY * params->block_x + BX) * 16;
-            if (params->format == VK_FORMAT_BC5_UNORM_BLOCK)
-               astc_encode_rg_8x8(scratch, blk);
-            else
-               astc_encode_block_8x8(scratch, params->has_alpha, blk);
-         }
-      }
-      return NULL;
-   }
-
    for (int by = 0; by < params->block_y_count; by++) {
       for (int bx = 0; bx < params->block_x; bx++) {
          int pixel_x = (bx * 4);
@@ -405,86 +345,75 @@ decompression_routine(void *args)
          char *src = params->src +
             ((size_t)by * params->block_x_src + bx) * block_size;
 
-         /* ASTC target: decode the BCn block into a 4x4 RGBA scratch, then
-          * re-encode it as one ASTC 4x4 block written to the block grid. */
-         if (params->astc) {
-            uint8_t scratch[64];
-            switch (params->format) {
-            case VK_FORMAT_BC1_RGB_UNORM_BLOCK:
-            case VK_FORMAT_BC1_RGB_SRGB_BLOCK:
-            case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
-            case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
-               bcdec_bc1(src, scratch, 16);
-               break;
-            case VK_FORMAT_BC2_SRGB_BLOCK:
-            case VK_FORMAT_BC2_UNORM_BLOCK:
-               bcdec_bc2(src, scratch, 16);
-               break;
-            case VK_FORMAT_BC3_UNORM_BLOCK:
-            case VK_FORMAT_BC3_SRGB_BLOCK:
-               bcdec_bc3(src, scratch, 16);
-               break;
-            case VK_FORMAT_BC7_SRGB_BLOCK:
-            case VK_FORMAT_BC7_UNORM_BLOCK:
-               bcdec_bc7(src, scratch, 16);
-               break;
-            case VK_FORMAT_BC4_UNORM_BLOCK:
-            case VK_FORMAT_BC5_UNORM_BLOCK:
-               bcn_decode_rg_rgba(params->format, src, scratch, 16);
-               break;
-            default:
-               break;
-            }
-            int block_index = (by + params->block_y_start) * params->block_x + bx;
-            uint8_t *blk = (uint8_t *)dst_base + (size_t)block_index * 16;
-            if (params->format == VK_FORMAT_BC5_UNORM_BLOCK)
-               astc_encode_rg_4x4(scratch, blk);
-            else
-               astc_encode_block_4x4(scratch, params->has_alpha, blk);
-            continue;
-         }
-
-         char *dst = dst_base + (pixel_y * params->stride) + (pixel_x * params->texel_size);
-         if (!dst || !src)
-            return NULL;
+         uint8_t scratch[128];
+         int pitch = params->texel_size * 4;
+         int is_signed = params->format == VK_FORMAT_BC4_SNORM_BLOCK ||
+                         params->format == VK_FORMAT_BC5_SNORM_BLOCK ||
+                         params->format == VK_FORMAT_BC6H_SFLOAT_BLOCK;
 
          switch (params->format) {
             case VK_FORMAT_BC1_RGB_UNORM_BLOCK:
             case VK_FORMAT_BC1_RGB_SRGB_BLOCK:
+               bcdec_bc1(src, scratch, pitch);
+               for (int i = 0; i < 16; i++)
+                  scratch[i * 4 + 3] = 255;
+               break;
             case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
             case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
-               bcdec_bc1(src, dst, params->stride);
+               bcdec_bc1(src, scratch, pitch);
                break;
             case VK_FORMAT_BC2_SRGB_BLOCK:
             case VK_FORMAT_BC2_UNORM_BLOCK:
-               bcdec_bc2(src, dst, params->stride);
+               bcdec_bc2(src, scratch, pitch);
                break;
             case VK_FORMAT_BC3_UNORM_BLOCK:
             case VK_FORMAT_BC3_SRGB_BLOCK:
-               bcdec_bc3(src, dst, params->stride);
+               bcdec_bc3(src, scratch, pitch);
                break;
             case VK_FORMAT_BC4_UNORM_BLOCK:
             case VK_FORMAT_BC4_SNORM_BLOCK:
-               bcdec_bc4(src, dst, params->stride, params->format == VK_FORMAT_BC4_SNORM_BLOCK);
+               bcdec_bc4(src, scratch, pitch, is_signed);
                break;
             case VK_FORMAT_BC5_SNORM_BLOCK:
             case VK_FORMAT_BC5_UNORM_BLOCK:
-               bcdec_bc5(src, dst, params->stride, params->format == VK_FORMAT_BC5_SNORM_BLOCK);
+               bcdec_bc5(src, scratch, pitch, is_signed);
                break;
             case VK_FORMAT_BC6H_SFLOAT_BLOCK:
-            case VK_FORMAT_BC6H_UFLOAT_BLOCK:
-               bcdec_bc6h_half(src, dst, (params->stride / params->texel_size) * 3, params->format == VK_FORMAT_BC6H_SFLOAT_BLOCK);
+            case VK_FORMAT_BC6H_UFLOAT_BLOCK: {
+               uint16_t rgb[48];
+               uint16_t *rgba = (uint16_t *)scratch;
+               bcdec_bc6h_half(src, rgb, 12, is_signed);
+               if (params->texel_size == 4) {
+                  for (int i = 0; i < 16; i++)
+                     ((uint32_t *)scratch)[i] = bcn_half_to_b10g11r11(rgb + i * 3);
+                  break;
+               }
+               for (int i = 0; i < 16; i++) {
+                  rgba[i * 4 + 0] = rgb[i * 3 + 0];
+                  rgba[i * 4 + 1] = rgb[i * 3 + 1];
+                  rgba[i * 4 + 2] = rgb[i * 3 + 2];
+                  rgba[i * 4 + 3] = 0x3c00;
+               }
                break;
+            }
             case VK_FORMAT_BC7_SRGB_BLOCK:
             case VK_FORMAT_BC7_UNORM_BLOCK:
-               bcdec_bc7(src, dst, params->stride);
+               bcdec_bc7(src, scratch, pitch);
                break;
             default:
+               memset(scratch, 0, sizeof(scratch));
                break;
          }
+
+         int cols = MIN2(4, params->w - pixel_x);
+         int rows = MIN2(4, params->h - pixel_y);
+         for (int y = 0; y < rows; y++)
+            memcpy(dst_base + (size_t)(pixel_y + y) * params->stride +
+                      (size_t)pixel_x * params->texel_size,
+                   scratch + y * pitch, (size_t)cols * params->texel_size);
       }
    }
-   
+
    return NULL;
 }
 
@@ -508,14 +437,17 @@ get_decode_format_for_bcn(VkFormat bcn_format)
          return VK_FORMAT_R8G8_SNORM;
       case VK_FORMAT_BC6H_SFLOAT_BLOCK:
       case VK_FORMAT_BC6H_UFLOAT_BLOCK:
-         return VK_FORMAT_R16G16B16_SFLOAT;
+         return VK_FORMAT_R16G16B16A16_SFLOAT;
       default:
          return VK_FORMAT_R8G8B8A8_UNORM;
    }
 }
 
-/* Storage (image) format. For BC1/2/3/4/5/7 this is ASTC 4x4 (kept compressed);
- * the SNORM BC4/5 variants and BC6H stay uncompressed (decoded). */
+/* Storage (image) format. The UNORM formats go to ASTC (BC4 as luminance,
+ * BC5 as luminance + alpha, put back in place by the image view swizzle),
+ * BC6H to ASTC 4x4 HDR where the device has it, else unsigned BC6H to
+ * B10G11R11 and signed BC6H to RGBA16F. ASTC has no signed formats, so the
+ * SNORM BC4/BC5 variants are decoded. */
 VkFormat
 get_format_for_bcn(VkFormat bcn_format)
 {
@@ -542,8 +474,10 @@ get_format_for_bcn(VkFormat bcn_format)
          idx = BCN_POL_BC5; break;
       case VK_FORMAT_BC6H_UFLOAT_BLOCK:
       case VK_FORMAT_BC6H_SFLOAT_BLOCK:
-         if (__atomic_load_n(&bcn_astc_hdr, __ATOMIC_RELAXED) && bcn_policy_bc6h_hdr())
+         if (__atomic_load_n(&bcn_astc_hdr, __ATOMIC_RELAXED))
             return VK_FORMAT_ASTC_4x4_SFLOAT_BLOCK;
+         if (bcn_format == VK_FORMAT_BC6H_UFLOAT_BLOCK)
+            return VK_FORMAT_B10G11R11_UFLOAT_PACK32;
          break;
       default:
          break;
@@ -561,6 +495,89 @@ get_format_for_bcn(VkFormat bcn_format)
    return get_decode_format_for_bcn(bcn_format);
 }
 
+static double
+bcn_stored_bits_per_texel(VkFormat img)
+{
+   if (is_astc_6x6(img))
+      return 128.0 / 36.0;
+   if (is_astc_8x8(img))
+      return 2.0;
+   if (is_astc_4x4(img) || is_astc_hdr_4x4(img))
+      return 8.0;
+   return get_texel_size_for_format(img) * 8.0;
+}
+
+static const char *
+bcn_stored_name(VkFormat img)
+{
+   if (is_astc_6x6(img)) return "astc6x6";
+   if (is_astc_8x8(img)) return "astc8x8";
+   if (is_astc_hdr_4x4(img)) return "astc4x4hdr";
+   if (is_astc_4x4(img)) return "astc4x4";
+   switch (img) {
+   case VK_FORMAT_R8_UNORM: return "r8";
+   case VK_FORMAT_R8_SNORM: return "r8snorm";
+   case VK_FORMAT_R8G8_UNORM: return "rg8";
+   case VK_FORMAT_R8G8_SNORM: return "rg8snorm";
+   case VK_FORMAT_R16G16B16A16_SFLOAT: return "rgba16f";
+   case VK_FORMAT_B10G11R11_UFLOAT_PACK32: return "b10g11r11";
+   default: return "rgba8";
+   }
+}
+
+/* Storage format and size relative to the BC data for each BC format. */
+void
+bcn_describe_storage(char *buf, size_t size)
+{
+   static const struct { VkFormat f; const char *name; } fmts[] = {
+      { VK_FORMAT_BC1_RGBA_UNORM_BLOCK, "bc1" }, { VK_FORMAT_BC2_UNORM_BLOCK, "bc2" },
+      { VK_FORMAT_BC3_UNORM_BLOCK, "bc3" },      { VK_FORMAT_BC4_UNORM_BLOCK, "bc4" },
+      { VK_FORMAT_BC4_SNORM_BLOCK, "bc4s" },     { VK_FORMAT_BC5_UNORM_BLOCK, "bc5" },
+      { VK_FORMAT_BC5_SNORM_BLOCK, "bc5s" },     { VK_FORMAT_BC6H_UFLOAT_BLOCK, "bc6h" },
+      { VK_FORMAT_BC6H_SFLOAT_BLOCK, "bc6hs" },  { VK_FORMAT_BC7_UNORM_BLOCK, "bc7" },
+   };
+   size_t n = snprintf(buf, size, "cpus=%ld", sysconf(_SC_NPROCESSORS_CONF));
+   for (unsigned i = 0; i < sizeof(fmts) / sizeof(fmts[0]) && n < size; i++) {
+      VkFormat img = get_format_for_bcn(fmts[i].f);
+      double bc = get_block_size(fmts[i].f) / 2.0;
+      n += snprintf(buf + n, size - n, " %s=%s(%.2fx)", fmts[i].name,
+                    bcn_stored_name(img), bcn_stored_bits_per_texel(img) / bc);
+   }
+}
+
+/* BC4 stored as ASTC luminance and BC5 as luminance + alpha sample as
+ * (L, L, L, 1) and (L, L, L, A); compose the view swizzle so they read as
+ * (r, 0, 0, 1) and (r, g, 0, 1) like the BC formats. */
+void
+bcn_view_swizzle(VkFormat bcn_format, VkComponentMapping *m)
+{
+   static const VkComponentSwizzle l[4] = {
+      VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_ZERO,
+      VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ONE,
+   };
+   static const VkComponentSwizzle la[4] = {
+      VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_A,
+      VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ONE,
+   };
+   const VkComponentSwizzle *map;
+   if (!is_astc(get_format_for_bcn(bcn_format)))
+      return;
+   if (bcn_format == VK_FORMAT_BC4_UNORM_BLOCK)
+      map = l;
+   else if (bcn_format == VK_FORMAT_BC5_UNORM_BLOCK)
+      map = la;
+   else
+      return;
+   VkComponentSwizzle *c[4] = { &m->r, &m->g, &m->b, &m->a };
+   for (int i = 0; i < 4; i++) {
+      VkComponentSwizzle s = *c[i] == VK_COMPONENT_SWIZZLE_IDENTITY ?
+         (VkComponentSwizzle)(VK_COMPONENT_SWIZZLE_R + i) : *c[i];
+      if (s >= VK_COMPONENT_SWIZZLE_R && s <= VK_COMPONENT_SWIZZLE_A)
+         s = map[s - VK_COMPONENT_SWIZZLE_R];
+      *c[i] = s;
+   }
+}
+
 /* Bytes needed to hold the transcoded upload for a w*h mip of this BCn format:
  * ASTC block bytes for ASTC targets, else linear decoded size. */
 size_t
@@ -573,16 +590,15 @@ bcn_upload_size(VkFormat bcn_format, int w, int h)
       return (size_t)((w + 7) / 8) * ((h + 7) / 8) * 16;
    if (is_astc_4x4(img) || is_astc_hdr_4x4(img))
       return (size_t)((w + 3) / 4) * ((h + 3) / 4) * 16;
-   return (size_t)w * h *
-      get_texel_size_for_format(get_decode_format_for_bcn(bcn_format));
+   return (size_t)w * h * get_texel_size_for_format(img);
 }
 
 int 
 get_texel_size_for_format(VkFormat format) 
 {
    switch (format) {
-      case VK_FORMAT_R16G16B16_SFLOAT:
-         return 6;
+      case VK_FORMAT_R16G16B16A16_SFLOAT:
+         return 8;
       case VK_FORMAT_R8G8_UNORM:
       case VK_FORMAT_R8G8_SNORM:
          return 2;
@@ -595,8 +611,20 @@ get_texel_size_for_format(VkFormat format)
 }
 
 int
+bcn_is_native(struct wrapper_physical_device *pdev, VkFormat format)
+{
+   if (pdev->emulate_bcn != 3 || format < VK_FORMAT_BC1_RGB_UNORM_BLOCK ||
+       format > VK_FORMAT_BC7_SRGB_BLOCK)
+      return 0;
+   return (pdev->native_bcn_mask >> (format - VK_FORMAT_BC1_RGB_UNORM_BLOCK)) & 1;
+}
+
+int
 is_emulated_bcn(struct wrapper_physical_device *pdev, VkFormat format)
 {
+   if (bcn_is_native(pdev, format))
+      return 0;
+
    switch(format) {
       case VK_FORMAT_BC1_RGB_UNORM_BLOCK:
       case VK_FORMAT_BC1_RGB_SRGB_BLOCK:
@@ -606,17 +634,6 @@ is_emulated_bcn(struct wrapper_physical_device *pdev, VkFormat format)
       case VK_FORMAT_BC2_UNORM_BLOCK:
       case VK_FORMAT_BC3_UNORM_BLOCK:
       case VK_FORMAT_BC3_SRGB_BLOCK:
-         if (pdev->emulate_bcn == 3 && 
-             pdev->driver_properties.driverID == VK_DRIVER_ID_SAMSUNG_PROPRIETARY)
-         {
-            return 0;
-         }
-         else if (pdev->emulate_bcn > 1) {
-            return 1;
-         } else {
-            return 0;
-         }
-         break;
       case VK_FORMAT_BC4_UNORM_BLOCK:
       case VK_FORMAT_BC4_SNORM_BLOCK:
       case VK_FORMAT_BC5_SNORM_BLOCK:
@@ -653,9 +670,11 @@ bcn_cache_src_tag(VkFormat format)
    switch (format) {
    case VK_FORMAT_BC1_RGB_UNORM_BLOCK:
    case VK_FORMAT_BC1_RGB_SRGB_BLOCK:
+      return "bc1";
    case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
    case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
-      return "bc1";
+      /* Do not reuse opaque BC1 entries written before alpha was preserved. */
+      return "bc1a";
    case VK_FORMAT_BC2_UNORM_BLOCK:
    case VK_FORMAT_BC2_SRGB_BLOCK:
       return "bc2";
@@ -705,8 +724,8 @@ bcn_cache_out_tag(VkFormat image_format)
       return "r8";
    case VK_FORMAT_R8_SNORM:
       return "r8s";
-   case VK_FORMAT_R16G16B16_SFLOAT:
-      return "rgb16f";
+   case VK_FORMAT_R16G16B16A16_SFLOAT:
+      return "rgba16f";
    default:
       return NULL;
    }
@@ -914,53 +933,230 @@ bcn_cache_source_exists(const char *entry_path)
    return exists;
 }
 
-/* BC6H -> ASTC 4x4 HDR fallback when no server entry exists: each block
- * becomes a void-extent block holding the mean of its in-bounds texels.
- * Khronos Data Format Spec, ASTC "Void-Extent Blocks" (2D):
- *   bits [8:0]     0x1FC  void-extent block mode
- *   bit  9         1      HDR, the colour is FP16 (0 = UNORM16)
- *   bits [11:10]   0b11   reserved
- *   bits [63:12]   all 1  min/max S and T (13 bits each), no extent
- *   bits [127:64]  R, G, B, A as 16-bit values, R lowest
- * ASTC HDR has no negative values, so SFLOAT texels clamp at 0. */
+/* BC texels as the ASTC encoder takes them: RGBA8 rows of w texels, with
+ * BC4 in red and BC5 in red and green, or RGBA half texels for BC6H. */
 static void
-bcn_encode_bc6h_void(const char *src, uint8_t *dst, int w, int h,
-                     int block_x, int block_y, int block_x_src, int is_signed)
+bcn_decode_for_astc(const char *src, int w, int h, int block_x_src, VkFormat format,
+                    uint8_t *out)
 {
-   static const uint8_t head[8] = { 0xFC, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
-   for (int by = 0; by < block_y; by++) {
-      for (int bx = 0; bx < block_x; bx++) {
-         unsigned short half[48];
-         bcdec_bc6h_half(src + ((size_t)by * block_x_src + bx) * 16, half, 12,
-                         is_signed);
-         float sum[3] = { 0, 0, 0 };
-         int n = 0;
-         for (int y = 0; y < 4 && by * 4 + y < h; y++) {
-            for (int x = 0; x < 4 && bx * 4 + x < w; x++) {
-               for (int c = 0; c < 3; c++) {
-                  _Float16 v;
-                  memcpy(&v, &half[(y * 4 + x) * 3 + c], 2);
-                  sum[c] += (float)v;
-               }
-               n++;
+   int block_size = get_block_size(format);
+   int hdr = format == VK_FORMAT_BC6H_UFLOAT_BLOCK || format == VK_FORMAT_BC6H_SFLOAT_BLOCK;
+   int texel = hdr ? 8 : 4;
+   for (int by = 0; by < (h + 3) / 4; by++) {
+      for (int bx = 0; bx < (w + 3) / 4; bx++) {
+         const char *blk = src + ((size_t)by * block_x_src + bx) * block_size;
+         uint8_t tile[128];
+         switch (format) {
+         case VK_FORMAT_BC1_RGB_UNORM_BLOCK:
+         case VK_FORMAT_BC1_RGB_SRGB_BLOCK:
+            bcdec_bc1(blk, tile, 16);
+            for (int i = 0; i < 16; i++)
+               tile[i * 4 + 3] = 255;
+            break;
+         case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
+         case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
+            bcdec_bc1(blk, tile, 16);
+            break;
+         case VK_FORMAT_BC2_UNORM_BLOCK:
+         case VK_FORMAT_BC2_SRGB_BLOCK:
+            bcdec_bc2(blk, tile, 16);
+            break;
+         case VK_FORMAT_BC3_UNORM_BLOCK:
+         case VK_FORMAT_BC3_SRGB_BLOCK:
+            bcdec_bc3(blk, tile, 16);
+            break;
+         case VK_FORMAT_BC4_UNORM_BLOCK:
+         case VK_FORMAT_BC5_UNORM_BLOCK:
+            bcn_decode_rg_rgba(format, blk, tile, 16);
+            break;
+         case VK_FORMAT_BC6H_UFLOAT_BLOCK:
+         case VK_FORMAT_BC6H_SFLOAT_BLOCK: {
+            uint16_t rgb[48];
+            uint16_t *rgba = (uint16_t *)tile;
+            bcdec_bc6h_half(blk, rgb, 12, format == VK_FORMAT_BC6H_SFLOAT_BLOCK);
+            for (int i = 0; i < 16; i++) {
+               for (int c = 0; c < 3; c++)
+                  rgba[i * 4 + c] = (rgb[i * 3 + c] & 0x8000) ? 0 : rgb[i * 3 + c];
+               rgba[i * 4 + 3] = 0x3c00;
             }
+            break;
          }
-         uint8_t *blk = dst + ((size_t)by * block_x + bx) * 16;
-         memcpy(blk, head, 8);
-         for (int c = 0; c < 4; c++) {
-            float f = c == 3 ? 1.0f : (n ? sum[c] / n : 0.0f);
-            if (!(f > 0.0f))
-               f = 0.0f;
-            if (f > 65504.0f)
-               f = 65504.0f;
-            _Float16 hv = (_Float16)f;
-            uint16_t bits;
-            memcpy(&bits, &hv, 2);
-            blk[8 + 2 * c] = bits & 0xFF;
-            blk[9 + 2 * c] = bits >> 8;
+         default:
+            bcdec_bc7(blk, tile, 16);
+            break;
          }
+         int cols = MIN2(4, w - bx * 4), rows = MIN2(4, h - by * 4);
+         for (int y = 0; y < rows; y++)
+            memcpy(out + ((size_t)(by * 4 + y) * w + bx * 4) * texel, tile + y * 4 * texel,
+                   (size_t)cols * texel);
       }
    }
+}
+
+static int
+bcn_astc_block_edge(VkFormat img)
+{
+   return is_astc_6x6(img) ? 6 : is_astc_8x8(img) ? 8 : 4;
+}
+
+static enum wrapper_astc_kind
+bcn_astc_kind(VkFormat format)
+{
+   switch (format) {
+   case VK_FORMAT_BC4_UNORM_BLOCK:
+      return WRAPPER_ASTC_L;
+   case VK_FORMAT_BC5_UNORM_BLOCK:
+      return WRAPPER_ASTC_LA;
+   case VK_FORMAT_BC6H_UFLOAT_BLOCK:
+   case VK_FORMAT_BC6H_SFLOAT_BLOCK:
+      return WRAPPER_ASTC_HDR_RGB;
+   default:
+      return WRAPPER_ASTC_RGBA;
+   }
+}
+
+/* Mean squared error per channel of a BC7 block against 16 RGBA8 texels. */
+float
+wrapper_bcn_bc7_mse(const uint8_t blk[16], const uint8_t rgba[64])
+{
+   uint8_t t[64];
+   bcdec_bc7(blk, t, 16);
+   float e = 0.0f;
+   for (int i = 0; i < 64; i++)
+      e += (float)(t[i] - rgba[i]) * (float)(t[i] - rgba[i]);
+   return e / 64.0f;
+}
+
+static void
+astc_bits(uint8_t *o, unsigned pos, unsigned n, uint32_t v)
+{
+   for (unsigned i = 0; i < n; i++)
+      if ((v >> i) & 1)
+         o[(pos + i) >> 3] |= (uint8_t)(1u << ((pos + i) & 7));
+}
+
+static int
+bcn_channel_constant(const uint8_t *v, int stride)
+{
+   for (int i = 1; i < 16; i++)
+      if (v[i * stride] != v[0])
+         return 0;
+   return 1;
+}
+
+/* An ASTC 4x4 block taken straight from the endpoints and indices of a BC2 or
+ * BC3 block with constant alpha (RGBA direct, 2-bit weights) or a BC5 block
+ * with one constant channel (luminance + alpha direct, 3-bit weights, or
+ * 4-bit for a six-value block without its 0 and 1 entries). Returns 0 when the
+ * block does not map, and for a constant block. */
+int
+wrapper_bcn_astc4_direct(VkFormat format, const uint8_t *blk, uint8_t out[16])
+{
+   uint8_t t[64];
+   uint32_t ev[8], wt[16], mode, cem, nv, wbits;
+   switch (format) {
+   case VK_FORMAT_BC2_UNORM_BLOCK:
+   case VK_FORMAT_BC2_SRGB_BLOCK:
+   case VK_FORMAT_BC3_UNORM_BLOCK:
+   case VK_FORMAT_BC3_SRGB_BLOCK: {
+      if (format == VK_FORMAT_BC2_UNORM_BLOCK || format == VK_FORMAT_BC2_SRGB_BLOCK)
+         bcdec_bc2(blk, t, 16);
+      else
+         bcdec_bc3(blk, t, 16);
+      if (!bcn_channel_constant(t + 3, 4) ||
+          (bcn_channel_constant(t, 4) && bcn_channel_constant(t + 1, 4) &&
+           bcn_channel_constant(t + 2, 4)))
+         return 0;
+      const uint8_t *c = blk + 8;
+      uint32_t col[2] = { c[0] | (uint32_t)c[1] << 8, c[2] | (uint32_t)c[3] << 8 };
+      uint32_t idx = c[4] | (uint32_t)c[5] << 8 | (uint32_t)c[6] << 16 | (uint32_t)c[7] << 24;
+      uint32_t e[2][3];
+      for (int k = 0; k < 2; k++) {
+         uint32_t r = (col[k] >> 11) & 31, g = (col[k] >> 5) & 63, b = col[k] & 31;
+         e[k][0] = (r << 3) | (r >> 2);
+         e[k][1] = (g << 2) | (g >> 4);
+         e[k][2] = (b << 3) | (b >> 2);
+      }
+      int swap = e[1][0] + e[1][1] + e[1][2] < e[0][0] + e[0][1] + e[0][2];
+      static const uint8_t q4[4] = { 0, 3, 1, 2 };
+      for (int i = 0; i < 16; i++) {
+         uint32_t q = q4[(idx >> (2 * i)) & 3];
+         wt[i] = swap ? 3 - q : q;
+      }
+      for (int ch = 0; ch < 3; ch++) {
+         ev[ch * 2] = e[swap][ch];
+         ev[ch * 2 + 1] = e[!swap][ch];
+      }
+      ev[6] = ev[7] = t[3];
+      mode = 0x042;
+      cem = 12;
+      nv = 8;
+      wbits = 2;
+      break;
+   }
+   case VK_FORMAT_BC5_UNORM_BLOCK: {
+      uint8_t r[16], g[16];
+      bcdec_bc4(blk, r, 4, 0);
+      bcdec_bc4(blk + 8, g, 4, 0);
+      int rc = bcn_channel_constant(r, 1), gc = bcn_channel_constant(g, 1);
+      if (rc == gc)
+         return 0;
+      const uint8_t *v = rc ? blk + 8 : blk;
+      uint32_t e0 = v[0], e1 = v[1];
+      uint64_t bits = 0;
+      for (int i = 0; i < 6; i++)
+         bits |= (uint64_t)v[2 + i] << (8 * i);
+      int eight = e0 > e1;
+      static const uint8_t q16[6] = { 0, 15, 3, 6, 9, 12 };
+      for (int i = 0; i < 16; i++) {
+         uint32_t k = (bits >> (3 * i)) & 7;
+         if (!eight && k >= 6)
+            return 0;
+         wt[i] = eight ? (k == 0 ? 0 : k == 1 ? 7 : k - 1) : q16[k];
+      }
+      ev[0] = rc ? r[0] : e0;
+      ev[1] = rc ? r[0] : e1;
+      ev[2] = gc ? g[0] : e0;
+      ev[3] = gc ? g[0] : e1;
+      mode = eight ? 0x053 : 0x242;
+      cem = 4;
+      nv = 4;
+      wbits = eight ? 3 : 4;
+      break;
+   }
+   default:
+      return 0;
+   }
+   memset(out, 0, 16);
+   astc_bits(out, 0, 11, mode);
+   astc_bits(out, 13, 4, cem);
+   for (uint32_t i = 0; i < nv; i++)
+      astc_bits(out, 17 + 8 * i, 8, ev[i]);
+   for (uint32_t i = 0; i < 16; i++)
+      for (uint32_t b = 0; b < wbits; b++)
+         if ((wt[i] >> b) & 1)
+            astc_bits(out, 127 - (i * wbits + b), 1, 1);
+   return 1;
+}
+
+/* astcenc encode of tightly packed BC blocks (w x h texels) to the image's
+ * ASTC format, on the given number of threads and at the given quality. */
+int
+wrapper_bcn_astc_encode_cpu(const void *blocks, int w, int h, VkFormat format, uint8_t *out,
+                            size_t len, unsigned threads, float quality)
+{
+   VkFormat img = get_format_for_bcn(format);
+   int hdr = bcn_astc_kind(format) == WRAPPER_ASTC_HDR_RGB;
+   uint8_t *texels = malloc((size_t)w * h * (hdr ? 8 : 4));
+   if (!texels)
+      return -1;
+   bcn_decode_for_astc(blocks, w, h, (w + 3) / 4, format, texels);
+   int srgb = get_decode_format_for_bcn(format) == VK_FORMAT_R8G8B8A8_SRGB;
+   int r = wrapper_astcenc_compress_threads(texels, w, h, is_astc_hdr_4x4(img) ? 4 :
+                                            bcn_astc_block_edge(img), bcn_astc_kind(format),
+                                            srgb, out, len, threads, quality);
+   free(texels);
+   return r;
 }
 
 void
@@ -989,32 +1185,20 @@ decompress_bcn_format(void *srcBuffer,
    if (wrapper_cache_path == NULL)
       wrapper_cache_path = getenv("WRAPPER_CACHE_PATH") ? getenv("WRAPPER_CACHE_PATH") : WRAPPER_CACHE_DIR;
 
-   int astc = is_astc_4x4(get_format_for_bcn(format));
-   int astc8 = is_astc_8x8(get_format_for_bcn(format));
-   int astc6 = is_astc_6x6(get_format_for_bcn(format));
-   int hdr = is_astc_hdr_4x4(get_format_for_bcn(format));
-   int has_alpha = bcn_has_alpha(format);
-   int texel_size = get_texel_size_for_format(get_decode_format_for_bcn(format));
+   VkFormat img = get_format_for_bcn(format);
+   int astc = is_astc(img) || is_astc_hdr_4x4(img);
+   int texel_size = get_texel_size_for_format(img);
    int block_size = get_block_size(format);
    int block_x = (w + 3) / 4;
    /* source row stride in blocks (bufferRowLength may pad rows wider than w) */
    int block_x_src = ((src_w > 0 ? src_w : w) + 3) / 4;
    int block_y = (h + 3) / 4;
-   int block_x8 = (w + 7) / 8;
-   int block_y8 = (h + 7) / 8;
-   int block_x6 = (w + 5) / 6;
-   int block_y6 = (h + 5) / 6;
    int stride = w * texel_size;
-   int uncompressed_size = astc8 ? (block_x8 * block_y8 * 16)
-                                 : (astc ? (block_x * block_y * 16) : (w * h * texel_size));
-   if (astc6)
-      uncompressed_size = block_x6 * block_y6 * 16;
-   if (hdr)
-      uncompressed_size = block_x * block_y * 16;
+   int uncompressed_size = (int)bcn_upload_size(format, w, h);
    char *src = srcBuffer + offset;
    char *dst = dstBuffer;
 
-   if (wrapper_mark_bcn && !astc && !astc6 && !hdr) {
+   if (wrapper_mark_bcn && !astc) {
       WRAPPER_LOG(bcn, "Filling %dx%d BCn %d texture with custom color", w, h, format);
 
       for (int i = 0; i < h; i++) {
@@ -1087,6 +1271,11 @@ decompress_bcn_format(void *srcBuffer,
     * compressed source. Skips decode+encode on subsequent loads. Only touched
     * when explicitly enabled, so there is zero overhead by default. */
    char *cache_filename = NULL;
+   if (wrapper_use_bcn_cache && astc &&
+       wrapper_bcn_cache_load(format, img, w, h, (const uint8_t *)src,
+                              (size_t)block_x * block_size, (size_t)block_x_src * block_size,
+                              block_y, dst, uncompressed_size))
+      return;
    if (wrapper_use_bcn_cache) {
       CREATE_FOLDER(wrapper_cache_path, 0700);
       cache_filename = bcn_cache_filename(wrapper_cache_path, format,
@@ -1106,74 +1295,27 @@ decompress_bcn_format(void *srcBuffer,
    }
 
 
-   if (hdr) {
-      bcn_encode_bc6h_void(src, (uint8_t *)dst, w, h, block_x, block_y,
-                           block_x_src, format == VK_FORMAT_BC6H_SFLOAT_BLOCK);
-   } else if (astc6) {
-      /* 6x6 ASTC: threaded over rows of 12x12-texel groups (2 ASTC block rows). */
-      int group_y = (block_y6 + 1) / 2;
-      int core_count = sysconf(_SC_NPROCESSORS_CONF);
-      int num_threads = (group_y >= core_count) ? core_count : (group_y >= 4 ? 4 : 1);
-      int rows_per = group_y / num_threads, rem = group_y % num_threads;
-      int bc1_alpha = format == VK_FORMAT_BC1_RGBA_UNORM_BLOCK ||
-                      format == VK_FORMAT_BC1_RGBA_SRGB_BLOCK;
-      pthread_t *threads = malloc(sizeof(pthread_t) * num_threads);
-      struct decompression_params *args = calloc(num_threads, sizeof(struct decompression_params));
-      int cur = 0;
-      for (int i = 0; i < num_threads; i++) {
-         int rows = rows_per + ((i < rem) ? 1 : 0);
-         args[i].src = src;
-         args[i].dst = dst;
-         args[i].block_x = block_x6;
-         args[i].block_x_src = block_x_src;
-         args[i].format = format;
-         args[i].block_y_count = rows;
-         args[i].block_y_start = cur;
-         args[i].astc_by = block_y6;
-         args[i].bc_bx = block_x;
-         args[i].bc_by = block_y;
-         args[i].w = w;
-         args[i].h = h;
-         args[i].astc6 = 1;
-         args[i].has_alpha = bc1_alpha;
-         pthread_create(&threads[i], NULL, decompression_routine, &args[i]);
-         cur += rows;
+   if (astc) {
+      int hdr_in = bcn_astc_kind(format) == WRAPPER_ASTC_HDR_RGB;
+      uint8_t *texels = malloc((size_t)w * h * (hdr_in ? 8 : 4));
+      if (texels) {
+         struct timespec t0, t1, t2;
+         clock_gettime(CLOCK_MONOTONIC, &t0);
+         bcn_decode_for_astc(src, w, h, block_x_src, format, texels);
+         clock_gettime(CLOCK_MONOTONIC, &t1);
+         int block = bcn_astc_block_edge(img);
+         int srgb = get_decode_format_for_bcn(format) == VK_FORMAT_R8G8B8A8_SRGB;
+         if (wrapper_astcenc_compress(texels, w, h, block, bcn_astc_kind(format), srgb,
+                                      (uint8_t *)dst, uncompressed_size))
+            WRAPPER_LOG(error, "BCn: ASTC encode of a %dx%d %d texture failed", w, h, format);
+         clock_gettime(CLOCK_MONOTONIC, &t2);
+         if (w * h >= 1024 * 1024)
+            wrapper_diag_append("[BCN] cpu %s %dx%d -> astc %dx%d: decode %.1f ms, encode %.1f ms\n",
+                                bcn_format_name(format), w, h, block, block,
+                                (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6,
+                                (t2.tv_sec - t1.tv_sec) * 1e3 + (t2.tv_nsec - t1.tv_nsec) / 1e6);
+         free(texels);
       }
-      for (int i = 0; i < num_threads; i++) pthread_join(threads[i], NULL);
-      free(threads);
-      free(args);
-   } else if (astc8) {
-      /* 8x8 ASTC: each block covers a 2x2 group of BC blocks (8 = 2*4, aligned).
-       * Decode the 4 BC blocks into an 8x8 RGBA scratch, then encode one ASTC
-       * 8x8 block. Threaded over 8x8-block rows. */
-      int core_count = sysconf(_SC_NPROCESSORS_CONF);
-      int num_threads = (block_y8 >= core_count) ? core_count : (block_y8 >= 4 ? 4 : 1);
-      int rows_per = block_y8 / num_threads, rem = block_y8 % num_threads;
-      pthread_t *threads = malloc(sizeof(pthread_t) * num_threads);
-      struct decompression_params *args = malloc(sizeof(struct decompression_params) * num_threads);
-      int cur = 0;
-      for (int i = 0; i < num_threads; i++) {
-         int rows = rows_per + ((i < rem) ? 1 : 0);
-         args[i].src = src;                 /* full src; absolute BC addressing */
-         args[i].dst = dst;
-         args[i].block_x = block_x8;         /* ASTC 8x8 grid width */
-         args[i].block_x_src = block_x_src;  /* BC source row stride (blocks) */
-         args[i].format = format;
-         args[i].block_y_count = rows;
-         args[i].block_y_start = cur;
-         args[i].texel_size = block_size;    /* BC block bytes */
-         args[i].bc_bx = block_x;
-         args[i].bc_by = block_y;
-         args[i].astc = 0;
-         args[i].astc8 = 1;
-         args[i].astc6 = 0;
-         args[i].has_alpha = has_alpha;
-         pthread_create(&threads[i], NULL, decompression_routine, &args[i]);
-         cur += rows;
-      }
-      for (int i = 0; i < num_threads; i++) pthread_join(threads[i], NULL);
-      free(threads);
-      free(args);
    } else if (wrapper_no_bcn_thread) {
       WRAPPER_LOG(bcn, "Decompressing %dx%d BCN %d texture from main thread",
          w, h, format);
@@ -1188,10 +1330,8 @@ decompress_bcn_format(void *srcBuffer,
       args[0].block_y_start = 0;
       args[0].stride = stride;
       args[0].texel_size = texel_size;
-      args[0].astc = astc;
-      args[0].astc8 = 0;
-      args[0].astc6 = 0;
-      args[0].has_alpha = has_alpha;
+      args[0].w = w;
+      args[0].h = h;
       decompression_routine(&args[0]);
    } else {
       int core_count = sysconf(_SC_NPROCESSORS_CONF);
@@ -1224,10 +1364,8 @@ decompress_bcn_format(void *srcBuffer,
          args[i].block_y_start = current_row;
          args[i].stride = stride;
          args[i].texel_size = texel_size;
-         args[i].astc = astc;
-         args[i].astc8 = 0;
-         args[i].astc6 = 0;
-         args[i].has_alpha = has_alpha;
+         args[i].w = w;
+         args[i].h = h;
          pthread_create(&threads[i], NULL, decompression_routine, &args[i]);
          current_row += rows;
       }
@@ -1370,45 +1508,6 @@ bcn_cache_note_source(void *srcBuffer, int w, int h, int src_w,
    if (name && !bcn_cache_source_exists(name))
       bcn_cache_write_source(name, src, block_x, block_y, block_x_src, block_size);
    free(name);
-}
-
-/* Cache step of the GPU transcode path, keyed exactly as decompress_bcn_format.
- * Hit: returns the entry (bcn_upload_size bytes, caller frees). Miss: leaves the
- * .src sidecar and returns NULL; the GPU result is never read back. */
-void *
-bcn_cache_gpu_lookup(void *srcBuffer, int w, int h, int src_w, VkFormat format,
-                     int offset, size_t *size)
-{
-   if (!bcn_cache_enabled())
-      return NULL;
-   const char *dir = getenv("WRAPPER_CACHE_PATH") ? getenv("WRAPPER_CACHE_PATH")
-                                                   : WRAPPER_CACHE_DIR;
-   char *src = (char *)srcBuffer + offset;
-   int block_size = get_block_size(format);
-   int block_x = (w + 3) / 4;
-   int block_y = (h + 3) / 4;
-   int block_x_src = ((src_w > 0 ? src_w : w) + 3) / 4;
-   CREATE_FOLDER(dir, 0700);
-   char *name = bcn_cache_filename(dir, format, get_format_for_bcn(format), w, h,
-                                   src, block_x, block_y, block_x_src, block_size);
-   if (!name)
-      return NULL;
-   size_t sz = bcn_upload_size(format, w, h);
-   void *dst = malloc(sz);
-   int raw = 0;
-   if (dst && bcn_cache_read(name, dst, sz, &raw)) {
-      WRAPPER_LOG(bcn, "Restored texture %s from cache", name);
-      if (raw && w >= 8 && h >= 8 && !bcn_cache_source_exists(name))
-         bcn_cache_write_source(name, src, block_x, block_y, block_x_src, block_size);
-      free(name);
-      *size = sz;
-      return dst;
-   }
-   free(dst);
-   if (w >= 8 && h >= 8 && !bcn_cache_source_exists(name))
-      bcn_cache_write_source(name, src, block_x, block_y, block_x_src, block_size);
-   free(name);
-   return NULL;
 }
 
 /* SPIR-V scan, independent of the Mali passes: a shader that takes the size or

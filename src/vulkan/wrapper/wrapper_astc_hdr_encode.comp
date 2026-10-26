@@ -1,0 +1,746 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+#extension GL_EXT_control_flow_attributes : require
+/*
+ * ASTC 4x4 HDR encode, one invocation per block, from RGBA16F texels (BC6H
+ * UF16 decoded; alpha is ignored and decodes as 1.0). Endpoint mode 11 (HDR
+ * RGB, direct), one partition. Texels are fitted in the decoder's 16-bit LNS
+ * space, where it interpolates: a line fit, the weights, a least squares
+ * refit of the endpoints, then the endpoints are quantized the way astcenc
+ * does (quantize_hdr_rgb), unpacked again, and the weights fitted to them.
+ * Each of three block modes (weights of 8, 12 or 16 levels, endpoints of 256
+ * or 192) is tried and the smallest error kept. Constant blocks become HDR
+ * void-extent blocks.
+ */
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+const float FLOOR_STOPS = 10.0;
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Words { uint w[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer OutWords { uint w[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Tables { uint t[]; };
+layout(push_constant) uniform PC {
+   uvec2 src;
+   uvec2 dst;
+   uint src_row_pitch;
+   uint src_slice_pitch;
+   uint dst_row_pitch;
+   uint dst_slice_pitch;
+   uint blocks_x;
+   uint blocks_y;
+   uint block;
+   uint kind;
+   uint width;
+   uint height;
+   uvec2 tables;
+} pc;
+const uint astc_qr[21] = uint[](65538u, 16777219u, 131076u, 268435461u, 16842758u, 196616u, 268501002u, 16908300u, 262160u, 268566548u, 16973848u, 327712u, 268632104u, 17039408u, 393280u, 268697680u, 17104992u, 458880u, 268763296u, 17170624u, 524544u);
+
+/* tables in the buffer at pc.tables (wrapper_astc_tables.h) */
+#define OFF_TRIT_ENC 0u
+#define OFF_QUINT_ENC 61u
+#define OFF_WUNQ 93u
+#define OFF_WQUANT 189u
+#define OFF_CUNQ 393u
+#define OFF_CQUANT 1481u
+
+Tables tb;
+
+#define BYTE(off, i) ((tb.t[(off) + ((i) >> 2)] >> (((i) & 3u) * 8u)) & 255u)
+
+uint qr_bits(uint q) { return (astc_qr[q] >> 16) & 255u; }
+bool qr_trits(uint q) { return ((astc_qr[q] >> 24) & 15u) != 0u; }
+bool qr_quints(uint q) { return (astc_qr[q] >> 28) != 0u; }
+
+uint ib[4];
+uint ipos;
+uint ise_vals[16];
+
+void ibits(uint n, uint v)
+{
+   if (n == 0u)
+      return;
+   uint word = ipos >> 5, off = ipos & 31u;
+   ib[word] |= (v & ((1u << n) - 1u)) << off;
+   if (off + n > 32u)
+      ib[word + 1u] |= (v & ((1u << n) - 1u)) >> (32u - off);
+   ipos += n;
+}
+
+void ise_encode(uint count, uint q)
+{
+   ib[0] = 0u; ib[1] = 0u; ib[2] = 0u; ib[3] = 0u;
+   ipos = 0u;
+   uint b = qr_bits(q);
+   if (qr_trits(q)) {
+      const uint tbits[5] = uint[](2u, 2u, 1u, 2u, 1u);
+      [[dont_unroll]] for (uint g = 0u; g < count; g += 5u) {
+         uint t[5] = uint[](0u, 0u, 0u, 0u, 0u), m[5] = uint[](0u, 0u, 0u, 0u, 0u);
+         [[dont_unroll]] for (uint j = 0u; j < 5u && g + j < count; j++) {
+            t[j] = ise_vals[g + j] >> b;
+            m[j] = ise_vals[g + j] & ((1u << b) - 1u);
+         }
+         uint T = BYTE(OFF_TRIT_ENC, t[0] + 3u * t[1] + 9u * t[2] + 27u * t[3] + 81u * t[4]);
+         uint ts = 0u;
+         for (uint j = 0u; j < 5u; j++) {
+            if (g + j >= count)
+               break;
+            ibits(b, m[j]);
+            ibits(tbits[j], T >> ts);
+            ts += tbits[j];
+         }
+      }
+   } else if (qr_quints(q)) {
+      const uint qbits[3] = uint[](3u, 2u, 2u);
+      [[dont_unroll]] for (uint g = 0u; g < count; g += 3u) {
+         uint qv[3] = uint[](0u, 0u, 0u), m[3] = uint[](0u, 0u, 0u);
+         [[dont_unroll]] for (uint j = 0u; j < 3u && g + j < count; j++) {
+            qv[j] = ise_vals[g + j] >> b;
+            m[j] = ise_vals[g + j] & ((1u << b) - 1u);
+         }
+         uint Q = BYTE(OFF_QUINT_ENC, qv[0] + 5u * qv[1] + 25u * qv[2]);
+         uint qs = 0u;
+         for (uint j = 0u; j < 3u; j++) {
+            if (g + j >= count)
+               break;
+            ibits(b, m[j]);
+            ibits(qbits[j], Q >> qs);
+            qs += qbits[j];
+         }
+      }
+   } else {
+      [[dont_unroll]] for (uint j = 0u; j < count; j++)
+         ibits(b, ise_vals[j]);
+   }
+}
+
+uint wunq(uint q, uint v) { return BYTE(OFF_WUNQ, q * 32u + v); }
+uint wquant(uint q, uint t) { return BYTE(OFF_WQUANT, q * 68u + t); }
+uint cunq(uint q, uint v) { return BYTE(OFF_CUNQ, (q - 4u) * 256u + v); }
+uint cquant(uint q, uint x) { return BYTE(OFF_CQUANT, (q - 4u) * 256u + x); }
+uint qcol(uint q, int x) { return cunq(q, cquant(q, uint(clamp(x, 0, 255)))); }
+
+uint keep_top(uint q, int v, uint mask)
+{
+   [[dont_unroll]] for (int i = 0; i < 256; i++) {
+      uint u = qcol(q, v);
+      if ((u & mask) == (uint(v) & mask) || v <= 0)
+         return u;
+      v--;
+   }
+   return qcol(q, v);
+}
+
+int rtn(float x) { return int(floor(x + 0.5)); }
+
+float to_lns(float a)
+{
+   if (!(a > 1.0 / 67108864.0))
+      return 0.0;
+   if (a >= 65536.0)
+      return 65535.0;
+   int e;
+   float m = frexp(a, e);
+   float v;
+   if (e - 1 < -13) {
+      v = a * 33554432.0;
+      e = 0;
+   } else {
+      v = (m - 0.5) * 4096.0;
+      e = e - 1 + 15;
+   }
+   if (v < 384.0)
+      v = v * (4.0 / 3.0);
+   else if (v <= 1408.0)
+      v = v + 128.0;
+   else
+      v = (v + 512.0) * 0.8;
+   return v + float(e) * 2048.0 + 1.0;
+}
+
+vec3 tex[16];   /* texels the endpoints are fitted to */
+vec3 orig[16];  /* texels in LNS */
+
+/* quantize_hdr_rgb: six colour values (unquantized bytes) for two endpoints */
+uint cv[6];
+
+void quantize_hdr_rgb(vec3 c0, vec3 c1, uint q)
+{
+   c0 = clamp(c0, 0.0, 65535.0);
+   c1 = clamp(c1, 0.0, 65535.0);
+   vec3 b0 = c0, b1 = c1;
+   uint majcomp = c1.r > c1.g && c1.r > c1.b ? 0u : c1.g > c1.b ? 1u : 2u;
+   if (majcomp == 1u) {
+      c0 = c0.grb; c1 = c1.grb;
+   } else if (majcomp == 2u) {
+      c0 = c0.bgr; c1 = c1.bgr;
+   }
+   float a_base = c1.r;
+   float b0_base = a_base - c1.g, b1_base = a_base - c1.b;
+   float c_base = a_base - c0.r;
+   float d0_base = a_base - b0_base - c_base - c0.g;
+   float d1_base = a_base - b1_base - c_base - c0.b;
+   const int mbits[32] = int[](9, 7, 6, 7, 9, 8, 6, 6, 10, 6, 7, 7, 10, 7, 7, 6,
+                               11, 8, 6, 5, 11, 6, 8, 6, 12, 7, 7, 5, 12, 6, 7, 6);
+   const float cut[32] = float[](16384.0, 8192.0, 8192.0, 8.0, 32768.0, 8192.0, 4096.0, 8.0,
+                                 4096.0, 8192.0, 4096.0, 4.0, 8192.0, 8192.0, 2048.0, 4.0,
+                                 8192.0, 2048.0, 512.0, 2.0, 2048.0, 8192.0, 1024.0, 2.0,
+                                 2048.0, 2048.0, 256.0, 1.0, 1024.0, 2048.0, 512.0, 1.0);
+   [[dont_unroll]] for (int mode = 7; mode >= 0; mode--) {
+      if (b0_base > cut[mode * 4] || b1_base > cut[mode * 4] || c_base > cut[mode * 4 + 1] ||
+          abs(d0_base) > cut[mode * 4 + 2] || abs(d1_base) > cut[mode * 4 + 2])
+         continue;
+      float scale = 1.0 / float(128 >> (mode >> 1));
+      float rscale = float(128 >> (mode >> 1));
+      int b_icut = 1 << mbits[mode * 4 + 1];
+      int c_icut = 1 << mbits[mode * 4 + 2];
+      int d_icut = 1 << (mbits[mode * 4 + 3] - 1);
+
+      int a_int = rtn(a_base * scale);
+      uint a_q = qcol(q, a_int & 0xff);
+      a_int = (a_int & ~0xff) | int(a_q);
+      float a_f = float(a_int) * rscale;
+
+      float c_f = clamp(a_f - c0.r, 0.0, 65535.0);
+      int c_int = rtn(c_f * scale);
+      if (c_int >= c_icut)
+         continue;
+      int c_low = (c_int & 0x3f) | ((mode & 1) << 7) | ((a_int & 0x100) >> 2);
+      uint c_q = keep_top(q, c_low, 0xc0u);
+      c_int = (c_int & ~0x3f) | int(c_q & 0x3fu);
+      c_f = float(c_int) * rscale;
+
+      float b0_f = clamp(a_f - c1.g, 0.0, 65535.0), b1_f = clamp(a_f - c1.b, 0.0, 65535.0);
+      int b0_int = rtn(b0_f * scale), b1_int = rtn(b1_f * scale);
+      if (b0_int >= b_icut || b1_int >= b_icut)
+         continue;
+      int b0_low = b0_int & 0x3f, b1_low = b1_int & 0x3f;
+      int bit0 = 0, bit1 = 0;
+      if (mode == 0 || mode == 1 || mode == 3 || mode == 4 || mode == 6)
+         bit0 = (b0_int >> 6) & 1;
+      else
+         bit0 = (a_int >> 9) & 1;
+      if (mode == 0 || mode == 1 || mode == 3 || mode == 4 || mode == 6)
+         bit1 = (b1_int >> 6) & 1;
+      else if (mode == 2)
+         bit1 = (c_int >> 6) & 1;
+      else
+         bit1 = (a_int >> 10) & 1;
+      b0_low |= (bit0 << 6) | (((mode >> 1) & 1) << 7);
+      b1_low |= (bit1 << 6) | (((mode >> 2) & 1) << 7);
+      uint b0_q = keep_top(q, b0_low, 0xc0u), b1_q = keep_top(q, b1_low, 0xc0u);
+      b0_int = (b0_int & ~0x3f) | int(b0_q & 0x3fu);
+      b1_int = (b1_int & ~0x3f) | int(b1_q & 0x3fu);
+      b0_f = float(b0_int) * rscale;
+      b1_f = float(b1_int) * rscale;
+
+      float d0_f = clamp(a_f - b0_f - c_f - c0.g, -65535.0, 65535.0);
+      float d1_f = clamp(a_f - b1_f - c_f - c0.b, -65535.0, 65535.0);
+      int d0_int = rtn(d0_f * scale), d1_int = rtn(d1_f * scale);
+      if (abs(d0_int) >= d_icut || abs(d1_int) >= d_icut)
+         continue;
+      int d0_low = d0_int & 0x1f, d1_low = d1_int & 0x1f;
+      int bit2 = 0, bit3 = 0, bit4, bit5;
+      if (mode == 0 || mode == 2)
+         bit2 = (d0_int >> 6) & 1;
+      else if (mode == 1 || mode == 4)
+         bit2 = (b0_int >> 7) & 1;
+      else if (mode == 3)
+         bit2 = (a_int >> 9) & 1;
+      else if (mode == 5)
+         bit2 = (c_int >> 7) & 1;
+      else
+         bit2 = (a_int >> 11) & 1;
+      if (mode == 0 || mode == 2)
+         bit3 = (d1_int >> 6) & 1;
+      else if (mode == 1 || mode == 4)
+         bit3 = (b1_int >> 7) & 1;
+      else
+         bit3 = (c_int >> 6) & 1;
+      if (mode == 4 || mode == 6) {
+         bit4 = (a_int >> 9) & 1;
+         bit5 = (a_int >> 10) & 1;
+      } else {
+         bit4 = (d0_int >> 5) & 1;
+         bit5 = (d1_int >> 5) & 1;
+      }
+      d0_low |= (bit2 << 6) | (bit4 << 5) | (int(majcomp & 1u) << 7);
+      d1_low |= (bit3 << 6) | (bit5 << 5) | (int(majcomp >> 1) << 7);
+      cv[0] = a_q;
+      cv[1] = c_q;
+      cv[2] = b0_q;
+      cv[3] = b1_q;
+      cv[4] = keep_top(q, d0_low, 0xf0u);
+      cv[5] = keep_top(q, d1_low, 0xf0u);
+      return;
+   }
+   cv[0] = qcol(q, rtn(clamp(b0.r, 0.0, 65020.0) / 256.0));
+   cv[1] = qcol(q, rtn(clamp(b1.r, 0.0, 65020.0) / 256.0));
+   cv[2] = qcol(q, rtn(clamp(b0.g, 0.0, 65020.0) / 256.0));
+   cv[3] = qcol(q, rtn(clamp(b1.g, 0.0, 65020.0) / 256.0));
+   cv[4] = keep_top(q, rtn(clamp(b0.b, 0.0, 65020.0) / 512.0) + 128, 0xc0u);
+   cv[5] = keep_top(q, rtn(clamp(b1.b, 0.0, 65020.0) / 512.0) + 128, 0xc0u);
+}
+
+/* hdr_rgb_unpack: the decoder's endpoints, 16-bit LNS */
+void unpack_hdr_rgb(out vec3 e0, out vec3 e1)
+{
+   int v0 = int(cv[0]), v1 = int(cv[1]), v2 = int(cv[2]), v3 = int(cv[3]), v4 = int(cv[4]), v5 = int(cv[5]);
+   int modeval = ((v1 & 0x80) >> 7) | (((v2 & 0x80) >> 7) << 1) | (((v3 & 0x80) >> 7) << 2);
+   int majcomp = ((v4 & 0x80) >> 7) | (((v5 & 0x80) >> 7) << 1);
+   if (majcomp == 3) {
+      e0 = vec3(float(v0 << 8), float(v2 << 8), float((v4 & 0x7f) << 9));
+      e1 = vec3(float(v1 << 8), float(v3 << 8), float((v5 & 0x7f) << 9));
+      return;
+   }
+   int a = v0 | ((v1 & 0x40) << 2);
+   int b0 = v2 & 0x3f, b1 = v3 & 0x3f, c = v1 & 0x3f, d0 = v4 & 0x7f, d1 = v5 & 0x7f;
+   const int dbits_tab[8] = int[](7, 6, 7, 6, 5, 6, 5, 6);
+   int dbits = dbits_tab[modeval];
+   int bit0 = (v2 >> 6) & 1, bit1 = (v3 >> 6) & 1, bit2 = (v4 >> 6) & 1;
+   int bit3 = (v5 >> 6) & 1, bit4 = (v4 >> 5) & 1, bit5 = (v5 >> 5) & 1;
+   int oh = 1 << modeval;
+   if ((oh & 0xa4) != 0) a |= bit0 << 9;
+   if ((oh & 0x8) != 0) a |= bit2 << 9;
+   if ((oh & 0x50) != 0) a |= bit4 << 9;
+   if ((oh & 0x50) != 0) a |= bit5 << 10;
+   if ((oh & 0xa0) != 0) a |= bit1 << 10;
+   if ((oh & 0xc0) != 0) a |= bit2 << 11;
+   if ((oh & 0x4) != 0) c |= bit1 << 6;
+   if ((oh & 0xe8) != 0) c |= bit3 << 6;
+   if ((oh & 0x20) != 0) c |= bit2 << 7;
+   if ((oh & 0x5b) != 0) { b0 |= bit0 << 6; b1 |= bit1 << 6; }
+   if ((oh & 0x12) != 0) { b0 |= bit2 << 7; b1 |= bit3 << 7; }
+   if ((oh & 0xaf) != 0) { d0 |= bit4 << 5; d1 |= bit5 << 5; }
+   if ((oh & 0x5) != 0) { d0 |= bit2 << 6; d1 |= bit3 << 6; }
+   int sx = 32 - dbits;
+   d0 = (d0 << sx) >> sx;
+   d1 = (d1 << sx) >> sx;
+   int sh = (modeval >> 1) ^ 3;
+   a <<= sh; b0 <<= sh; b1 <<= sh; c <<= sh; d0 <<= sh; d1 <<= sh;
+   ivec3 i1 = clamp(ivec3(a, a - b0, a - b1), 0, 4095);
+   ivec3 i0 = clamp(ivec3(a - c, a - b0 - c - d0, a - b1 - c - d1), 0, 4095);
+   if (majcomp == 1) {
+      i0 = i0.grb; i1 = i1.grb;
+   } else if (majcomp == 2) {
+      i0 = i0.bgr; i1 = i1.bgr;
+   }
+   e0 = vec3(i0 << 4);
+   e1 = vec3(i1 << 4);
+}
+
+float ideal[16];
+uint gw[16], tw[16];
+
+void ideal_weights(vec3 e0, vec3 e1, bool final)
+{
+   vec3 d = e1 - e0;
+   float l = dot(d, d);
+   [[dont_unroll]] for (uint i = 0u; i < 16u; i++)
+      ideal[i] = l > 0.0 ? clamp(dot((final ? orig[i] : tex[i]) - e0, d) / l, 0.0, 1.0) : 0.0;
+}
+
+void fit_weights(uint q)
+{
+   [[dont_unroll]] for (uint i = 0u; i < 16u; i++) {
+      gw[i] = wquant(q, uint(ideal[i] * 64.0 + 0.5));
+      tw[i] = wunq(q, gw[i]);
+   }
+}
+
+void line_fit(out vec3 e0, out vec3 e1)
+{
+   vec3 mean = vec3(0.0);
+   [[dont_unroll]] for (uint i = 0u; i < 16u; i++)
+      mean += tex[i];
+   mean /= 16.0;
+   mat3 cov = mat3(0.0);
+   vec3 lo = vec3(1e9), hi = vec3(-1e9);
+   [[dont_unroll]] for (uint i = 0u; i < 16u; i++) {
+      vec3 d = tex[i] - mean;
+      cov += outerProduct(d, d);
+      lo = min(lo, tex[i]);
+      hi = max(hi, tex[i]);
+   }
+   vec3 a = hi - lo;
+   [[dont_unroll]] for (int it = 0; it < 8; it++) {
+      vec3 n = cov * a;
+      float m = max(abs(n.x), max(abs(n.y), abs(n.z)));
+      if (m <= 0.0)
+         break;
+      a = n / m;
+   }
+   float l = dot(a, a);
+   float tmin = 0.0, tmax = 0.0;
+   if (l > 0.0) {
+      tmin = 1e9;
+      tmax = -1e9;
+      [[dont_unroll]] for (uint i = 0u; i < 16u; i++) {
+         float t = dot(tex[i] - mean, a) / l;
+         tmin = min(tmin, t);
+         tmax = max(tmax, t);
+      }
+   }
+   e0 = mean + a * tmin;
+   e1 = mean + a * tmax;
+}
+
+void refit(inout vec3 e0, inout vec3 e1)
+{
+   float aa = 0.0, ab = 0.0, bb = 0.0;
+   vec3 ax = vec3(0.0), bx = vec3(0.0);
+   [[dont_unroll]] for (uint i = 0u; i < 16u; i++) {
+      float w = float(tw[i]) / 64.0;
+      aa += (1.0 - w) * (1.0 - w);
+      ab += (1.0 - w) * w;
+      bb += w * w;
+      ax += (1.0 - w) * tex[i];
+      bx += w * tex[i];
+   }
+   float det = aa * bb - ab * ab;
+   if (abs(det) < 1e-6)
+      return;
+   e0 = clamp((ax * bb - bx * ab) / det, 0.0, 65535.0);
+   e1 = clamp((bx * aa - ax * ab) / det, 0.0, 65535.0);
+}
+
+/* quantize_hdr_rgbo: four colour values for endpoint mode 7, from the dark
+ * endpoint c and the LNS offset sc to the bright one */
+void quantize_hdr_rgbo(vec3 c, float sc, uint q)
+{
+   vec4 col = clamp(vec4(c + sc, sc), 0.0, 65535.0);
+   vec4 bak = col;
+   uint majcomp = col.r > col.g && col.r > col.b ? 0u : col.g > col.b ? 1u : 2u;
+   if (majcomp == 1u)
+      col = col.grba;
+   else if (majcomp == 2u)
+      col = col.bgra;
+   const int mbits[15] = int[](11, 5, 7, 11, 6, 5, 10, 5, 8, 9, 6, 7, 8, 7, 6);
+   const float cut[10] = float[](1024.0, 4096.0, 2048.0, 1024.0, 2048.0, 16384.0,
+                                 8192.0, 16384.0, 32768.0, 16384.0);
+   float r_base = col.r, g_base = col.r - col.g, b_base = col.r - col.b, s_base = col.a;
+   [[dont_unroll]] for (int mode = 0; mode < 5; mode++) {
+      if (g_base > cut[mode * 2] || b_base > cut[mode * 2] || s_base > cut[mode * 2 + 1])
+         continue;
+      int mode_enc = mode < 4 ? (mode | int(majcomp << 2)) : (int(majcomp) | 0xc);
+      float rscale = float(32 << max(mode - 1, 0)), scale = 1.0 / rscale;
+      int gb_icut = 1 << mbits[mode * 3 + 1];
+      int s_icut = 1 << mbits[mode * 3 + 2];
+
+      int r_int = rtn(r_base * scale);
+      int r_low = (r_int & 0x3f) | ((mode_enc & 3) << 6);
+      uint r_q = keep_top(q, r_low, 0xc0u);
+      r_int = (r_int & ~0x3f) | int(r_q & 0x3fu);
+      float r_f = float(r_int) * rscale;
+
+      float g_f = clamp(r_f - col.g, 0.0, 65535.0), b_f = clamp(r_f - col.b, 0.0, 65535.0);
+      int g_int = rtn(g_f * scale), b_int = rtn(b_f * scale);
+      if (g_int >= gb_icut || b_int >= gb_icut)
+         continue;
+      int g_low = g_int & 0x1f, b_low = b_int & 0x1f;
+      int bit0 = 0, bit1 = 0, bit2 = 0, bit3 = 0;
+      if (mode == 0 || mode == 2)
+         bit0 = (r_int >> 9) & 1;
+      else if (mode == 1 || mode == 3)
+         bit0 = (r_int >> 8) & 1;
+      else
+         bit0 = (g_int >> 6) & 1;
+      if (mode <= 3)
+         bit2 = (r_int >> 7) & 1;
+      else
+         bit2 = (b_int >> 6) & 1;
+      if (mode == 0 || mode == 2)
+         bit1 = (r_int >> 8) & 1;
+      else
+         bit1 = (g_int >> 5) & 1;
+      if (mode == 0)
+         bit3 = (r_int >> 10) & 1;
+      else if (mode == 2)
+         bit3 = (r_int >> 6) & 1;
+      else
+         bit3 = (b_int >> 5) & 1;
+      g_low |= ((mode_enc & 0x4) << 5) | (bit0 << 6) | (bit1 << 5);
+      b_low |= ((mode_enc & 0x8) << 4) | (bit2 << 6) | (bit3 << 5);
+      uint g_q = keep_top(q, g_low, 0xf0u), b_q = keep_top(q, b_low, 0xf0u);
+      g_int = (g_int & ~0x1f) | int(g_q & 0x1fu);
+      b_int = (b_int & ~0x1f) | int(b_q & 0x1fu);
+      g_f = float(g_int) * rscale;
+      b_f = float(b_int) * rscale;
+
+      float errsum = (r_f - col.r) + (r_f - g_f - col.g) + (r_f - b_f - col.b);
+      float s_f = clamp(s_base + errsum / 3.0, 0.0, 1e9);
+      int s_int = rtn(s_f * scale);
+      if (s_int >= s_icut)
+         continue;
+      int s_low = s_int & 0x1f;
+      int bit4, bit5, bit6;
+      bit6 = mode == 1 ? (r_int >> 9) & 1 : (s_int >> 5) & 1;
+      bit5 = mode == 4 ? (r_int >> 7) & 1 : mode == 1 ? (r_int >> 10) & 1 : (s_int >> 6) & 1;
+      bit4 = mode == 2 ? (s_int >> 7) & 1 : (r_int >> 6) & 1;
+      s_low |= (bit6 << 5) | (bit5 << 6) | (bit4 << 7);
+      cv[0] = r_q;
+      cv[1] = g_q;
+      cv[2] = b_q;
+      cv[3] = keep_top(q, s_low, 0xf0u);
+      return;
+   }
+   vec4 v = bak;
+   ivec4 iv;
+   for (int i = 0; i < 3; i++) {
+      v[i] = clamp(v[i], 0.0, 65020.0);
+      iv[i] = rtn(v[i] / 512.0);
+   }
+   v.a += ((float(iv.r) * 512.0 - v.r) + (float(iv.g) * 512.0 - v.g) + (float(iv.b) * 512.0 - v.b)) / 3.0;
+   iv.a = rtn(clamp(v.a, 0.0, 65020.0) / 512.0);
+   cv[0] = keep_top(q, (iv.r & 0x3f) | 0xc0, 0xf0u);
+   cv[1] = keep_top(q, (iv.g & 0x7f) | 0x80, 0xf0u);
+   cv[2] = keep_top(q, (iv.b & 0x7f) | 0x80, 0xf0u);
+   cv[3] = keep_top(q, (iv.a & 0x7f) | ((iv.r & 0x40) << 1), 0xf0u);
+}
+
+void unpack_hdr_rgbo(out vec3 e0, out vec3 e1)
+{
+   int v0 = int(cv[0]), v1 = int(cv[1]), v2 = int(cv[2]), v3 = int(cv[3]);
+   int modeval = ((v0 & 0xc0) >> 6) | (((v1 & 0x80) >> 7) << 2) | (((v2 & 0x80) >> 7) << 3);
+   int majcomp, mode;
+   if ((modeval & 0xc) != 0xc) {
+      majcomp = modeval >> 2;
+      mode = modeval & 3;
+   } else if (modeval != 0xf) {
+      majcomp = modeval & 3;
+      mode = 4;
+   } else {
+      majcomp = 0;
+      mode = 5;
+   }
+   int red = v0 & 0x3f, green = v1 & 0x1f, blue = v2 & 0x1f, sc = v3 & 0x1f;
+   int bit0 = (v1 >> 6) & 1, bit1 = (v1 >> 5) & 1, bit2 = (v2 >> 6) & 1, bit3 = (v2 >> 5) & 1;
+   int bit4 = (v3 >> 7) & 1, bit5 = (v3 >> 6) & 1, bit6 = (v3 >> 5) & 1;
+   int oh = 1 << mode;
+   if ((oh & 0x30) != 0) green |= bit0 << 6;
+   if ((oh & 0x3a) != 0) green |= bit1 << 5;
+   if ((oh & 0x30) != 0) blue |= bit2 << 6;
+   if ((oh & 0x3a) != 0) blue |= bit3 << 5;
+   if ((oh & 0x3d) != 0) sc |= bit6 << 5;
+   if ((oh & 0x2d) != 0) sc |= bit5 << 6;
+   if ((oh & 0x04) != 0) sc |= bit4 << 7;
+   if ((oh & 0x3b) != 0) red |= bit4 << 6;
+   if ((oh & 0x04) != 0) red |= bit3 << 6;
+   if ((oh & 0x10) != 0) red |= bit5 << 7;
+   if ((oh & 0x0f) != 0) red |= bit2 << 7;
+   if ((oh & 0x05) != 0) red |= bit1 << 8;
+   if ((oh & 0x0a) != 0) red |= bit0 << 8;
+   if ((oh & 0x05) != 0) red |= bit0 << 9;
+   if ((oh & 0x02) != 0) red |= bit6 << 9;
+   if ((oh & 0x01) != 0) red |= bit3 << 10;
+   if ((oh & 0x02) != 0) red |= bit5 << 10;
+   const int shamts[6] = int[](1, 1, 2, 3, 4, 5);
+   int sh = shamts[mode];
+   red <<= sh; green <<= sh; blue <<= sh; sc <<= sh;
+   if (mode != 5) {
+      green = red - green;
+      blue = red - blue;
+   }
+   ivec3 c1 = ivec3(red, green, blue);
+   if (majcomp == 1)
+      c1 = c1.grb;
+   else if (majcomp == 2)
+      c1 = c1.bgr;
+   ivec3 c0 = max(c1 - sc, 0);
+   c1 = max(c1, 0);
+   e0 = vec3(c0 << 4);
+   e1 = vec3(c1 << 4);
+}
+
+/* endpoints base + s * w with one LNS offset s for all channels, from weights */
+void refit_offset(out vec3 base, out float sc)
+{
+   float wbar = 0.0;
+   vec3 tbar = vec3(0.0);
+   [[dont_unroll]] for (uint i = 0u; i < 16u; i++) {
+      wbar += float(tw[i]) / 64.0;
+      tbar += tex[i];
+   }
+   wbar /= 16.0;
+   tbar /= 16.0;
+   float num = 0.0, den = 0.0;
+   [[dont_unroll]] for (uint i = 0u; i < 16u; i++) {
+      float dw = float(tw[i]) / 64.0 - wbar;
+      vec3 dt = tex[i] - tbar;
+      num += dw * (dt.r + dt.g + dt.b);
+      den += 3.0 * dw * dw;
+   }
+   sc = den > 0.0 ? max(num / den, 0.0) : 0.0;
+   base = max(tbar - sc * wbar, vec3(0.0));
+}
+
+vec3 gam[16];   /* texels as min(v, 16)^(1/2.2) */
+vec3 pw[16];    /* their weight: exposures -4..+4 that do not clip them, each by its gain */
+
+vec3 lns_gamma(vec3 c)
+{
+   uvec3 p = uvec3(c);
+   uvec3 mc = p & 0x7ffu, ec = p >> 11;
+   uvec3 mt = mix(mix(mc * 5u - 2048u, mc * 4u - 512u, lessThan(mc, uvec3(1536u))), mc * 3u,
+                  lessThan(mc, uvec3(512u)));
+   uvec3 h = min((ec << 10) | (mt >> 3), uvec3(0x7bffu));
+   vec3 v = vec3(unpackHalf2x16(h.x | (h.y << 16)), unpackHalf2x16(h.z).x);
+   return pow(min(v, vec3(16.0)), vec3(1.0 / 2.2));
+}
+
+/* error as the exposures -4..+4 see it */
+float block_error(vec3 e0, vec3 e1)
+{
+   float err = 0.0;
+   [[dont_unroll]] for (uint i = 0u; i < 16u; i++) {
+      float w = float(tw[i]);
+      vec3 d = lns_gamma(floor((e0 * (64.0 - w) + e1 * w + 32.0) / 64.0)) - gam[i];
+      err += dot(d * d, pw[i]);
+   }
+   return err;
+}
+
+void main()
+{
+   tb = Tables(pc.tables);
+   uvec3 gid = gl_GlobalInvocationID;
+   if (gid.x >= pc.blocks_x || gid.y >= pc.blocks_y)
+      return;
+   Words s = Words(pc.src);
+   uvec2 first = uvec2(0u);
+   bool same = true;
+   [[dont_unroll]] for (uint i = 0u; i < 16u; i++) {
+      uint x = min(gid.x * 4u + (i & 3u), pc.width - 1u);
+      uint y = min(gid.y * 4u + (i >> 2), pc.height - 1u);
+      uint o = (gid.z * pc.src_slice_pitch + y * pc.src_row_pitch + x * 8u) >> 2;
+      uvec2 raw = uvec2(s.w[o], s.w[o + 1u] & 0xffffu);
+      if (i == 0u)
+         first = raw;
+      same = same && raw == first;
+      vec2 rg = unpackHalf2x16(raw.x), ba = unpackHalf2x16(raw.y);
+      orig[i] = vec3(to_lns(rg.x), to_lns(rg.y), to_lns(ba.x));
+      vec3 lin = clamp(vec3(rg, ba.x), vec3(0.0), vec3(16.0));
+      gam[i] = pow(lin, vec3(1.0 / 2.2));
+      pw[i] = vec3(0.0);
+      [[dont_unroll]] for (int e = -4; e <= 4; e++)
+         pw[i] += mix(vec3(0.0), vec3(exp2(float(e) * 2.0 / 2.2)), lessThan(lin * exp2(float(e)), vec3(1.0)));
+   }
+   OutWords d = OutWords(pc.dst);
+   uint off = (gid.z * pc.dst_slice_pitch + gid.y * pc.dst_row_pitch + gid.x * 16u) >> 2;
+   if (same) {
+      uvec3 h = uvec3(first.x & 0xffffu, first.x >> 16, first.y);
+      h = mix(h, uvec3(0u), greaterThanEqual(h, uvec3(0x8000u)));
+      h = min(h, uvec3(0x7bffu));
+      d.w[off] = 0xfffffffcu;
+      d.w[off + 1u] = 0xffffffffu;
+      d.w[off + 2u] = h.x | (h.y << 16);
+      d.w[off + 3u] = h.z | (0x3c00u << 16);
+      return;
+   }
+
+   /* block mode, weight quant, colour quant, weight bits */
+   const uvec4 cands[3] = uvec4[](uvec4(593u, 7u, 20u, 58u), uvec4(578u, 8u, 19u, 64u),
+                                  uvec4(83u, 5u, 20u, 48u));
+   float best = 1e30;
+   /* a uvec4, not a uint[4]: Mali-G715 drops a whole-array copy into an
+    * initialised local array made in this loop and writes the zeros */
+   uvec4 best_out = uvec4(0u);
+   float first_err = -1.0;
+   float top = 0.0;
+   [[dont_unroll]] for (uint i = 0u; i < 16u; i++)
+      top = max(top, max(orig[i].r, max(orig[i].g, orig[i].b)));
+   /* fits with and without the texels far below the brightest one raised:
+    * a channel near zero spans most of the LNS range and pulls the line */
+   [[dont_unroll]] for (uint v = 0u; v < 2u; v++) {
+      float floor_lns = v == 0u ? 0.0 : top - FLOOR_STOPS * 2048.0;
+      [[dont_unroll]] for (uint i = 0u; i < 16u; i++)
+         tex[i] = max(orig[i], vec3(floor_lns));
+      vec3 l0, l1;
+      line_fit(l0, l1);
+      [[dont_unroll]] for (uint k = 0u; k < 3u; k++) {
+         uint mode = cands[k].x, wq = cands[k].y, cq = cands[k].z, wbits = cands[k].w;
+         vec3 e0 = l0, e1 = l1;
+         if (e0.r + e0.g + e0.b > e1.r + e1.g + e1.b) {
+            vec3 t = e0; e0 = e1; e1 = t;
+         }
+         ideal_weights(e0, e1, false);
+         fit_weights(wq);
+         refit(e0, e1);
+         if (e0.r + e0.g + e0.b > e1.r + e1.g + e1.b) {
+            vec3 t = e0; e0 = e1; e1 = t;
+         }
+         quantize_hdr_rgb(e0, e1, cq);
+         vec3 u0, u1;
+         unpack_hdr_rgb(u0, u1);
+         ideal_weights(u0, u1, false);
+         fit_weights(wq);
+         float err = block_error(u0, u1);
+         if (first_err < 0.0)
+            first_err = err;
+         if (err >= best)
+            continue;
+         best = err;
+         uint ob[4] = uint[](mode | (11u << 13), 0u, 0u, 0u);
+         for (uint j = 0u; j < 6u; j++)
+            ise_vals[j] = cquant(cq, cv[j]);
+         ise_encode(6u, cq);
+         [[dont_unroll]] for (uint b = 0u; b < ipos; b++)
+            if (((ib[b >> 5] >> (b & 31u)) & 1u) != 0u)
+               ob[(17u + b) >> 5] |= 1u << ((17u + b) & 31u);
+         [[dont_unroll]] for (uint j = 0u; j < 16u; j++)
+            ise_vals[j] = gw[j];
+         ise_encode(16u, wq);
+         [[dont_unroll]] for (uint b = 0u; b < ipos; b++)
+            if (((ib[b >> 5] >> (b & 31u)) & 1u) != 0u)
+               ob[(127u - b) >> 5] |= 1u << ((127u - b) & 31u);
+         best_out = uvec4(ob[0], ob[1], ob[2], ob[3]);
+      }
+      /* endpoint mode 7: one offset for all channels, more weight levels */
+      const uvec4 ocands[2] = uvec4[](uvec4(595u, 11u, 19u, 80u), uvec4(579u, 10u, 20u, 74u));
+      [[dont_unroll]] for (uint k = 0u; k < 2u; k++) {
+         uint mode = ocands[k].x, wq = ocands[k].y, cq = ocands[k].z;
+         float lmin = 1e9, lmax = -1e9;
+         [[dont_unroll]] for (uint i = 0u; i < 16u; i++) {
+            float l = (tex[i].r + tex[i].g + tex[i].b) / 3.0;
+            lmin = min(lmin, l);
+            lmax = max(lmax, l);
+         }
+         [[dont_unroll]] for (uint i = 0u; i < 16u; i++)
+            ideal[i] = lmax > lmin ? ((tex[i].r + tex[i].g + tex[i].b) / 3.0 - lmin) / (lmax - lmin) : 0.0;
+         fit_weights(wq);
+         vec3 base;
+         float sc;
+         refit_offset(base, sc);
+         quantize_hdr_rgbo(base, sc, cq);
+         vec3 u0, u1;
+         unpack_hdr_rgbo(u0, u1);
+         ideal_weights(u0, u1, false);
+         fit_weights(wq);
+         float err = block_error(u0, u1);
+         if (err >= best)
+            continue;
+         best = err;
+         uint ob[4] = uint[](mode | (7u << 13), 0u, 0u, 0u);
+         for (uint j = 0u; j < 4u; j++)
+            ise_vals[j] = cquant(cq, cv[j]);
+         ise_encode(4u, cq);
+         [[dont_unroll]] for (uint b = 0u; b < ipos; b++)
+            if (((ib[b >> 5] >> (b & 31u)) & 1u) != 0u)
+               ob[(17u + b) >> 5] |= 1u << ((17u + b) & 31u);
+         [[dont_unroll]] for (uint j = 0u; j < 16u; j++)
+            ise_vals[j] = gw[j];
+         ise_encode(16u, wq);
+         [[dont_unroll]] for (uint b = 0u; b < ipos; b++)
+            if (((ib[b >> 5] >> (b & 31u)) & 1u) != 0u)
+               ob[(127u - b) >> 5] |= 1u << ((127u - b) & 31u);
+         best_out = uvec4(ob[0], ob[1], ob[2], ob[3]);
+      }
+   }
+   /* no candidate kept: what the self-test log shows to find out why */
+   if (best_out[0] == 0u)
+      best_out = uvec4(0u, floatBitsToUint(first_err), floatBitsToUint(top),
+                        floatBitsToUint(orig[5].r));
+   d.w[off] = best_out[0];
+   d.w[off + 1u] = best_out[1];
+   d.w[off + 2u] = best_out[2];
+   d.w[off + 3u] = best_out[3];
+}
