@@ -40,6 +40,7 @@ struct wrapper_physical_device {
    int emulate_bcn;
    uint32_t native_bcn_mask;
    bool is_vkd3d;
+   uint32_t queue_family_count;
    bool emulate_imageless_framebuffer;
    bool emulate_vulkan13;
    bool raises_push_constant_limit;
