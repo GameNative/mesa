@@ -9,12 +9,14 @@
  *
  * WRAPPER_USE_BCN_CACHE turns it on, WRAPPER_BCN_CACHE_MB caps its size
  * (4096; the oldest entries go first) and WRAPPER_BCN_CACHE_MIN_FREE_MB is
- * the free space a write leaves on the filesystem (2048).
+ * the free space a write leaves on the filesystem (2048). WRAPPER_LOG_LEVEL
+ * with bcn logs every lookup and write.
  */
 
 #include "wrapper_bcdec.h"
 #include "wrapper_bcn_gpu.h"
 #include "wrapper_private.h"
+#include "wrapper_log.h"
 
 #define XXH_STATIC_LINKING_ONLY
 #include "util/xxhash.h"
@@ -180,6 +182,9 @@ wrapper_bcn_cache_load(VkFormat bc, VkFormat stored, uint32_t w, uint32_t h,
          unlink(name);
    }
    free(name);
+   if (get_wrapper_log_level("bcn"))
+      wrapper_diag_append("[BCN] cache %s %s %ux%u -> %s\n", hit ? "hit" : "miss", bc_tag(bc), w,
+                          h, astc_tag(stored));
    pthread_mutex_lock(&cache_lock);
    if (hit)
       cache_note(++cache_hits, "hit");
@@ -302,6 +307,9 @@ wrapper_bcn_cache_store(VkFormat bc, VkFormat stored, uint32_t w, uint32_t h,
       free(tmp);
    }
    free(name);
+   if (get_wrapper_log_level("bcn"))
+      wrapper_diag_append("[BCN] cache write %s %ux%u -> %s: %s\n", bc_tag(bc), w, h,
+                          astc_tag(stored), ok ? "ok" : "failed");
    pthread_mutex_lock(&cache_lock);
    if (ok) {
       cache_bytes += need;
