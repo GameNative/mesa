@@ -141,6 +141,14 @@ struct wrapper_device {
    uint32_t bcn_astc_block_only;           /* slots whose workgroup encoder failed */
    bool bcn_direct;                        /* the ASTC 4x4 encoder maps BC blocks directly */
    bool bcn_bc7_mode6;                     /* BC7 readbacks use mode 6 only */
+   /* indirect group counts of dispatches recorded before their pipeline's
+    * self-test (no private queue): zero until the test at the next submit */
+   VkBuffer bcn_gate;
+   VkDeviceMemory bcn_gate_memory;
+   uint32_t *bcn_gate_map;
+   uint32_t bcn_gate_used;
+   uint32_t bcn_gate_pending[64][5];
+   uint32_t bcn_gate_pending_count;
    bool bcn_cache_warm;                    /* the pipeline cache file had data */
    VkQueue bcn_queue;                      /* where the worker runs the self-test */
    uint32_t bcn_queue_family;
