@@ -648,13 +648,15 @@ bcn_tools_start(struct wrapper_device *device)
 /* The pipeline of a slot. Uploads, which have the CPU path, take it only
  * once it has passed its self-test; with a warm pipeline cache and the
  * wrapper's own queue the build and the check take milliseconds, so an
- * upload waits for them (up to 250 ms). Readbacks and copies (wait) take it
- * as soon as it is built. */
+ * upload waits for them (up to 250 ms). Readbacks and copies, which have no
+ * CPU path, wait for the build and the check; only without the wrapper's own
+ * queue, where the check runs at the next submit, do they take it built. */
 static VkPipeline
 bcn_pipe(struct wrapper_device *device, int slot, bool wait)
 {
    int st = __atomic_load_n(&device->bcn_slot_state[slot], __ATOMIC_ACQUIRE);
-   if (st == BCN_TESTED || (wait && st == BCN_BUILT))
+   bool built_ok = wait && !device->bcn_queue;
+   if (st == BCN_TESTED || (built_ok && st == BCN_BUILT))
       return device->bcn_pipe[slot];
    if (st == BCN_FAILED || !bcn_tools_start(device))
       return VK_NULL_HANDLE;
@@ -665,7 +667,8 @@ bcn_pipe(struct wrapper_device *device, int slot, bool wait)
    }
    if (wait) {
       while (device->bcn_slot_state[slot] == BCN_QUEUED ||
-             device->bcn_slot_state[slot] == BCN_BUILDING)
+             device->bcn_slot_state[slot] == BCN_BUILDING ||
+             (!built_ok && device->bcn_slot_state[slot] == BCN_BUILT))
          pthread_cond_wait(&device->bcn_tool_cond, &device->bcn_tool_lock);
    } else if (device->bcn_cache_warm && device->bcn_queue) {
       struct timespec until;
@@ -684,7 +687,7 @@ bcn_pipe(struct wrapper_device *device, int slot, bool wait)
    }
    st = device->bcn_slot_state[slot];
    pthread_mutex_unlock(&device->bcn_tool_lock);
-   return st == BCN_TESTED || (wait && st == BCN_BUILT) ? device->bcn_pipe[slot] : VK_NULL_HANDLE;
+   return st == BCN_TESTED || (built_ok && st == BCN_BUILT) ? device->bcn_pipe[slot] : VK_NULL_HANDLE;
 }
 
 static int
