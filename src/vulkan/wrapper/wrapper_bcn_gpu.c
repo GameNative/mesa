@@ -507,6 +507,9 @@ bcn_cache_save(struct wrapper_device *device)
    free(data);
 }
 
+#define BCN_BUILD_ATTEMPTS 3
+#define BCN_WAIT_SECONDS 20
+
 static void
 bcn_selftest(struct wrapper_device *device, VkQueue queue, uint32_t family);
 
@@ -533,6 +536,13 @@ bcn_tools_worker(void *arg)
       clock_gettime(CLOCK_MONOTONIC, &t0);
       VkPipeline p = VK_NULL_HANDLE;
       VkResult r = bcn_build_slot(device, slot, &p);
+      for (int attempt = 1; r != VK_SUCCESS && attempt < BCN_BUILD_ATTEMPTS &&
+                            !__atomic_load_n(&device->bcn_tool_stop, __ATOMIC_RELAXED); attempt++) {
+         wrapper_diag_append("[BCN] GPU shader %s build failed (VkResult %d), attempt %d of %d\n",
+                             bcn_slot_names[slot], r, attempt + 1, BCN_BUILD_ATTEMPTS);
+         usleep(100000 * attempt);
+         r = bcn_build_slot(device, slot, &p);
+      }
       clock_gettime(CLOCK_MONOTONIC, &t1);
       if (r == VK_SUCCESS)
          bcn_cache_save(device);
@@ -559,6 +569,8 @@ bcn_tools_worker(void *arg)
          pthread_cond_broadcast(&device->bcn_tool_cond);
       }
    }
+   device->bcn_tool_exited = true;
+   pthread_cond_broadcast(&device->bcn_tool_cond);
    pthread_mutex_unlock(&device->bcn_tool_lock);
    return NULL;
 }
@@ -707,11 +719,21 @@ bcn_pipe(struct wrapper_device *device, int slot, bool wait)
       device->bcn_slot_state[slot] = BCN_QUEUED;
       pthread_cond_broadcast(&device->bcn_tool_cond);
    }
-   if (wait) {
+   if (wait && !device->bcn_slot_late[slot]) {
+      struct timespec until;
+      clock_gettime(CLOCK_REALTIME, &until);
+      until.tv_sec += BCN_WAIT_SECONDS;
       while (device->bcn_slot_state[slot] == BCN_QUEUED ||
              device->bcn_slot_state[slot] == BCN_BUILDING ||
-             (!built_ok && device->bcn_slot_state[slot] == BCN_BUILT))
-         pthread_cond_wait(&device->bcn_tool_cond, &device->bcn_tool_lock);
+             (!built_ok && device->bcn_slot_state[slot] == BCN_BUILT)) {
+         if (pthread_cond_timedwait(&device->bcn_tool_cond, &device->bcn_tool_lock, &until)) {
+            device->bcn_slot_late[slot] = true;
+            wrapper_diag_append("[BCN] GPU shader %s not ready after %d s (state %d), not waiting "
+                                "for it again\n", bcn_slot_names[slot], BCN_WAIT_SECONDS,
+                                device->bcn_slot_state[slot]);
+            break;
+         }
+      }
    } else if (device->bcn_cache_warm && device->bcn_queue) {
       struct timespec until;
       clock_gettime(CLOCK_REALTIME, &until);
@@ -1022,12 +1044,25 @@ wrapper_bcn_gpu_finish(struct wrapper_device *device)
 {
    VkDevice d = device->dispatch_handle;
    if (device->bcn_tool_thread_live) {
+      struct timespec until;
+      clock_gettime(CLOCK_REALTIME, &until);
+      until.tv_sec += 15;
       pthread_mutex_lock(&device->bcn_tool_lock);
       device->bcn_tool_stop = true;
       pthread_cond_broadcast(&device->bcn_tool_cond);
+      while (!device->bcn_tool_exited &&
+             !pthread_cond_timedwait(&device->bcn_tool_cond, &device->bcn_tool_lock, &until))
+         ;
+      bool exited = device->bcn_tool_exited;
       pthread_mutex_unlock(&device->bcn_tool_lock);
-      pthread_join(device->bcn_tool_thread, NULL);
       device->bcn_tool_thread_live = false;
+      if (!exited) {
+         wrapper_diag_append("[BCN] GPU shader build still running at device destruction, "
+                             "left to the process exit\n");
+         pthread_detach(device->bcn_tool_thread);
+         return;
+      }
+      pthread_join(device->bcn_tool_thread, NULL);
    }
    for (int i = 0; i < BCN_SLOT_COUNT; i++)
       if (device->bcn_pipe[i])
