@@ -1437,6 +1437,9 @@ wrapper_bcn_gpu_copy_image_region(struct wrapper_command_buffer *wcb,
    struct wrapper_device *device = wcb->device;
 
    if (src_emulated && dst_emulated) {
+      VkImageSubresourceLayers sub = c->dstSubresource;
+      sub.layerCount = bcn_layers(dst, &sub);
+      wrapper_bcn_hq_write(device, dst, &sub, c->dstOffset, c->extent);
       /* Same stored format and whole stored blocks: the driver copies them. */
       VkFormat s = get_format_for_bcn(src->info.format);
       if (s == get_format_for_bcn(dst->info.format))
