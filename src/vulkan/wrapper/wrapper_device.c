@@ -751,6 +751,55 @@ wrapper_UpdateDescriptorSets(VkDevice _device, uint32_t descriptorWriteCount,
    free(writes);
 }
 
+
+static int
+wrapper_probe_vi(void)
+{
+   static int v = -1;
+   if (v < 0)
+      v = getenv("WRAPPER_PROBE_VI") ? atoi(getenv("WRAPPER_PROBE_VI")) : 0;
+   return v;
+}
+
+static void
+wrapper_probe_pipeline(const struct wrapper_device *device, const VkGraphicsPipelineCreateInfo *info,
+                       VkPipeline pipeline, bool stride_wants)
+{
+   const VkPipelineVertexInputStateCreateInfo *vi = info->pVertexInputState;
+   char buf[1024];
+   int n = snprintf(buf, sizeof(buf), "PROBE pipeline %p flags 0x%x stages %u wants_stride %d",
+                    (void *)(uintptr_t)pipeline, info->flags, info->stageCount, stride_wants);
+   if (vi) {
+      for (uint32_t b = 0; b < vi->vertexBindingDescriptionCount && n < 900; b++)
+         n += snprintf(buf + n, sizeof(buf) - n, " B%u:rate%u:stride%u",
+                       vi->pVertexBindingDescriptions[b].binding,
+                       vi->pVertexBindingDescriptions[b].inputRate,
+                       vi->pVertexBindingDescriptions[b].stride);
+      for (uint32_t a = 0; a < vi->vertexAttributeDescriptionCount && n < 900; a++)
+         n += snprintf(buf + n, sizeof(buf) - n, " A%u:b%u:f%u:o%u",
+                       vi->pVertexAttributeDescriptions[a].location,
+                       vi->pVertexAttributeDescriptions[a].binding,
+                       vi->pVertexAttributeDescriptions[a].format,
+                       vi->pVertexAttributeDescriptions[a].offset);
+      for (const VkBaseInStructure *e = vi->pNext; e && n < 900; e = e->pNext) {
+         n += snprintf(buf + n, sizeof(buf) - n, " vi_pnext %d", e->sType);
+         if (e->sType == VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_DIVISOR_STATE_CREATE_INFO_KHR) {
+            const VkPipelineVertexInputDivisorStateCreateInfoKHR *d = (const void *)e;
+            for (uint32_t i = 0; i < d->vertexBindingDivisorCount && n < 900; i++)
+               n += snprintf(buf + n, sizeof(buf) - n, " D%u:%u",
+                             d->pVertexBindingDivisors[i].binding,
+                             d->pVertexBindingDivisors[i].divisor);
+         }
+      }
+   }
+   if (info->pDynamicState) {
+      n += snprintf(buf + n, sizeof(buf) - n, " dyn");
+      for (uint32_t i = 0; i < info->pDynamicState->dynamicStateCount && n < 1000; i++)
+         n += snprintf(buf + n, sizeof(buf) - n, " %d", info->pDynamicState->pDynamicStates[i]);
+   }
+   WRAPPER_LOG(info, "%s", buf);
+}
+
 VKAPI_ATTR void VKAPI_CALL
 wrapper_CmdBindVertexBuffers2(VkCommandBuffer commandBuffer, uint32_t firstBinding,
                              uint32_t bindingCount, const VkBuffer *pBuffers,
@@ -776,6 +825,15 @@ wrapper_CmdBindVertexBuffers2(VkCommandBuffer commandBuffer, uint32_t firstBindi
       if (sizes)
          pSizes = sizes;
    }
+   if (wrapper_probe_vi()) {
+      for (uint32_t i = 0; i < bindingCount; i++)
+         WRAPPER_LOG(info, "PROBE bind2 cb %p b%u buf %p off %llu size %lld stride %lld",
+                     (void *)commandBuffer, firstBinding + i,
+                     pBuffers ? (void *)(uintptr_t)pBuffers[i] : NULL,
+                     pOffsets ? (unsigned long long)pOffsets[i] : 0ull,
+                     pSizes ? (long long)pSizes[i] : -2ll,
+                     pStrides ? (long long)pStrides[i] : -2ll);
+   }
    if ((device->emulate_vertex_divisor || device->emulate_zero_divisor) && pBuffers)
       wrapper_divisor_track(wcb, firstBinding, bindingCount, pBuffers, pOffsets, pSizes,
                             pStrides);
@@ -783,6 +841,10 @@ wrapper_CmdBindVertexBuffers2(VkCommandBuffer commandBuffer, uint32_t firstBindi
       wrapper_stride_set(wcb, firstBinding, bindingCount, pStrides);
       pStrides = NULL;
    }
+   if (wrapper_probe_vi() >= 2 && !pStrides && bindingCount) {
+      device->dispatch_table.CmdBindVertexBuffers(wcb->dispatch_handle,
+         firstBinding, bindingCount, pBuffers, pOffsets);
+   } else
    if (device->dispatch_table.CmdBindVertexBuffers2)
       device->dispatch_table.CmdBindVertexBuffers2(wcb->dispatch_handle,
          firstBinding, bindingCount, pBuffers, pOffsets, pSizes, pStrides);
@@ -4280,6 +4342,14 @@ wrapper_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
          pAllocator, pPipelines);
    }
 
+   if (wrapper_probe_vi()) {
+      for (uint32_t i = 0; i < createInfoCount; i++) {
+         wrapper_probe_pipeline(device, &pCreateInfos[i], pPipelines[i], false);
+         wrapper_probe_pipeline(device, &driver_infos[i], pPipelines[i],
+                                wrapper_stride_wants(device, &driver_infos[i]));
+      }
+   }
+
    if (div_lowerings) {
       for (uint32_t i = 0; i < createInfoCount; i++) {
          if (div_infos == driver_infos)
@@ -4370,6 +4440,11 @@ wrapper_CmdDraw(VkCommandBuffer commandBuffer, uint32_t vertexCount,
       return;
    if (wcb->stride_pipeline)
       wrapper_stride_flush(wcb);
+   if (wrapper_probe_vi())
+      WRAPPER_LOG(info, "PROBE draw cb %p v%u i%u fv%u fi%u stride_pipeline %d bound %p divisor %d",
+                  (void *)commandBuffer, vertexCount, instanceCount, firstVertex, firstInstance,
+                  wcb->stride_pipeline != NULL, (void *)(uintptr_t)wcb->stride_bound,
+                  wcb->divisor_pipeline != NULL);
    wcb->device->dispatch_table.CmdDraw(wcb->dispatch_handle, vertexCount,
                                        instanceCount, firstVertex, firstInstance);
 }
@@ -5209,6 +5284,10 @@ wrapper_CmdBindPipeline(VkCommandBuffer commandBuffer,
    if ((wcb->device->emulate_vertex_divisor || wcb->device->emulate_zero_divisor) &&
        pipelineBindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS)
       wrapper_divisor_bind(wcb, pipeline);
+   if (wrapper_probe_vi() && pipelineBindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS)
+      WRAPPER_LOG(info, "PROBE bindpipe cb %p %p stride %d divisor %d", (void *)commandBuffer,
+                  (void *)(uintptr_t)pipeline, wcb->stride_pipeline != NULL,
+                  wcb->divisor_pipeline != NULL);
    wcb->device->dispatch_table.CmdBindPipeline(wcb->dispatch_handle, pipelineBindPoint,
                                                pipeline);
 }						   						   

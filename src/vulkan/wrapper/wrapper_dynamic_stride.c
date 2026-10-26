@@ -497,6 +497,10 @@ create_variant(struct wrapper_device *device, struct wrapper_stride_pipeline *sp
       sp->variants = v;
       sp->variant_capacity = cap;
    }
+   if (getenv("WRAPPER_PROBE_VI"))
+      WRAPPER_LOG(info, "PROBE variant %p strides %u %u %u %u eds_topo %u",
+                  (void *)(uintptr_t)pipeline, key->strides[0], key->strides[1], key->strides[2],
+                  key->strides[3], key->eds[WRAPPER_EDS_TOPOLOGY]);
    sp->variants[sp->variant_count].key = *key;
    sp->variants[sp->variant_count++].pipeline = pipeline;
    return pipeline;
