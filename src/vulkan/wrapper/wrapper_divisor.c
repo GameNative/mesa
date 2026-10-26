@@ -113,24 +113,6 @@ zero_base_instance(const uint32_t *code, size_t size, size_t *out_size)
    return out;
 }
 
-#define SPV_GENERATOR_VKD3D_SHADER 18
-
-static bool
-vertex_shader_from_vkd3d_shader(struct wrapper_device *device,
-                                const VkGraphicsPipelineCreateInfo *info)
-{
-   for (uint32_t i = 0; i < info->stageCount; i++) {
-      if (info->pStages[i].stage != VK_SHADER_STAGE_VERTEX_BIT || !info->pStages[i].module)
-         continue;
-      size_t size = 0;
-      uint32_t *code = wrapper_stride_module_code(device, info->pStages[i].module, &size);
-      bool match = code && size >= 12 && (code[2] >> 16) == SPV_GENERATOR_VKD3D_SHADER;
-      free(code);
-      return match;
-   }
-   return false;
-}
-
 static VkShaderModule
 vertex_module_without_base_instance(struct wrapper_device *device, VkShaderModule module)
 {
@@ -168,11 +150,8 @@ wrapper_divisor_lower(struct wrapper_device *device,
 
    const VkPipelineVertexInputStateCreateInfo *vi = in->pVertexInputState;
    const VkPipelineVertexInputDivisorStateCreateInfoKHR *ds = find_divisor_state(vi);
-   bool split = !zero_only && device->split_instance_rate &&
-                has_dynamic(in, VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE) &&
-                vertex_shader_from_vkd3d_shader(device, in);
-   if ((!ds && !split) || vi->vertexBindingDescriptionCount > WRAPPER_DIVISOR_MAX_BINDINGS ||
-       (ds && ds->vertexBindingDivisorCount > WRAPPER_DIVISOR_MAX_BINDINGS))
+   if (!ds || vi->vertexBindingDescriptionCount > WRAPPER_DIVISOR_MAX_BINDINGS ||
+       ds->vertexBindingDivisorCount > WRAPPER_DIVISOR_MAX_BINDINGS)
       return NULL;
    if (zero_only) {
       bool any_zero = false;
@@ -189,11 +168,11 @@ wrapper_divisor_lower(struct wrapper_device *device,
    memcpy(l->bindings, vi->pVertexBindingDescriptions,
           vi->vertexBindingDescriptionCount * sizeof(*l->bindings));
    l->vi.pVertexBindingDescriptions = l->bindings;
-   if (ds && vi->pNext == (const void *)ds)
+   if (vi->pNext == (const void *)ds)
       l->vi.pNext = ds->pNext;
    l->info.dynamic_stride = has_dynamic(in, VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE);
 
-   for (uint32_t i = 0; ds && i < ds->vertexBindingDivisorCount; i++) {
+   for (uint32_t i = 0; i < ds->vertexBindingDivisorCount; i++) {
       const VkVertexInputBindingDivisorDescriptionKHR *d = &ds->pVertexBindingDivisors[i];
       if (zero_only && d->divisor != 0) {
          l->divisors[l->ds.vertexBindingDivisorCount++] = *d;
@@ -212,15 +191,6 @@ wrapper_divisor_lower(struct wrapper_device *device,
          l->bindings[b].stride = 0;
       }
    }
-   for (uint32_t b = 0; split && b < vi->vertexBindingDescriptionCount; b++) {
-      uint32_t n = l->bindings[b].binding;
-      if (l->bindings[b].inputRate != VK_VERTEX_INPUT_RATE_INSTANCE ||
-          n >= WRAPPER_DIVISOR_MAX_BINDINGS || (l->info.mask & (1u << n)))
-         continue;
-      l->info.mask |= 1u << n;
-      l->info.divisor[n] = 1;
-      l->info.stride[n] = l->bindings[b].stride;
-   }
    if (l->ds.vertexBindingDivisorCount) {
       l->ds.sType = ds->sType;
       l->ds.pNext = ds->pNext;
@@ -231,7 +201,7 @@ wrapper_divisor_lower(struct wrapper_device *device,
 
    bool grouped = false;
    u_foreach_bit(b, l->info.mask)
-      grouped |= l->info.divisor[b] != 0;
+      grouped |= l->info.divisor[b] > 1;
    if (grouped && in->stageCount <= ARRAY_SIZE(l->stages)) {
       memcpy(l->stages, in->pStages, in->stageCount * sizeof(*l->stages));
       for (uint32_t i = 0; i < in->stageCount; i++) {
@@ -368,11 +338,11 @@ binding_stride(const struct wrapper_command_buffer *wcb, const struct wrapper_di
 }
 
 static void
-override_strides(struct wrapper_command_buffer *wcb, uint32_t mask,
+override_strides(struct wrapper_command_buffer *wcb, const struct wrapper_divisor_pipeline *p,
                  uint32_t *saved, uint32_t *saved_valid)
 {
    *saved_valid = wcb->vertex_strides_valid;
-   u_foreach_bit(b, mask) {
+   u_foreach_bit(b, p->mask) {
       saved[b] = wcb->vertex_strides[b];
       wcb->vertex_strides[b] = 0;
       wcb->vertex_strides_valid |= 1u << b;
@@ -380,19 +350,19 @@ override_strides(struct wrapper_command_buffer *wcb, uint32_t mask,
 }
 
 static void
-restore_strides(struct wrapper_command_buffer *wcb, uint32_t mask,
+restore_strides(struct wrapper_command_buffer *wcb, const struct wrapper_divisor_pipeline *p,
                 const uint32_t *saved, uint32_t saved_valid)
 {
-   u_foreach_bit(b, mask)
+   u_foreach_bit(b, p->mask)
       wcb->vertex_strides[b] = saved[b];
    wcb->vertex_strides_valid = saved_valid;
 }
 
 static void
 bind_elements(struct wrapper_command_buffer *wcb, const struct wrapper_divisor_pipeline *p,
-              uint32_t mask, uint32_t first_instance, uint32_t start)
+              uint32_t first_instance, uint32_t start)
 {
-   u_foreach_bit(b, mask & wcb->vb_valid) {
+   u_foreach_bit(b, p->mask & wcb->vb_valid) {
       uint32_t d = p->divisor[b];
       VkDeviceSize stride = binding_stride(wcb, p, b);
       VkDeviceSize element = d ? first_instance + start / d : first_instance;
@@ -405,10 +375,9 @@ bind_elements(struct wrapper_command_buffer *wcb, const struct wrapper_divisor_p
 }
 
 static void
-restore_bindings(struct wrapper_command_buffer *wcb, const struct wrapper_divisor_pipeline *p,
-                 uint32_t mask)
+restore_bindings(struct wrapper_command_buffer *wcb, const struct wrapper_divisor_pipeline *p)
 {
-   u_foreach_bit(b, mask & wcb->vb_valid)
+   u_foreach_bit(b, p->mask & wcb->vb_valid)
       bind_one(wcb, p, b, wcb->vb_offset[b], wcb->vb_size[b], binding_stride(wcb, p, b));
 }
 
@@ -438,13 +407,13 @@ wrapper_divisor_draw(struct wrapper_command_buffer *wcb, bool indexed, uint32_t 
 
    uint32_t saved[WRAPPER_DIVISOR_MAX_BINDINGS], saved_valid = 0;
    if (wcb->stride_pipeline) {
-      override_strides(wcb, p->mask, saved, &saved_valid);
+      override_strides(wcb, p, saved, &saved_valid);
       wrapper_stride_flush(wcb);
    }
 
    for (uint32_t start = 0; start < instance_count; start += group) {
       uint32_t n = MIN2(group, instance_count - start);
-      bind_elements(wcb, p, p->mask, first_instance, start);
+      bind_elements(wcb, p, first_instance, start);
       if (indexed)
          device->dispatch_table.CmdDrawIndexed(wcb->dispatch_handle, count, n, first,
                                                vertex_offset, first_instance + start);
@@ -453,27 +422,17 @@ wrapper_divisor_draw(struct wrapper_command_buffer *wcb, bool indexed, uint32_t 
                                         first_instance + start);
    }
 
-   restore_bindings(wcb, p, p->mask);
+   restore_bindings(wcb, p);
    if (wcb->stride_pipeline)
-      restore_strides(wcb, p->mask, saved, saved_valid);
+      restore_strides(wcb, p, saved, saved_valid);
    return true;
-}
-
-static uint32_t
-indirect_mask(const struct wrapper_divisor_pipeline *p)
-{
-   uint32_t mask = 0;
-   u_foreach_bit(b, p->mask)
-      if (p->divisor[b] != 1)
-         mask |= 1u << b;
-   return mask;
 }
 
 bool
 wrapper_divisor_begin_indirect(struct wrapper_command_buffer *wcb)
 {
    const struct wrapper_divisor_pipeline *p = wcb->divisor_pipeline;
-   if (!p || !(indirect_mask(p) & wcb->vb_valid))
+   if (!p || !(p->mask & wcb->vb_valid))
       return false;
    static bool warned;
    u_foreach_bit(b, p->mask) {
@@ -484,11 +443,10 @@ wrapper_divisor_begin_indirect(struct wrapper_command_buffer *wcb)
       }
    }
    if (wcb->stride_pipeline) {
-      override_strides(wcb, indirect_mask(p), wcb->divisor_saved_strides,
-                       &wcb->divisor_saved_valid);
+      override_strides(wcb, p, wcb->divisor_saved_strides, &wcb->divisor_saved_valid);
       wrapper_stride_flush(wcb);
    }
-   bind_elements(wcb, p, indirect_mask(p), 0, 0);
+   bind_elements(wcb, p, 0, 0);
    return true;
 }
 
@@ -496,8 +454,7 @@ void
 wrapper_divisor_end_indirect(struct wrapper_command_buffer *wcb)
 {
    const struct wrapper_divisor_pipeline *p = wcb->divisor_pipeline;
-   restore_bindings(wcb, p, indirect_mask(p));
+   restore_bindings(wcb, p);
    if (wcb->stride_pipeline)
-      restore_strides(wcb, indirect_mask(p), wcb->divisor_saved_strides,
-                      wcb->divisor_saved_valid);
+      restore_strides(wcb, p, wcb->divisor_saved_strides, wcb->divisor_saved_valid);
 }
