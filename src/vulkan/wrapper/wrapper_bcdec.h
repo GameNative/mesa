@@ -80,6 +80,9 @@ void
 bcn_cache_note_source(void *srcBuffer, int w, int h, int src_w,
                       VkFormat format, int offset);
 
+float
+wrapper_bcn_bc7_mse(const uint8_t blk[16], const uint8_t rgba[64]);
+
 int
 wrapper_bcn_astc4_direct(VkFormat format, const uint8_t *blk, uint8_t out[16]);
 

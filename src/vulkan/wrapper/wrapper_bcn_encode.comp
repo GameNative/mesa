@@ -445,14 +445,14 @@ float encode_two(uint mode, uint part)
       float best = 1e30;
       [[dont_unroll]] for (int pass = 0; pass < 2; pass++) {
          float bq = 1e30;
-         int q0[3], q1[3], pa = 0, pb = 0;
+         ivec3 q0 = ivec3(0), q1 = ivec3(0);
+         int pa = 0, pb = 0;
          ivec3 u0 = ivec3(0), u1 = ivec3(0);
          [[dont_unroll]] for (int a = 0; a < 2; a++)
             [[dont_unroll]] for (int b = 0; b < 2; b++) {
                if (mode == 1u && a != b)
                   continue;
-               int t0[3], t1[3];
-               ivec3 v0, v1;
+               ivec3 t0 = ivec3(0), t1 = ivec3(0), v0, v1;
                float eq = 0.0;
                [[dont_unroll]] for (int c = 0; c < 3; c++) {
                   v0[c] = qbest(e0[c], bits, a, true, t0[c]);
@@ -462,8 +462,8 @@ float encode_two(uint mode, uint part)
                }
                if (eq < bq) {
                   bq = eq;
-                  q0 = t0;
-                  q1 = t1;
+                  q0.x = t0.x; q0.y = t0.y; q0.z = t0.z;
+                  q1.x = t1.x; q1.y = t1.y; q1.z = t1.z;
                   pa = a;
                   pb = b;
                   u0 = v0;
@@ -568,10 +568,10 @@ float encode_m5()
    vec4 e0, e1;
    fit_line(0xffffu, chm, e0, e1);
    float best = 1e30;
-   int cq0[3], cq1[3];
+   ivec3 cq0 = ivec3(0), cq1 = ivec3(0);
    uint cidx[16];
    [[dont_unroll]] for (int pass = 0; pass < 2; pass++) {
-      int q0[3], q1[3];
+      ivec3 q0 = ivec3(0), q1 = ivec3(0);
       ivec3 u0, u1;
       [[dont_unroll]] for (int c = 0; c < 3; c++) {
          u0[c] = qbest(e0[c], 7, 0, false, q0[c]);
@@ -596,9 +596,10 @@ float encode_m5()
       }
       if (err < best) {
          best = err;
-         cq0 = q0;
-         cq1 = q1;
-         cidx = idx;
+         cq0.x = q0.x; cq0.y = q0.y; cq0.z = q0.z;
+         cq1.x = q1.x; cq1.y = q1.y; cq1.z = q1.z;
+         [[dont_unroll]] for (uint i = 0u; i < 16u; i++)
+            cidx[i] = idx[i];
       }
       vec4 r0, r1;
       if (!refit(0xffffu, wt, chm, r0, r1))
@@ -636,7 +637,8 @@ float encode_m5()
          abest = err;
          aq0 = a0;
          aq1 = a1;
-         aidx = idx;
+         [[dont_unroll]] for (uint i = 0u; i < 16u; i++)
+            aidx[i] = idx[i];
       }
       float aa = 0.0, ab = 0.0, bb = 0.0, ax = 0.0, bx = 0.0;
       [[dont_unroll]] for (uint i = 0u; i < 16u; i++) {
@@ -654,7 +656,7 @@ float encode_m5()
       hi = clamp((bx * aa - ax * ab) / det, 0.0, 255.0);
    }
    if (cidx[0] >= 2u) {
-      int t[3] = cq0;
+      ivec3 t = cq0;
       cq0 = cq1;
       cq1 = t;
       [[dont_unroll]] for (uint i = 0u; i < 16u; i++)
@@ -686,7 +688,7 @@ float encode_m5()
 
 void encode_bc7_modes()
 {
-   uint keep[4] = ob;
+   uvec4 keep = uvec4(ob[0], ob[1], ob[2], ob[3]);
    float best = bc7_err;
    bool opaque = true;
    [[dont_unroll]] for (uint i = 0u; i < 16u; i++)
@@ -710,17 +712,17 @@ void encode_bc7_modes()
          if (e < best) {
             best = e;
             write_two(mode, part);
-            keep = ob;
+            keep.x = ob[0]; keep.y = ob[1]; keep.z = ob[2]; keep.w = ob[3];
          }
       }
    } else {
       float e = encode_m5();
       if (e < best) {
          best = e;
-         keep = ob;
+         keep.x = ob[0]; keep.y = ob[1]; keep.z = ob[2]; keep.w = ob[3];
       }
    }
-   ob = keep;
+   ob[0] = keep.x; ob[1] = keep.y; ob[2] = keep.z; ob[3] = keep.w;
 }
 
 void encode_bc7()
@@ -728,7 +730,7 @@ void encode_bc7()
    vec4 e0, e1;
    fit_line(0xffffu, vec4(1.0), e0, e1);
    float best_err = 1e30;
-   uint best[4];
+   uvec4 best = uvec4(0u);
    [[dont_unroll]] for (int pass = 0; pass < 2; pass++) {
       int q0[4], q1[4];
       int p0 = 0, p1 = 0;
@@ -784,7 +786,7 @@ void encode_bc7()
          wbits(uint(flip ? p0 : p1), 1u);
          [[dont_unroll]] for (uint i = 0u; i < 16u; i++)
             wbits(flip ? 15u - idx[i] : idx[i], i == 0u ? 3u : 4u);
-         best = ob;
+         best.x = ob[0]; best.y = ob[1]; best.z = ob[2]; best.w = ob[3];
       }
       vec4 r0, r1;
       if (!refit(0xffffu, wt, vec4(1.0), r0, r1))
@@ -792,7 +794,7 @@ void encode_bc7()
       e0 = clamp(r0, 0.0, 255.0);
       e1 = clamp(r1, 0.0, 255.0);
    }
-   ob = best;
+   ob[0] = best.x; ob[1] = best.y; ob[2] = best.z; ob[3] = best.w;
 }
 
 /* ---- BC6H mode 11 ---- */
@@ -847,7 +849,7 @@ void encode_bc6h(bool sgn)
    vec4 chm = vec4(1.0, 1.0, 1.0, 0.0);
    fit_line(0xffffu, chm, e0, e1);
    float best_err = 1e30;
-   uint best[4];
+   uvec4 best = uvec4(0u);
    [[dont_unroll]] for (int pass = 0; pass < 2; pass++) {
       ivec3 q0, q1, u0, u1;
       for (int c = 0; c < 3; c++) {
@@ -891,7 +893,7 @@ void encode_bc6h(bool sgn)
             wbits(uint(b[c]) & 1023u, 10u);
          [[dont_unroll]] for (uint i = 0u; i < 16u; i++)
             wbits(flip ? 15u - idx[i] : idx[i], i == 0u ? 3u : 4u);
-         best = ob;
+         best.x = ob[0]; best.y = ob[1]; best.z = ob[2]; best.w = ob[3];
       }
       vec4 r0, r1;
       if (!refit(0xffffu, wt, chm, r0, r1))
@@ -899,7 +901,7 @@ void encode_bc6h(bool sgn)
       e0 = r0;
       e1 = r1;
    }
-   ob = best;
+   ob[0] = best.x; ob[1] = best.y; ob[2] = best.z; ob[3] = best.w;
 }
 
 void main()
