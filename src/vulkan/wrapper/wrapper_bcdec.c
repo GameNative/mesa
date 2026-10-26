@@ -1014,6 +1014,18 @@ bcn_astc_kind(VkFormat format)
    }
 }
 
+/* Mean squared error per channel of a BC7 block against 16 RGBA8 texels. */
+float
+wrapper_bcn_bc7_mse(const uint8_t blk[16], const uint8_t rgba[64])
+{
+   uint8_t t[64];
+   bcdec_bc7(blk, t, 16);
+   float e = 0.0f;
+   for (int i = 0; i < 64; i++)
+      e += (float)(t[i] - rgba[i]) * (float)(t[i] - rgba[i]);
+   return e / 64.0f;
+}
+
 static void
 astc_bits(uint8_t *o, unsigned pos, unsigned n, uint32_t v)
 {

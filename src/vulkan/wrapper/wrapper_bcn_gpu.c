@@ -904,6 +904,9 @@ bcn_selftest(struct wrapper_device *device, VkQueue queue, uint32_t family)
       at += snprintf(report + at, sizeof(report) - MIN2(at, sizeof(report)), ok ? " %s=ok" :
                      " %s=off(%08x %08x %08x %08x%s)", bcn_slot_names[s], w[0], w[1], w[2], w[3],
                      retry ? ", block encoder next" : "");
+      if (ok && s == BCN_SLOT_ENC_BC7 && at < sizeof(report))
+         at += snprintf(report + at, sizeof(report) - at, " (mse %.1f)",
+                        wrapper_bcn_bc7_mse(o, in[s].map));
       if (ok && s == BCN_SLOT_ASTC4 && device->bcn_slot_group[s] == 8 && at < sizeof(report)) {
          uint32_t dw[4];
          memcpy(dw, o + 16, 16);
