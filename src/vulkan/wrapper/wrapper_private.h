@@ -97,6 +97,7 @@ struct wrapper_device {
    struct hash_table_u64 *fold_set_table;
    struct fold_merge *fold_merges;
    uint32_t fold_max_pool_count;
+   uint32_t fold_set_budget;
    uint32_t max_viewports;
    struct hash_table_u64 *divisor_pipeline_table;
    bool emulate_vertex_divisor;
