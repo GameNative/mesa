@@ -325,6 +325,21 @@ VkResult enumerate_physical_device(struct vk_instance *_instance)
       pdevice->dispatch_table.GetPhysicalDeviceProperties2(
          pdevice->dispatch_handle, &pdevice->properties2);
 
+      /* Only DXVK needs the raised limit; vkd3d-proton works within the real
+       * one. The raised limit is not real storage: DXVK's independent GPL
+       * layouts push 224 bytes and overrun the driver's command buffer. */
+      const char *engine = pdevice->instance->vk.app_info.engine_name;
+      pdevice->raises_push_constant_limit =
+         pdevice->driver_properties.driverID == VK_DRIVER_ID_SAMSUNG_PROPRIETARY &&
+         pdevice->properties2.properties.limits.maxPushConstantsSize < 256 &&
+         !(engine && strstr(engine, "vkd3d"));
+      if (pdevice->raises_push_constant_limit &&
+          pdevice->vk.supported_extensions.EXT_graphics_pipeline_library) {
+         WRAPPER_LOG(info, "Hiding VK_EXT_graphics_pipeline_library: the driver stores only %u bytes of push constants",
+                     pdevice->properties2.properties.limits.maxPushConstantsSize);
+         pdevice->vk.supported_extensions.EXT_graphics_pipeline_library = false;
+      }
+
       /* Raising the reported core version above the base ICD requires
        * substantial lowering. Keep it opt-in and select it from the actual API
        * gap, not from a vendor ID. */
@@ -657,8 +672,7 @@ wrapper_GetPhysicalDeviceProperties(VkPhysicalDevice physicalDevice,
 
    /* See wrapper_GetPhysicalDeviceProperties2: bump push constant size to the
     * DXVK-required minimum on Xclipse. */
-   if (pdevice->driver_properties.driverID == VK_DRIVER_ID_SAMSUNG_PROPRIETARY &&
-       pProperties->limits.maxPushConstantsSize < 256)
+   if (pdevice->raises_push_constant_limit)
       pProperties->limits.maxPushConstantsSize = 256;
 }
 
@@ -729,8 +743,7 @@ wrapper_GetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice,
     * just reports conservatively -- bump it so DXVK proceeds. NOTE: unlike the
     * extension fakes, this is a real driver limit; if the driver enforces it in
     * vkCreatePipelineLayout this will surface as pipeline-creation failures. */
-   if (pdevice->driver_properties.driverID == VK_DRIVER_ID_SAMSUNG_PROPRIETARY &&
-       pProperties->properties.limits.maxPushConstantsSize < 256)
+   if (pdevice->raises_push_constant_limit)
       pProperties->properties.limits.maxPushConstantsSize = 256;
 
    vk_foreach_struct(prop, pProperties->pNext) {

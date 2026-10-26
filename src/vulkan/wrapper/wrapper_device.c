@@ -2714,6 +2714,31 @@ wrapper_DestroyDescriptorSetLayout(VkDevice _device,
       descriptorSetLayout, pAllocator);
 }
 
+VKAPI_ATTR void VKAPI_CALL
+wrapper_CmdPushConstants(VkCommandBuffer commandBuffer, VkPipelineLayout layout,
+                         VkShaderStageFlags stageFlags, uint32_t offset,
+                         uint32_t size, const void *pValues)
+{
+   VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   const struct wrapper_physical_device *pdev = wcb->device->physical;
+
+   if (pdev->raises_push_constant_limit) {
+      uint32_t limit = pdev->properties2.properties.limits.maxPushConstantsSize;
+      if (offset >= limit) {
+         WRAPPER_LOG(error, "Dropping push constants past the driver's %u bytes (offset %u size %u)",
+                     limit, offset, size);
+         return;
+      }
+      if (offset + size > limit) {
+         WRAPPER_LOG(error, "Dropping push constants past the driver's %u bytes (offset %u size %u)",
+                     limit, offset, size);
+         size = limit - offset;
+      }
+   }
+   wcb->device->dispatch_table.CmdPushConstants(wcb->dispatch_handle, layout,
+                                                stageFlags, offset, size, pValues);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 wrapper_CreatePipelineLayout(VkDevice _device,
                             const VkPipelineLayoutCreateInfo *pCreateInfo,
