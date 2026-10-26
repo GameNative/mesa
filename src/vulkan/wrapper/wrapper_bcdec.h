@@ -6,6 +6,10 @@
 VkFormat
 get_format_for_bcn(VkFormat bcn_format);
 
+/* 4x4-class formats are stored decoded from now on (the 4x4 encoder is unusable) */
+void
+wrapper_bcn_store_4x4_decoded(void);
+
 VkFormat
 get_decode_format_for_bcn(VkFormat bcn_format);
 

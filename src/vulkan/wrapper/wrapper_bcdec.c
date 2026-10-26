@@ -448,6 +448,14 @@ get_decode_format_for_bcn(VkFormat bcn_format)
  * BC6H to ASTC 4x4 HDR where the device has it, else unsigned BC6H to
  * B10G11R11 and signed BC6H to RGBA16F. ASTC has no signed formats, so the
  * SNORM BC4/BC5 variants are decoded. */
+static int bcn_astc4_decoded;
+
+void
+wrapper_bcn_store_4x4_decoded(void)
+{
+   __atomic_store_n(&bcn_astc4_decoded, 1, __ATOMIC_RELEASE);
+}
+
 VkFormat
 get_format_for_bcn(VkFormat bcn_format)
 {
@@ -485,6 +493,8 @@ get_format_for_bcn(VkFormat bcn_format)
       if (idx >= 0) {
          int srgb = get_decode_format_for_bcn(bcn_format) == VK_FORMAT_R8G8B8A8_SRGB;
          int b = bcn_astc_edge(idx);
+         if (b == 4 && __atomic_load_n(&bcn_astc4_decoded, __ATOMIC_ACQUIRE))
+            return get_decode_format_for_bcn(bcn_format);
          if (b == 6)
             return srgb ? VK_FORMAT_ASTC_6x6_SRGB_BLOCK : VK_FORMAT_ASTC_6x6_UNORM_BLOCK;
          if (b == 8)
