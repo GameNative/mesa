@@ -507,7 +507,6 @@ bcn_cache_save(struct wrapper_device *device)
    free(data);
 }
 
-#define BCN_BUILD_ATTEMPTS 3
 #define BCN_WAIT_SECONDS 20
 
 static void
@@ -536,13 +535,6 @@ bcn_tools_worker(void *arg)
       clock_gettime(CLOCK_MONOTONIC, &t0);
       VkPipeline p = VK_NULL_HANDLE;
       VkResult r = bcn_build_slot(device, slot, &p);
-      for (int attempt = 1; r != VK_SUCCESS && attempt < BCN_BUILD_ATTEMPTS &&
-                            !__atomic_load_n(&device->bcn_tool_stop, __ATOMIC_RELAXED); attempt++) {
-         wrapper_diag_append("[BCN] GPU shader %s build failed (VkResult %d), attempt %d of %d\n",
-                             bcn_slot_names[slot], r, attempt + 1, BCN_BUILD_ATTEMPTS);
-         usleep(100000 * attempt);
-         r = bcn_build_slot(device, slot, &p);
-      }
       clock_gettime(CLOCK_MONOTONIC, &t1);
       if (r == VK_SUCCESS)
          bcn_cache_save(device);
@@ -1586,7 +1578,7 @@ bcn_upload_cached(struct wrapper_command_buffer *wcb, struct wrapper_image *wi,
    VkFormat format = wi->info.format;
    uint32_t m = c->imageSubresource.mipLevel;
    uint32_t w = c->imageExtent.width, h = c->imageExtent.height;
-   if (!wrapper_bcn_cache_on() || !wb || bcn_layers(wi, &c->imageSubresource) != 1 ||
+   if (!wrapper_bcn_cache_on() || !wb || wb->device_only || bcn_layers(wi, &c->imageSubresource) != 1 ||
        c->imageOffset.x || c->imageOffset.y || c->imageOffset.z ||
        w != MAX2(1u, wi->info.extent.width >> m) || h != MAX2(1u, wi->info.extent.height >> m))
       return false;
@@ -1867,7 +1859,7 @@ wrapper_bcn_gpu_upload(struct wrapper_command_buffer *wcb, struct wrapper_image 
 {
    uint32_t done = 0;
    while (done < count && bcn_gpu_upload_region(wcb, wi, wb, wb->dispatch_handle, layout,
-                                                &regions[done], false))
+                                                &regions[done], wb->device_only))
       done++;
    return done;
 }
