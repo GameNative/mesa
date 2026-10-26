@@ -4794,7 +4794,7 @@ wrapper_lower_int64_module(const VkShaderModuleCreateInfo *info,
          break;
       }
    }
-   WRAPPER_LOG(error, "Refusing shader %.64s (spirv hash %016llx): it uses 64-bit integers "
+   WRAPPER_LOG(info, "Refusing shader %.64s (spirv hash %016llx): it uses 64-bit integers "
                "beyond widening before a float conversion and the driver lacks shaderInt64",
                name, (unsigned long long)hash);
    return VK_ERROR_FEATURE_NOT_PRESENT;
