@@ -750,6 +750,15 @@ wrapper_GetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice,
       switch (prop->sType) {
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_PROPERTIES_EXT:
       {
+         if (pdevice->emulate_vertex_divisor) {
+            ((VkPhysicalDeviceVertexAttributeDivisorPropertiesEXT *)prop)->maxVertexAttribDivisor =
+               UINT32_MAX;
+            break;
+         }
+         /* A driver with only the EXT extension already filled this struct;
+          * its KHR query would come back empty. */
+         if (!pdevice->base_supported_extensions.KHR_vertex_attribute_divisor)
+            break;
          VkPhysicalDeviceVertexAttributeDivisorPropertiesKHR khr_vad = {
             .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_PROPERTIES_KHR,
          };
@@ -760,7 +769,7 @@ wrapper_GetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice,
          pdevice->dispatch_table.GetPhysicalDeviceProperties2(
             pdevice->dispatch_handle, &p2);
          ((VkPhysicalDeviceVertexAttributeDivisorPropertiesEXT *)prop)->maxVertexAttribDivisor =
-            pdevice->emulate_vertex_divisor ? UINT32_MAX : khr_vad.maxVertexAttribDivisor;
+            khr_vad.maxVertexAttribDivisor;
          break;
       }
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_PROPERTIES_KHR:
