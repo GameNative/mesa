@@ -649,8 +649,12 @@ void main()
    [[dont_unroll]] for (uint i = 0u; i < 16u; i++)
       top = max(top, max(orig[i].r, max(orig[i].g, orig[i].b)));
    /* fits with and without the texels far below the brightest one raised:
-    * a channel near zero spans most of the LNS range and pulls the line */
-   [[dont_unroll]] for (uint v = 0u; v < 2u; v++) {
+    * a channel near zero spans most of the LNS range and pulls the line.
+    * Without such texels the second fit is the first one again. */
+   bool raise = false;
+   [[dont_unroll]] for (uint i = 0u; i < 16u; i++)
+      raise = raise || any(lessThan(orig[i], vec3(top - FLOOR_STOPS * 2048.0)));
+   [[dont_unroll]] for (uint v = 0u; v < (raise ? 2u : 1u); v++) {
       float floor_lns = v == 0u ? 0.0 : top - FLOOR_STOPS * 2048.0;
       [[dont_unroll]] for (uint i = 0u; i < 16u; i++)
          tex[i] = max(orig[i], vec3(floor_lns));
