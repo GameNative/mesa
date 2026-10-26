@@ -5164,6 +5164,224 @@ wrapper_lower_int64_module(const VkShaderModuleCreateInfo *info,
    return VK_ERROR_FEATURE_NOT_PRESENT;
 }
 
+
+struct probe_buf { uint32_t *w; size_t n, cap; };
+
+static void
+probe_put(struct probe_buf *b, const uint32_t *w, size_t n)
+{
+   if (b->n + n > b->cap) {
+      b->cap = (b->n + n) * 2 + 64;
+      b->w = realloc(b->w, b->cap * 4);
+   }
+   memcpy(b->w + b->n, w, n * 4);
+   b->n += n;
+}
+
+static void
+probe_op(struct probe_buf *b, uint32_t op, int n, ...)
+{
+   uint32_t w[16];
+   va_list ap;
+   va_start(ap, n);
+   w[0] = ((uint32_t)(n + 1) << 16) | op;
+   for (int i = 0; i < n; i++)
+      w[1 + i] = va_arg(ap, uint32_t);
+   va_end(ap);
+   probe_put(b, w, n + 1);
+}
+
+/* WRAPPER_PROBE_REWRITE bit 1: per-component input-to-output copies;
+ * bit 2: drop the Position output read-back (load, shuffle with constants, store);
+ * bit 4: declare signed-int InstanceIndex/BaseInstance as uint and bitcast the loads. */
+static uint32_t *
+wrapper_probe_rewrite(const uint32_t *code, size_t size, size_t *out_size)
+{
+   static int mode = -1;
+   if (mode < 0)
+      mode = getenv("WRAPPER_PROBE_REWRITE") ? atoi(getenv("WRAPPER_PROBE_REWRITE")) : 0;
+   size_t words = size / 4;
+   if (!mode || words < 5 || (code[2] >> 16) != 18)
+      return NULL;
+
+   uint32_t bound = code[3];
+   uint32_t *storage = calloc(bound, 4), *pointee = calloc(bound, 4), *var_type = calloc(bound, 4);
+   uint32_t *vec_comp = calloc(bound, 4), *vec_n = calloc(bound, 4), *def = calloc(bound, 4);
+   uint32_t *cc_off = calloc(bound, 4);
+   bool vertex = false;
+   uint32_t uint_type = 0;
+   uint8_t *inst_builtin = calloc(bound, 1);
+   size_t first_func = 0;
+   for (size_t o = 5; o < words;) {
+      uint32_t len = code[o] >> 16, op = code[o] & 0xffff;
+      if (!len || o + len > words)
+         goto fail;
+      if (op == 15 && code[o + 1] == 0)
+         vertex = true;
+      if (op == 21 && code[o + 2] == 32 && code[o + 3] == 0)
+         uint_type = code[o + 1];
+      if (op == 71 && len >= 4 && code[o + 2] == 11 && (code[o + 3] == 43 || code[o + 3] == 4425))
+         inst_builtin[code[o + 1]] = 1;
+      if (op == 23) {
+         vec_comp[code[o + 1]] = code[o + 2];
+         vec_n[code[o + 1]] = code[o + 3];
+      }
+      if (op == 32) {
+         storage[code[o + 1]] = code[o + 2];
+         pointee[code[o + 1]] = code[o + 3];
+      }
+      if (op == 59) {
+         var_type[code[o + 2]] = pointee[code[o + 1]];
+         storage[code[o + 2]] = code[o + 3] | 0x80000000u;
+      }
+      if (op == 44)
+         cc_off[code[o + 2]] = (uint32_t)o;
+      if (op == 61 && len >= 4)
+         def[code[o + 2]] = (uint32_t)o;
+      if (op == 54 && !first_func)
+         first_func = o;
+      o += len;
+   }
+   if (!vertex || !first_func)
+      goto fail;
+
+   struct probe_buf out = {0};
+   probe_put(&out, code, 5);
+   uint32_t next = bound;
+   uint32_t ut = uint_type;
+   uint32_t ptr_in[64] = {0}, ptr_out[64] = {0};
+   uint32_t cst[4];
+   uint32_t ptr_in_uint = 0;
+   size_t changed = 0;
+   for (size_t o = 5; o < first_func;) {
+      uint32_t len = code[o] >> 16, op = code[o] & 0xffff;
+      if ((mode & 4) && op == 59 && inst_builtin[code[o + 2]]) {
+         o += len;
+         continue;
+      }
+      probe_put(&out, code + o, len);
+      o += len;
+   }
+   if (!ut) {
+      ut = next++;
+      probe_op(&out, 21, 3, ut, 32, 0);
+   }
+   for (size_t o = 5; (mode & 4) && o < first_func;) {
+      uint32_t len = code[o] >> 16, op = code[o] & 0xffff;
+      if (op == 59 && inst_builtin[code[o + 2]]) {
+         if (!ptr_in_uint) {
+            ptr_in_uint = next++;
+            probe_op(&out, 32, 3, ptr_in_uint, 1, ut);
+         }
+         probe_op(&out, 59, 3, ptr_in_uint, code[o + 2], code[o + 3]);
+         changed++;
+      }
+      o += len;
+   }
+   for (int i = 0; i < 4; i++) {
+      cst[i] = next++;
+      probe_op(&out, 43, 3, ut, cst[i], i);
+   }
+   uint32_t floats[8] = {0}, nf = 0;
+   for (uint32_t id = 0; id < bound && nf < 8; id++) {
+      if (!vec_comp[id])
+         continue;
+      bool seen = false;
+      for (uint32_t k = 0; k < nf; k++)
+         seen |= floats[k] == vec_comp[id];
+      if (!seen) {
+         floats[nf] = vec_comp[id];
+         ptr_in[nf] = next++;
+         ptr_out[nf] = next++;
+         probe_op(&out, 32, 3, ptr_in[nf], 1, floats[nf]);
+         probe_op(&out, 32, 3, ptr_out[nf], 3, floats[nf]);
+         nf++;
+      }
+   }
+   for (size_t o = first_func; o < words;) {
+      uint32_t len = code[o] >> 16, op = code[o] & 0xffff;
+      if ((mode & 4) && ptr_in_uint && op == 61 && len == 4 && inst_builtin[code[o + 3]]) {
+         uint32_t tmp = next++;
+         probe_op(&out, 61, 3, ut, tmp, code[o + 3]);
+         probe_op(&out, 124, 3, code[o + 1], code[o + 2], tmp);
+         changed++;
+         o += len;
+         continue;
+      }
+      if ((mode & 1) && op == 62 && len == 3) {
+         uint32_t dst = code[o + 1], val = code[o + 2];
+         uint32_t ld = def[val];
+         if ((storage[dst] & 0x80000000u) && (storage[dst] & 0xffff) == 3 && ld &&
+             (storage[code[ld + 3]] & 0x80000000u) && (storage[code[ld + 3]] & 0xffff) == 1 &&
+             vec_n[var_type[dst]]) {
+            uint32_t comp = vec_comp[var_type[dst]], k = 0;
+            while (k < nf && floats[k] != comp)
+               k++;
+            uint32_t src = code[ld + 3];
+            for (uint32_t c = 0; c < vec_n[var_type[dst]] && c < 4 && k < nf; c++) {
+               uint32_t pi = next++, li = next++, po = next++;
+               probe_op(&out, 65, 4, ptr_in[k], pi, src, cst[c]);
+               probe_op(&out, 61, 3, comp, li, pi);
+               probe_op(&out, 65, 4, ptr_out[k], po, dst, cst[c]);
+               probe_op(&out, 62, 2, po, li);
+            }
+            changed++;
+            o += len;
+            continue;
+         }
+      }
+      if ((mode & 2) && op == 61 && len == 4 && (storage[code[o + 3]] & 0x80000000u) &&
+          (storage[code[o + 3]] & 0xffff) == 3) {
+         uint32_t var = code[o + 3], ld_id = code[o + 2];
+         size_t sh = o + len;
+         uint32_t shl = code[sh] >> 16;
+         size_t st = sh + shl;
+         if (sh < words && (code[sh] & 0xffff) == 79 && code[sh + 3] == ld_id && cc_off[code[sh + 4]] &&
+             st < words && (code[st] & 0xffff) == 62 && code[st + 1] == var && code[st + 2] == code[sh + 2]) {
+            uint32_t n = shl - 5, cc = cc_off[code[sh + 4]];
+            uint32_t comp = vec_comp[var_type[var]], k = 0;
+            while (k < nf && floats[k] != comp)
+               k++;
+            bool ok = k < nf;
+            for (uint32_t c = 0; c < n && ok; c++) {
+               uint32_t idx = code[sh + 5 + c];
+               if (idx < n && idx != c)
+                  ok = false;
+            }
+            if (ok) {
+               for (uint32_t c = 0; c < n && c < 4; c++) {
+                  uint32_t idx = code[sh + 5 + c];
+                  if (idx < n)
+                     continue;
+                  uint32_t po = next++;
+                  probe_op(&out, 65, 4, ptr_out[k], po, var, cst[c]);
+                  probe_op(&out, 62, 2, po, code[cc + 3 + (idx - n)]);
+               }
+               changed++;
+               o = st + (code[st] >> 16);
+               continue;
+            }
+         }
+      }
+      probe_put(&out, code + o, len);
+      o += len;
+   }
+   free(storage); free(pointee); free(var_type); free(vec_comp); free(vec_n); free(def); free(cc_off);
+   free(inst_builtin);
+   if (!changed) {
+      free(out.w);
+      return NULL;
+   }
+   out.w[3] = next;
+   WRAPPER_LOG(info, "PROBE rewrite mode %d changed %zu sites", mode, changed);
+   *out_size = out.n * 4;
+   return out.w;
+fail:
+   free(storage); free(pointee); free(var_type); free(vec_comp); free(vec_n); free(def); free(cc_off);
+   free(inst_builtin);
+   return NULL;
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 wrapper_CreateShaderModule(VkDevice _device,
 						   const VkShaderModuleCreateInfo *pCreateInfo,
@@ -5192,6 +5410,12 @@ wrapper_CreateShaderModule(VkDevice _device,
    uint32_t *patched = wrapper_patch_spirv(device, create_info.pCode, &create_info.codeSize);
    if (patched)
       create_info.pCode = patched;
+   size_t rw_size = 0;
+   uint32_t *rewritten = wrapper_probe_rewrite(create_info.pCode, create_info.codeSize, &rw_size);
+   if (rewritten) {
+      create_info.pCode = rewritten;
+      create_info.codeSize = rw_size;
+   }
 
    if (WRAPPER_LOG_LEVEL(shader))
       dump_shader_code(create_info.pCode, create_info.codeSize);
@@ -5204,6 +5428,7 @@ wrapper_CreateShaderModule(VkDevice _device,
    free(patched);
    free(lowered);
    free(int64_code);
+   free(rewritten);
    return result;
 }
 
