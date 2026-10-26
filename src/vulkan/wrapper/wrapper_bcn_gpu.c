@@ -965,8 +965,15 @@ wrapper_bcn_gpu_submit(struct wrapper_queue *queue)
 {
    struct wrapper_device *device = queue->device;
    if (!__atomic_load_n(&device->bcn_tool_untested, __ATOMIC_ACQUIRE) ||
-       queue->vk.queue_family_index != device->bcn_tool_family)
+       queue->vk.queue_family_index != device->bcn_tool_family) {
+      /* a test running on another queue fills gated counts before this
+       * submit's work can read them */
+      if (__atomic_load_n(&device->bcn_gate_pending_count, __ATOMIC_ACQUIRE)) {
+         simple_mtx_lock(&device->bcn_gpu_mutex);
+         simple_mtx_unlock(&device->bcn_gpu_mutex);
+      }
       return;
+   }
    simple_mtx_lock(&device->bcn_gpu_mutex);
    bcn_selftest(device, queue->dispatch_handle, device->bcn_tool_family);
    simple_mtx_unlock(&device->bcn_gpu_mutex);
@@ -1125,17 +1132,22 @@ bcn_gate_create(struct wrapper_device *device)
    return true;
 }
 
-/* Counts of the gated dispatches whose pipeline has passed its self-test; the
- * others stay zero. Called with bcn_gpu_mutex held, after a self-test. */
+/* Counts of the gated dispatches whose pipeline has passed its self-test.
+ * Those of a failed pipeline stay zero; those of a pipeline not tested yet
+ * wait for a later test. Called with bcn_gpu_mutex held, after a self-test. */
 static void
 bcn_gate_resolve(struct wrapper_device *device)
 {
+   uint32_t kept = 0;
    for (uint32_t i = 0; i < device->bcn_gate_pending_count; i++) {
       uint32_t *p = device->bcn_gate_pending[i];
-      if (__atomic_load_n(&device->bcn_slot_state[p[1]], __ATOMIC_ACQUIRE) == BCN_TESTED)
+      int st = __atomic_load_n(&device->bcn_slot_state[p[1]], __ATOMIC_ACQUIRE);
+      if (st == BCN_TESTED)
          memcpy(device->bcn_gate_map + p[0] * 3, p + 2, 3 * sizeof(uint32_t));
+      else if (st != BCN_FAILED)
+         memmove(device->bcn_gate_pending[kept++], p, 5 * sizeof(uint32_t));
    }
-   device->bcn_gate_pending_count = 0;
+   device->bcn_gate_pending_count = kept;
 }
 
 static void
