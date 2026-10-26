@@ -270,11 +270,17 @@ bcn_transient_image(struct wrapper_command_buffer *wcb, VkFormat format, uint32_
    return b->bcn_image;
 }
 
+static const char *const bcn_slot_names[BCN_SLOT_COUNT] = {
+   "decode", "astc4x4", "astc6x6", "astc8x8", "astc-hdr", "bc1-5-encode", "bc6h-encode",
+   "bc7-encode",
+};
+
 struct bcn_selftest_buf {
    VkBuffer buffer;
    VkDeviceMemory memory;
    VkDeviceAddress address;
    void *map;
+   bool coherent;
 };
 
 static bool
@@ -300,14 +306,32 @@ bcn_selftest_buffer(struct wrapper_device *device, VkDeviceSize size,
       .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
       .pNext = &flags,
       .allocationSize = mr.size,
-      .memoryTypeIndex = bcn_memory_type(device, mr.memoryTypeBits,
-         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
+      .memoryTypeIndex = UINT32_MAX,
    };
+   const VkPhysicalDeviceMemoryProperties *props = &device->physical->memory_properties;
+   static const VkMemoryPropertyFlags pref[3] = {
+      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+         VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
+   };
+   const VkMemoryPropertyFlags skip = VK_MEMORY_PROPERTY_PROTECTED_BIT |
+      VK_MEMORY_PROPERTY_DEVICE_COHERENT_BIT_AMD | VK_MEMORY_PROPERTY_DEVICE_UNCACHED_BIT_AMD;
+   for (int p = 0; p < 3 && ai.memoryTypeIndex == UINT32_MAX; p++)
+      for (uint32_t i = 0; i < props->memoryTypeCount && ai.memoryTypeIndex == UINT32_MAX; i++) {
+         VkMemoryPropertyFlags f = props->memoryTypes[i].propertyFlags;
+         if ((mr.memoryTypeBits & (1u << i)) && (f & pref[p]) == pref[p] && !(f & skip))
+            ai.memoryTypeIndex = i;
+      }
    if (ai.memoryTypeIndex == UINT32_MAX ||
        device->dispatch_table.AllocateMemory(device->dispatch_handle, &ai, NULL,
                                              &b->memory) != VK_SUCCESS)
       return false;
-   device->dispatch_table.BindBufferMemory(device->dispatch_handle, b->buffer, b->memory, 0);
+   b->coherent = props->memoryTypes[ai.memoryTypeIndex].propertyFlags &
+                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+   if (device->dispatch_table.BindBufferMemory(device->dispatch_handle, b->buffer, b->memory,
+                                               0) != VK_SUCCESS)
+      return false;
    if (device->dispatch_table.MapMemory(device->dispatch_handle, b->memory, 0, VK_WHOLE_SIZE,
                                         0, &b->map) != VK_SUCCESS)
       return false;
@@ -318,6 +342,51 @@ bcn_selftest_buffer(struct wrapper_device *device, VkDeviceSize size,
    };
    b->address = device->dispatch_table.GetBufferDeviceAddress(device->dispatch_handle, &dai);
    return true;
+}
+
+static void
+bcn_selftest_sync(struct wrapper_device *device, const struct bcn_selftest_buf *b,
+                  const int *todo, int n, bool flush, bool all)
+{
+   VkMappedMemoryRange r[BCN_SLOT_COUNT];
+   uint32_t c = 0;
+   for (int k = 0; k < n; k++)
+      if (b[todo[k]].map && (all || !b[todo[k]].coherent))
+         r[c++] = (VkMappedMemoryRange) {
+            .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+            .memory = b[todo[k]].memory,
+            .size = VK_WHOLE_SIZE,
+         };
+   if (!c)
+      return;
+   if (flush)
+      device->dispatch_table.FlushMappedMemoryRanges(device->dispatch_handle, c, r);
+   else
+      device->dispatch_table.InvalidateMappedMemoryRanges(device->dispatch_handle, c, r);
+}
+
+static uint32_t
+bcn_selftest_zero(const struct bcn_selftest_buf *out, const int *todo, int n)
+{
+   uint32_t mask = 0;
+   for (int k = 0; k < n; k++) {
+      static const uint8_t zero[16];
+      if (!memcmp(out[todo[k]].map, zero, sizeof(zero)))
+         mask |= 1u << todo[k];
+   }
+   return mask;
+}
+
+static size_t
+bcn_selftest_names(char *s, size_t size, uint32_t mask)
+{
+   size_t at = 0;
+   for (int i = 0; i < BCN_SLOT_COUNT; i++)
+      if ((mask & (1u << i)) && at < size)
+         at += snprintf(s + at, size - at, " %s", bcn_slot_names[i]);
+   if (!mask && size)
+      at = snprintf(s, size, " none");
+   return MIN2(at, size ? size - 1 : 0);
 }
 
 static void
@@ -352,11 +421,6 @@ bcn_selftest_push(struct wrapper_device *device, VkCommandBuffer cb, VkPipeline 
  * buffer recorded before the check may use it). */
 
 #define BCN_CACHE_DIR "/data/data/app.gamenative/files/imagefs/usr/cache"
-
-static const char *const bcn_slot_names[BCN_SLOT_COUNT] = {
-   "decode", "astc4x4", "astc6x6", "astc8x8", "astc-hdr", "bc1-5-encode", "bc6h-encode",
-   "bc7-encode",
-};
 
 static VkResult
 bcn_create_pipeline_specs(struct wrapper_device *device, const uint32_t *code, size_t size,
@@ -857,6 +921,29 @@ bcn_direct_enabled(void)
    return !e || strcmp(e, "0");
 }
 
+static VkResult
+bcn_selftest_run(struct wrapper_device *device, VkQueue queue, VkCommandBuffer cb,
+                 VkFence fence)
+{
+   VkSubmitInfo si = {
+      .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+      .commandBufferCount = 1,
+      .pCommandBuffers = &cb,
+   };
+   VkResult r = device->dispatch_table.QueueSubmit(queue, 1, &si, fence);
+   if (r != VK_SUCCESS)
+      return r;
+   r = device->dispatch_table.WaitForFences(device->dispatch_handle, 1, &fence, VK_TRUE,
+                                            2000000000ull);
+   if (r == VK_TIMEOUT) {
+      wrapper_diag_append("[BCN] GPU self-test fence not signalled after 2 s, waiting up to %d s "
+                          "more\n", BCN_WAIT_SECONDS);
+      r = device->dispatch_table.WaitForFences(device->dispatch_handle, 1, &fence, VK_TRUE,
+                                               BCN_WAIT_SECONDS * 1000000000ull);
+   }
+   return r;
+}
+
 /* Runs each pipeline built since the last check once on a known input and
  * checks the result on the CPU. WRAPPER_BCN_GPU_FAIL=decode,astc,hdr,bc drops
  * them on purpose. */
@@ -880,7 +967,7 @@ bcn_selftest(struct wrapper_device *device, VkQueue queue, uint32_t family)
    VkCommandPool pool = VK_NULL_HANDLE;
    VkCommandBuffer cb = VK_NULL_HANDLE;
    VkFence fence = VK_NULL_HANDLE;
-   bool ran = false;
+   bool ran = false, busy = false;
    VkCommandPoolCreateInfo cpci = {
       .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
       .queueFamilyIndex = family,
@@ -905,7 +992,6 @@ bcn_selftest(struct wrapper_device *device, VkQueue queue, uint32_t family)
           VK_SUCCESS) {
       VkCommandBufferBeginInfo bi = {
          .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
       };
       device->dispatch_table.BeginCommandBuffer(cb, &bi);
       for (int k = 0; k < n; k++) {
@@ -1023,14 +1109,36 @@ bcn_selftest(struct wrapper_device *device, VkQueue queue, uint32_t family)
       device->dispatch_table.CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
          VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
       device->dispatch_table.EndCommandBuffer(cb);
-      VkSubmitInfo si = {
-         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-         .commandBufferCount = 1,
-         .pCommandBuffers = &cb,
-      };
-      ran = device->dispatch_table.QueueSubmit(queue, 1, &si, fence) == VK_SUCCESS &&
-            device->dispatch_table.WaitForFences(device->dispatch_handle, 1, &fence, VK_TRUE,
-                                                 2000000000ull) == VK_SUCCESS;
+      bcn_selftest_sync(device, in, todo, n, true, false);
+      VkResult r = bcn_selftest_run(device, queue, cb, fence);
+      busy = r == VK_TIMEOUT;
+      ran = r == VK_SUCCESS;
+      if (ran) {
+         bcn_selftest_sync(device, out, todo, n, false, false);
+         uint32_t zero = bcn_selftest_zero(out, todo, n), stale = 0, again = 0;
+         if (zero) {
+            bcn_selftest_sync(device, out, todo, n, false, true);
+            stale = bcn_selftest_zero(out, todo, n);
+            again = stale;
+            if (stale &&
+                device->dispatch_table.ResetFences(device->dispatch_handle, 1, &fence) ==
+                   VK_SUCCESS) {
+               r = bcn_selftest_run(device, queue, cb, fence);
+               busy = r == VK_TIMEOUT;
+               ran = r == VK_SUCCESS;
+               if (ran) {
+                  bcn_selftest_sync(device, out, todo, n, false, true);
+                  again = bcn_selftest_zero(out, todo, n);
+               }
+            }
+            char a[96], b[96], c[96];
+            bcn_selftest_names(a, sizeof(a), zero);
+            bcn_selftest_names(b, sizeof(b), stale);
+            bcn_selftest_names(c, sizeof(c), again);
+            wrapper_diag_append("[BCN] GPU self-test zero blocks from%s; after invalidate%s; "
+                                "after a second run%s (VkResult %d)\n", a, b, c, r);
+         }
+      }
    }
    clock_gettime(CLOCK_MONOTONIC, &t1);
    char report[768];
@@ -1146,6 +1254,8 @@ bcn_selftest(struct wrapper_device *device, VkQueue queue, uint32_t family)
    wrapper_diag_append("[BCN] GPU self-test ran=%d%s (%.0f ms)\n", ran, report,
                        (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6);
 
+   if (busy)
+      return;
    if (fence)
       device->dispatch_table.DestroyFence(device->dispatch_handle, fence, NULL);
    if (pool)
