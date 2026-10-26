@@ -120,6 +120,7 @@ wrapper_files = files(
   'wrapper_bcdec.c',
   'wrapper_bcn_gpu.c',
   'wrapper_bcn_hq.c',
+  'wrapper_bcn_cache.c',
   'wrapper_log.c',
   'wrapper_physical_device.c',
 )

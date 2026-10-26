@@ -197,6 +197,44 @@ bcn_transient_buffer(struct wrapper_command_buffer *wcb, VkDeviceSize size,
    return b;
 }
 
+/* A mapped host-visible buffer, freed with the command buffer. */
+static struct wrapper_buffer *
+bcn_transient_host_buffer(struct wrapper_command_buffer *wcb, VkDeviceSize size, void **map)
+{
+   struct wrapper_device *device = wcb->device;
+   struct wrapper_buffer *b = bcn_transient(wcb);
+   if (!b)
+      return NULL;
+   VkBufferCreateInfo bci = {
+      .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+      .size = size,
+      .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+      .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+   };
+   if (device->dispatch_table.CreateBuffer(device->dispatch_handle, &bci, NULL,
+                                           &b->dispatch_handle) != VK_SUCCESS)
+      return NULL;
+   VkMemoryRequirements mr;
+   device->dispatch_table.GetBufferMemoryRequirements(device->dispatch_handle,
+                                                      b->dispatch_handle, &mr);
+   VkMemoryAllocateInfo ai = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      .allocationSize = mr.size,
+      .memoryTypeIndex = bcn_memory_type(device, mr.memoryTypeBits,
+         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
+   };
+   if (ai.memoryTypeIndex == UINT32_MAX ||
+       device->dispatch_table.AllocateMemory(device->dispatch_handle, &ai, NULL,
+                                             &b->memory) != VK_SUCCESS ||
+       device->dispatch_table.BindBufferMemory(device->dispatch_handle, b->dispatch_handle,
+                                               b->memory, 0) != VK_SUCCESS ||
+       device->dispatch_table.MapMemory(device->dispatch_handle, b->memory, 0, VK_WHOLE_SIZE,
+                                        0, map) != VK_SUCCESS)
+      return NULL;
+   b->size = size;
+   return b;
+}
+
 /* A 2D image (array) for unpacked texels, freed with the command buffer. */
 static VkImage
 bcn_transient_image(struct wrapper_command_buffer *wcb, VkFormat format, uint32_t w,
@@ -1499,6 +1537,61 @@ wrapper_bcn_gpu_misaligned(const struct wrapper_image *wi, const VkBufferImageCo
           ((h % astc) && c->imageOffset.y + h != lh);
 }
 
+/* A whole-level upload with an entry in the disk cache: the cached blocks go
+ * straight into the image. */
+static bool
+bcn_upload_cached(struct wrapper_command_buffer *wcb, struct wrapper_image *wi,
+                  struct wrapper_buffer *wb, VkImageLayout layout, const VkBufferImageCopy *c,
+                  VkFormat stored, uint32_t astc)
+{
+   struct wrapper_device *device = wcb->device;
+   VkFormat format = wi->info.format;
+   uint32_t m = c->imageSubresource.mipLevel;
+   uint32_t w = c->imageExtent.width, h = c->imageExtent.height;
+   if (!wrapper_bcn_cache_on() || !wb || bcn_layers(wi, &c->imageSubresource) != 1 ||
+       c->imageOffset.x || c->imageOffset.y || c->imageOffset.z ||
+       w != MAX2(1u, wi->info.extent.width >> m) || h != MAX2(1u, wi->info.extent.height >> m))
+      return false;
+   uint32_t bb = bcn_block_bytes(format), nby = (h + 3) / 4;
+   size_t row = (size_t)((w + 3) / 4) * bb;
+   size_t stride = (size_t)(((c->bufferRowLength ? c->bufferRowLength : w) + 3) / 4) * bb;
+   size_t len = (size_t)((w + astc - 1) / astc) * ((h + astc - 1) / astc) * 16;
+   simple_mtx_lock(&device->resource_mutex);
+   if (!wb->is_mapped) {
+      if (device->dispatch_table.MapMemory(device->dispatch_handle, wb->memory, wb->offset,
+                                           wb->size, 0, &wb->mapped_address) != VK_SUCCESS) {
+         simple_mtx_unlock(&device->resource_mutex);
+         return false;
+      }
+      wb->is_mapped = 1;
+   }
+   bool inside = c->bufferOffset + stride * (nby - 1) + row <= wb->size;
+   simple_mtx_unlock(&device->resource_mutex);
+   void *map = NULL;
+   struct wrapper_buffer *t = NULL;
+   uint8_t *blocks = inside ? malloc(len) : NULL;
+   bool hit = blocks && wrapper_bcn_cache_load(format, stored, w, h,
+      (const uint8_t *)wb->mapped_address + c->bufferOffset, row, stride, nby, blocks, len) &&
+      (t = bcn_transient_host_buffer(wcb, len, &map));
+   if (hit) {
+      memcpy(map, blocks, len);
+      VkBufferImageCopy copy = {
+         .bufferRowLength = (w + astc - 1) / astc * astc,
+         .bufferImageHeight = (h + astc - 1) / astc * astc,
+         .imageSubresource = c->imageSubresource,
+         .imageExtent = c->imageExtent,
+      };
+      copy.imageSubresource.layerCount = 1;
+      bcn_barrier(wcb);
+      device->dispatch_table.CmdCopyBufferToImage(wcb->dispatch_handle, t->dispatch_handle,
+                                                  wi->dispatch_handle, layout, 1, &copy);
+      wrapper_bcn_hq_write(device, wi, &copy.imageSubresource, copy.imageOffset,
+                           copy.imageExtent);
+   }
+   free(blocks);
+   return hit;
+}
+
 /* GPU upload of one region: the blocks are copied out of the application's
  * buffer, decoded, and either copied in as decoded texels or encoded to ASTC
  * first. A region that does not cover whole ASTC blocks is merged into the
@@ -1531,6 +1624,8 @@ bcn_gpu_upload_region(struct wrapper_command_buffer *wcb, struct wrapper_image *
                         VK_NULL_HANDLE;
    if (!decoder || (astc && !encoder))
       return false;
+   if (astc && bcn_upload_cached(wcb, wi, wb, layout, c, stored, astc))
+      return true;
    bool merge = astc && wrapper_bcn_gpu_misaligned(wi, c);
    /* the rectangle written: the region, or the ASTC blocks covering it */
    uint32_t x0 = c->imageOffset.x, y0 = c->imageOffset.y, ew = w, eh = h;

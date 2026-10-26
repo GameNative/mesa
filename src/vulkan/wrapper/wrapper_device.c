@@ -5211,6 +5211,7 @@ wrapper_DestroyDevice(VkDevice _device, const VkAllocationCallbacks* pAllocator)
    }
    if (device->dispatch_handle != VK_NULL_HANDLE) {
       wrapper_bcn_hq_finish(device);
+      wrapper_bcn_cache_report();
       wrapper_bcn_gpu_finish(device);
       device->dispatch_table.DestroyDevice(device->
          dispatch_handle, pAllocator);
