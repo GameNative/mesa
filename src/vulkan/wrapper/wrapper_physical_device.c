@@ -491,6 +491,15 @@ VkResult enumerate_physical_device(struct vk_instance *_instance)
          }
       }
 
+      if (strstr(engine_name, "vkd3d") && pdevice->emulate_vulkan13 &&
+          !pdevice->base_supported_features.shaderInt64 &&
+          debug_get_bool_option("WRAPPER_FAKE_SHADER_INT64", true)) {
+         WRAPPER_LOG(info, "Faking shaderInt64 for vkd3d; 64-bit widening before a float "
+                     "conversion is lowered, other 64-bit integer shaders are refused");
+         supported_features->shaderInt64 = true;
+         pdevice->lower_int64 = true;
+      }
+
       /* VK_KHR_push_descriptor: vkd3d/DXVK effectively require it, but some
        * drivers (e.g. Mali r44) don't expose it. Advertise + emulate it for D3D
        * clients whose base driver lacks it. maxPushDescriptors is reported in

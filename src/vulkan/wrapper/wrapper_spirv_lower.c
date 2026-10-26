@@ -8,6 +8,9 @@
 #ifndef MAX
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #endif
+#ifndef MIN
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
+#endif
 
 #define SPV_MAGIC 0x07230203u
 #define SPV_1_3 0x00010300u
@@ -531,6 +534,151 @@ wrapper_spirv_lower_to_1_3(const uint32_t *in, size_t words, uint32_t flags,
       return WRAPPER_SPIRV_FAILED;
    }
    b.d[3] = info.next_id;
+   *out_code = b.d;
+   *out_words = b.n;
+   return WRAPPER_SPIRV_LOWERED;
+}
+
+enum {
+   OP_SOURCE = 3,
+   OP_SOURCE_EXTENSION = 4,
+   OP_NAME = 5,
+   OP_MEMBER_NAME = 6,
+   OP_STRING = 7,
+   OP_LINE = 8,
+   OP_TYPE_INT = 21,
+   OP_CONVERT_S_TO_F = 111,
+   OP_CONVERT_U_TO_F = 112,
+   OP_U_CONVERT = 113,
+   OP_S_CONVERT = 114,
+   OP_MODULE_PROCESSED = 330,
+   CAP_INT64 = 11,
+};
+
+enum { K_I64_TYPE = 1, K_UCONV, K_SCONV };
+
+static bool
+int64_debug_op(uint32_t op)
+{
+   return op == OP_SOURCE || op == OP_SOURCE_EXTENSION || op == OP_NAME ||
+          op == OP_MEMBER_NAME || op == OP_STRING || op == OP_LINE ||
+          op == OP_MODULE_PROCESSED || op == OP_DECORATE || op == OP_MEMBER_DECORATE ||
+          op == OP_CAPABILITY || op == OP_EXTENSION || op == OP_EXT_INST_IMPORT ||
+          op == OP_ENTRY_POINT || op == OP_EXECUTION_MODE || op == OP_MEMORY_MODEL;
+}
+
+static bool
+int64_is_float_use(const uint32_t *w, const uint8_t *kind, uint32_t bound)
+{
+   uint32_t op = w[0] & 0xffff;
+   return (op == OP_CONVERT_U_TO_F || op == OP_CONVERT_S_TO_F) && (w[0] >> 16) == 4 &&
+          w[3] < bound && (kind[w[3]] == K_UCONV || kind[w[3]] == K_SCONV);
+}
+
+static bool
+int64_is_widen(const uint32_t *w, const uint8_t *kind, uint32_t bound)
+{
+   uint32_t op = w[0] & 0xffff;
+   return (op == OP_U_CONVERT || op == OP_S_CONVERT) && (w[0] >> 16) == 4 &&
+          w[2] < bound && (kind[w[2]] == K_UCONV || kind[w[2]] == K_SCONV);
+}
+
+enum wrapper_spirv_lower_result
+wrapper_spirv_lower_int64(const uint32_t *in, size_t words,
+                          uint32_t **out_code, size_t *out_words)
+{
+   if (words < 5 || in[0] != SPV_MAGIC)
+      return WRAPPER_SPIRV_UNCHANGED;
+
+   bool has_cap = false;
+   for (size_t i = 5; i < words && (in[i] >> 16);) {
+      if ((in[i] & 0xffff) == OP_CAPABILITY && in[i + 1] == CAP_INT64)
+         has_cap = true;
+      i += in[i] >> 16;
+   }
+   if (!has_cap)
+      return WRAPPER_SPIRV_UNCHANGED;
+
+   uint32_t bound = in[3];
+   uint8_t *kind = calloc(bound, 1);
+   uint32_t *source = calloc(bound, sizeof(uint32_t));
+   bool ok = kind && source;
+
+   for (size_t i = 5; ok && i < words;) {
+      uint32_t len = in[i] >> 16, op = in[i] & 0xffff;
+      if (!len || i + len > words) {
+         ok = false;
+         break;
+      }
+      if (op == OP_TYPE_INT && len == 4 && in[i + 1] < bound && in[i + 2] == 64)
+         kind[in[i + 1]] = K_I64_TYPE;
+      i += len;
+   }
+
+   for (size_t i = 5; ok && i < words; i += in[i] >> 16) {
+      uint32_t len = in[i] >> 16, op = in[i] & 0xffff;
+      if ((op == OP_U_CONVERT || op == OP_S_CONVERT) && len == 4 &&
+          in[i + 1] < bound && kind[in[i + 1]] == K_I64_TYPE && in[i + 2] < bound &&
+          in[i + 3] < bound && !kind[in[i + 3]]) {
+         kind[in[i + 2]] = op == OP_U_CONVERT ? K_UCONV : K_SCONV;
+         source[in[i + 2]] = in[i + 3];
+      }
+   }
+
+   for (size_t i = 5; ok && i < words; i += in[i] >> 16) {
+      uint32_t len = in[i] >> 16, op = in[i] & 0xffff;
+      if (int64_debug_op(op) || int64_is_widen(&in[i], kind, bound))
+         continue;
+      if (op == OP_TYPE_INT && in[i + 1] < bound && kind[in[i + 1]] == K_I64_TYPE)
+         continue;
+      if (int64_is_float_use(&in[i], kind, bound)) {
+         if (kind[in[i + 3]] == K_SCONV && op == OP_CONVERT_U_TO_F)
+            ok = false;
+         continue;
+      }
+      if (op == OP_TYPE_INT || op == 22)
+         continue;
+      uint32_t last = len;
+      if (op == OP_CONSTANT || op == 23)
+         last = 3;
+      else if (op == 81)
+         last = MIN(len, 4);
+      else if (op == 79 || op == 82)
+         last = MIN(len, 5);
+      for (uint32_t k = 1; k < last && ok; k++)
+         if (!(op == OP_VARIABLE && k == 3) && in[i + k] < bound && kind[in[i + k]])
+            ok = false;
+   }
+
+   struct spv_buf b = {0};
+   if (ok) {
+      buf_put(&b, in, 5);
+      for (size_t i = 5; i < words; i += in[i] >> 16) {
+         uint32_t len = in[i] >> 16, op = in[i] & 0xffff;
+         if (op == OP_CAPABILITY && in[i + 1] == CAP_INT64)
+            continue;
+         if ((op == OP_TYPE_INT || op == OP_NAME || op == OP_DECORATE) &&
+             in[i + 1] < bound && kind[in[i + 1]])
+            continue;
+         if (int64_is_widen(&in[i], kind, bound))
+            continue;
+         if (int64_is_float_use(&in[i], kind, bound)) {
+            uint32_t w[4] = {
+               (4u << 16) | (kind[in[i + 3]] == K_UCONV ? OP_CONVERT_U_TO_F : OP_CONVERT_S_TO_F),
+               in[i + 1], in[i + 2], source[in[i + 3]],
+            };
+            buf_put(&b, w, 4);
+            continue;
+         }
+         buf_put(&b, &in[i], len);
+      }
+   }
+   free(kind);
+   free(source);
+   if (!ok || b.oom) {
+      free(b.d);
+      return WRAPPER_SPIRV_FAILED;
+   }
    *out_code = b.d;
    *out_words = b.n;
    return WRAPPER_SPIRV_LOWERED;

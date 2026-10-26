@@ -79,6 +79,12 @@ wrapper_fold_init(struct wrapper_device *device)
    device->fold_layout_table = _mesa_hash_table_u64_create(NULL);
    device->fold_pl_table = _mesa_hash_table_u64_create(NULL);
    device->fold_set_table = _mesa_hash_table_u64_create(NULL);
+   device->fold_set_budget = debug_get_num_option("WRAPPER_FOLD_SET_BUDGET", 65536);
+   uint32_t v = device->physical->properties2.properties.driverVersion;
+   WRAPPER_LOG(info, "Folded descriptor set budget %u descriptors (driver %u.%u.%u); "
+               "descriptors at a set offset above it read as zero on Mali r26",
+               device->fold_set_budget, VK_VERSION_MAJOR(v), VK_VERSION_MINOR(v),
+               VK_VERSION_PATCH(v));
 }
 
 void
@@ -167,6 +173,19 @@ fold_class_mask(VkDescriptorType type)
 }
 
 static uint32_t
+fold_weight(VkDescriptorType type)
+{
+   switch (type) {
+   case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+      return 4;
+   case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+      return 3;
+   default:
+      return 1;
+   }
+}
+
+static uint32_t
 fold_binding_cap(const uint32_t *class_cap, uint32_t resource_cap, VkDescriptorType type)
 {
    uint32_t cap = resource_cap;
@@ -226,6 +245,14 @@ fold_merge_get(struct wrapper_device *device, const VkDescriptorSetLayout *handl
    }
    uint64_t resources = p->maxPerStageUpdateAfterBindResources;
    uint32_t resource_cap = resources > small_total ? (resources - small_total) / count : 1;
+   uint64_t budget = device->fold_set_budget;
+   uint64_t room = budget > small_total ? budget - small_total : count;
+   uint32_t weight_sum = 0;
+   for (uint32_t k = 0; k < count; k++) {
+      struct fold_layout *l = fold_layout_lookup(device, handles[k]);
+      if (l->variable_binding < l->binding_count)
+         weight_sum += fold_weight(l->bindings[l->variable_binding].vk.descriptorType);
+   }
    uint32_t class_cap[FOLD_CLASS_COUNT];
    for (uint32_t c = 0; c < FOLD_CLASS_COUNT; c++) {
       uint64_t room = limits[c] > small[c] ? limits[c] - small[c] : 0;
@@ -261,7 +288,10 @@ fold_merge_get(struct wrapper_device *device, const VkDescriptorSetLayout *handl
          VkDescriptorBindingFlags bf = l->bindings[b].flags;
          vb.binding += base;
          if (b == l->variable_binding) {
-            uint32_t cap = fold_binding_cap(class_cap, resource_cap, vb.descriptorType);
+            uint32_t share = (uint32_t)MAX2(room * fold_weight(vb.descriptorType) /
+                                            MAX2(weight_sum, 1), 1);
+            uint32_t cap = fold_binding_cap(class_cap, MIN2(resource_cap, share),
+                                            vb.descriptorType);
             vb.descriptorCount = MIN2(vb.descriptorCount, cap);
             if (last) {
                m->declared_variable = vb.descriptorCount;
@@ -298,9 +328,9 @@ fold_merge_get(struct wrapper_device *device, const VkDescriptorSetLayout *handl
                                                                  &ci, NULL, &m->merged);
    if (r != VK_SUCCESS)
       m->merged = VK_NULL_HANDLE;
-   WRAPPER_LOG(info, "Folded %u bindless set layouts into one: %u bindings, per-stage resource "
-               "cap %u per array (largest view heap seen %u), %llu fixed descriptors, result %d",
-               count, n, resource_cap, device->fold_max_pool_count, (unsigned long long)total, r);
+   WRAPPER_LOG(info, "Folded %u bindless set layouts into one: %u bindings, set budget %u, "
+               "%llu fixed descriptors, result %d",
+               count, n, device->fold_set_budget, (unsigned long long)total, r);
    return m->merged ? m : NULL;
 }
 
@@ -619,7 +649,14 @@ fold_instance_create(struct wrapper_device *device, struct fold_merge *m,
          uint32_t count = l->bindings[b].vk.descriptorCount;
          if (b == l->variable_binding)
             count = fsets[k]->variable_count;
-         count = MIN2(count, fold_member_limit(inst, k, l->bindings[b].vk.binding));
+         uint32_t limit = fold_member_limit(inst, k, l->bindings[b].vk.binding);
+         if (count > limit && !inst->truncation_logged) {
+            inst->truncation_logged = true;
+            WRAPPER_LOG(error, "Folded heap set %p: binding %u holds %u descriptors but only %u "
+                        "fit under the set budget; descriptors above %u are dropped",
+                        (void *)inst, l->bindings[b].vk.binding, count, limit, limit - 1);
+         }
+         count = MIN2(count, limit);
          if (!count)
             continue;
          copies[copy_count++] = (VkCopyDescriptorSet) {
