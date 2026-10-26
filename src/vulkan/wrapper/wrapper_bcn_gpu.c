@@ -818,6 +818,13 @@ bcn_selftest(struct wrapper_device *device, VkQueue queue, uint32_t family)
                         s == BCN_SLOT_ENC_BC7 ? 10 : 0;
          }
          bcn_selftest_push(device, cb, device->bcn_pipe[s], &pc);
+         if (s == BCN_SLOT_ENC_BC7) {
+            VkDeviceAddress da = out[s].address + 16;
+            pc.dst[0] = (uint32_t)da;
+            pc.dst[1] = (uint32_t)(da >> 32);
+            pc.flags = 8;
+            bcn_selftest_push(device, cb, device->bcn_pipe[s], &pc);
+         }
          if (s == BCN_SLOT_ASTC4 && device->bcn_slot_group[s] == 8) {
             memcpy(src + 64, bcn_selftest_bc3, 16);
             VkDeviceAddress ba = in[s].address + 64, da = out[s].address + 16;
@@ -870,7 +877,18 @@ bcn_selftest(struct wrapper_device *device, VkQueue queue, uint32_t family)
          for (int i = 0; i < 8; i++)
             ok = ok || o[i] != 0;
       }
-      bool direct = false;
+      bool direct = false, mode6 = false;
+      float bc7_mse = 0.0f, bc7_mse6 = 0.0f;
+      if (ok && s == BCN_SLOT_ENC_BC7) {
+         /* the gradient decodes at 470.9 with every mode and 1928.6 with mode 6
+          * alone on the reference GPU */
+         bc7_mse = wrapper_bcn_bc7_mse(o, in[s].map);
+         bc7_mse6 = wrapper_bcn_bc7_mse(o + 16, in[s].map);
+         if (bc7_mse > 600.0f) {
+            mode6 = true;
+            ok = bc7_mse6 < 2200.0f;
+         }
+      }
       if (ok && s == BCN_SLOT_ASTC4 && device->bcn_slot_group[s] == 8) {
          uint8_t want[16];
          wrapper_bcn_astc4_direct(VK_FORMAT_BC3_UNORM_BLOCK, bcn_selftest_bc3, want);
@@ -885,6 +903,8 @@ bcn_selftest(struct wrapper_device *device, VkQueue queue, uint32_t family)
       if (ok) {
          if (s == BCN_SLOT_ASTC4)
             device->bcn_direct = direct && bcn_direct_enabled();
+         if (s == BCN_SLOT_ENC_BC7)
+            device->bcn_bc7_mode6 = mode6;
          device->bcn_slot_state[s] = BCN_TESTED;
       } else {
          bcn_retire(device, s);
@@ -904,9 +924,9 @@ bcn_selftest(struct wrapper_device *device, VkQueue queue, uint32_t family)
       at += snprintf(report + at, sizeof(report) - MIN2(at, sizeof(report)), ok ? " %s=ok" :
                      " %s=off(%08x %08x %08x %08x%s)", bcn_slot_names[s], w[0], w[1], w[2], w[3],
                      retry ? ", block encoder next" : "");
-      if (ok && s == BCN_SLOT_ENC_BC7 && at < sizeof(report))
-         at += snprintf(report + at, sizeof(report) - at, " (mse %.1f)",
-                        wrapper_bcn_bc7_mse(o, in[s].map));
+      if (o && s == BCN_SLOT_ENC_BC7 && at < sizeof(report))
+         at += snprintf(report + at, sizeof(report) - at, " (mse %.1f, mode 6 alone %.1f%s; %08x %08x %08x %08x)",
+                        bc7_mse, bc7_mse6, mode6 ? ", two-subset modes off" : "", w[0], w[1], w[2], w[3]);
       if (ok && s == BCN_SLOT_ASTC4 && device->bcn_slot_group[s] == 8 && at < sizeof(report)) {
          uint32_t dw[4];
          memcpy(dw, o + 16, 16);
@@ -1174,7 +1194,8 @@ bcn_encode_region(struct wrapper_command_buffer *wcb, struct wrapper_image *wi,
       .blocks_x = nbx,
       .blocks_y = nby,
       .format = (uint32_t)id,
-      .flags = wi->info.format == VK_FORMAT_BC5_UNORM_BLOCK && is_astc(stored) ? 1 : 0,
+      .flags = (wi->info.format == VK_FORMAT_BC5_UNORM_BLOCK && is_astc(stored) ? 1 : 0) |
+               (id == 10 && device->bcn_bc7_mode6 ? 8 : 0),
       .width = ext.width,
       .height = ext.height,
    };
