@@ -1692,6 +1692,7 @@ if (pdf2 && pdf2->features.f) { \
                           bcn_bda, used_fallback_create);
       wrapper_bcn_gpu_init(device, pCreateInfo->queueCreateInfoCount ?
          pCreateInfo->pQueueCreateInfos[0].queueFamilyIndex : UINT32_MAX);
+      wrapper_bcn_gpu_prebuild(device);
    }
    if (bc6h_hdr && !used_fallback_create)
       WRAPPER_LOG(info, "BCn policy: BC6H stored as ASTC 4x4 HDR");
