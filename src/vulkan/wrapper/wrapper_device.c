@@ -2859,6 +2859,8 @@ wrapper_CmdPushConstants(VkCommandBuffer commandBuffer, VkPipelineLayout layout,
          size = limit - offset;
       }
    }
+   if (wcb->device->bcn_bda)
+      wrapper_cmd_track_push(wcb, layout, stageFlags, offset, size, pValues);
    wcb->device->dispatch_table.CmdPushConstants(wcb->dispatch_handle, layout,
                                                 stageFlags, offset, size, pValues);
 }
@@ -3088,18 +3090,6 @@ wrapper_BeginCommandBuffer(VkCommandBuffer commandBuffer,
          0, 1, &barrier, 0, NULL, 0, NULL);
    }
    return begin_result;
-}
-
-VKAPI_ATTR void VKAPI_CALL
-wrapper_CmdPushConstants(VkCommandBuffer commandBuffer, VkPipelineLayout layout,
-                         VkShaderStageFlags stageFlags, uint32_t offset,
-                         uint32_t size, const void *pValues)
-{
-   VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
-   if (wcb->device->bcn_bda)
-      wrapper_cmd_track_push(wcb, layout, stageFlags, offset, size, pValues);
-   wcb->device->dispatch_table.CmdPushConstants(wcb->dispatch_handle, layout,
-      stageFlags, offset, size, pValues);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
