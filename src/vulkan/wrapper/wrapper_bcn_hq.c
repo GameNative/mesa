@@ -25,7 +25,8 @@
  * The worker runs at the lowest priority (SCHED_IDLE, nice 19), encodes in
  * strips of 96 rows, waits between strips while CPU BCn work the application
  * waits for is running, and is held to WRAPPER_BCN_HQ_MTEXPS Mtexel per
- * second (4).
+ * second (4). While the application uploads BC textures (one in the last
+ * 500 ms) it encodes on one thread.
  * WRAPPER_BCN_HQ=0 turns it off, WRAPPER_BCN_HQ_THREADS sets the encoder
  * threads (2), WRAPPER_BCN_HQ_QUALITY the astcenc quality (60, its medium
  * preset), WRAPPER_BCN_HQ_MB caps the blocks waiting (256). */
@@ -92,6 +93,7 @@ hq_format_name(VkFormat f)
 }
 
 uint32_t wrapper_bcn_fg_busy;
+uint64_t wrapper_bcn_upload_ms;
 
 static double
 now_ms(void)
@@ -193,13 +195,15 @@ hq_worker(void *arg)
                usleep(2000);
             uint32_t sh = MIN2(96u, h - y);
             double s0 = now_ms();
+            bool loading = s0 - (double)__atomic_load_n(&wrapper_bcn_upload_ms,
+                                                         __ATOMIC_RELAXED) < 500.0;
             ok = wrapper_bcn_astc_encode_cpu(job->in + l * job->layer_in +
                                                 (size_t)(y / 4) * ((w + 3) / 4) * bb,
                                              w, sh, job->format,
                                              job->out + l * job->layer_out +
                                                 (size_t)(y / job->block) * out_row,
                                              job->layer_out - (size_t)(y / job->block) * out_row,
-                                             hq->threads, hq->quality) == 0;
+                                             loading ? 1 : hq->threads, hq->quality) == 0;
             double budget = (double)w * sh / (hq->mtexps * 1000.0);
             double spent = now_ms() - s0;
             if (spent < budget)

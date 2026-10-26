@@ -33,6 +33,9 @@ void
 wrapper_bcn_gpu_init(struct wrapper_device *device, uint32_t family);
 
 void
+wrapper_bcn_gpu_prebuild(struct wrapper_device *device);
+
+void
 wrapper_bcn_gpu_finish(struct wrapper_device *device);
 
 void
@@ -84,6 +87,9 @@ wrapper_bcn_cache_report(void);
 
 /* CPU BCn work the application is waiting for; the background stage yields to it */
 extern uint32_t wrapper_bcn_fg_busy;
+
+/* CLOCK_MONOTONIC milliseconds of the last BC upload recorded on the GPU path */
+extern uint64_t wrapper_bcn_upload_ms;
 
 void
 wrapper_bcn_hq_image_destroy(struct wrapper_device *device, struct wrapper_image *wi);

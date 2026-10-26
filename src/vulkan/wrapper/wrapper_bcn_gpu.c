@@ -39,6 +39,9 @@ wrapper_bcn_gpu_path(void)
    return on;
 }
 
+static uint32_t
+bcn_astc_block(VkFormat stored);
+
 struct bcn_pc {
    uint32_t src[2];
    uint32_t dst[2];
@@ -433,9 +436,12 @@ bcn_create_pipeline_specs(struct wrapper_device *device, const uint32_t *code, s
       .pCode = code,
    };
    VkResult r = VK_SUCCESS;
+   static pthread_mutex_t module_lock = PTHREAD_MUTEX_INITIALIZER;
+   pthread_mutex_lock(&module_lock);
    if (!*module)
       r = device->dispatch_table.CreateShaderModule(device->dispatch_handle, &smci, NULL,
                                                     module);
+   pthread_mutex_unlock(&module_lock);
    if (r != VK_SUCCESS)
       return r;
    VkSpecializationMapEntry entries[2] = {
@@ -588,7 +594,7 @@ bcn_cache_path(struct wrapper_device *device, char *path, size_t size)
 }
 
 static void
-bcn_cache_save(struct wrapper_device *device)
+bcn_cache_save_locked(struct wrapper_device *device)
 {
    VkDevice d = device->dispatch_handle;
    size_t out = 0;
@@ -611,6 +617,15 @@ bcn_cache_save(struct wrapper_device *device)
          remove(tmp);
    }
    free(data);
+}
+
+static void
+bcn_cache_save(struct wrapper_device *device)
+{
+   static pthread_mutex_t save_lock = PTHREAD_MUTEX_INITIALIZER;
+   pthread_mutex_lock(&save_lock);
+   bcn_cache_save_locked(device);
+   pthread_mutex_unlock(&save_lock);
 }
 
 #define BCN_WAIT_SECONDS 20
@@ -675,7 +690,7 @@ bcn_tools_worker(void *arg)
          pthread_cond_broadcast(&device->bcn_tool_cond);
       }
    }
-   device->bcn_tool_exited = true;
+   device->bcn_tool_exited++;
    pthread_cond_broadcast(&device->bcn_tool_cond);
    pthread_mutex_unlock(&device->bcn_tool_lock);
    return NULL;
@@ -790,11 +805,15 @@ bcn_tools_start(struct wrapper_device *device)
                                                             &device->bcn_tool_layout) ==
                    VK_SUCCESS &&
                 bcn_tables_create(device) &&
-                pthread_create(&device->bcn_tool_thread, NULL, bcn_tools_worker, device) == 0;
+                pthread_create(&device->bcn_tool_thread[0], NULL, bcn_tools_worker, device) == 0;
+      device->bcn_tool_threads = ok;
+      if (ok && sysconf(_SC_NPROCESSORS_ONLN) > 2 &&
+          pthread_create(&device->bcn_tool_thread[1], NULL, bcn_tools_worker, device) == 0)
+         device->bcn_tool_threads = 2;
       device->bcn_tool_thread_live = ok;
       wrapper_diag_append("[BCN] GPU shaders: %s (bda=%d, pipeline cache %ld bytes from %s; "
                           "self-test on %s)\n",
-                          ok ? "built on first use" : "off, upload=cpu", device->bcn_bda,
+                          ok ? "built in the background" : "off, upload=cpu", device->bcn_bda,
                           device->bcn_cache_warm ? len : 0L, path,
                           device->bcn_queue_shares_query_reset ? "the query reset queue" :
                           device->bcn_queue ? "a private queue" : "the next submit");
@@ -804,13 +823,14 @@ bcn_tools_start(struct wrapper_device *device)
    return device->bcn_tool_state > 0;
 }
 
-/* The pipeline of a slot. Uploads, which have the CPU path, take it only
- * once it has passed its self-test; with a warm pipeline cache and the
- * wrapper's own queue the build and the check take milliseconds, so an
- * upload waits for them (up to 250 ms). Readbacks and copies, which have no
- * CPU path, wait for the build and the check. Without the wrapper's own queue
- * the check runs at the next submit: they take the pipeline built, and their
- * dispatch is indirect with zero groups until the check passes. */
+/* The pipeline of a slot, queued for the worker if it was not. With the
+ * wrapper's own queue every caller waits for the build and the self-test (up
+ * to 20 s, once per slot): a build in flight takes a second at most, where
+ * the CPU encoder takes that long for each texture. Uploads, which have the
+ * CPU path, take it only when the slot failed or that wait ran out. Without
+ * the wrapper's own queue the check runs at the next submit: uploads take
+ * the CPU path until then, readbacks and copies take the pipeline built and
+ * their dispatch is indirect with zero groups until the check passes. */
 static VkPipeline
 bcn_pipe(struct wrapper_device *device, int slot, bool wait)
 {
@@ -825,7 +845,7 @@ bcn_pipe(struct wrapper_device *device, int slot, bool wait)
       device->bcn_slot_state[slot] = BCN_QUEUED;
       pthread_cond_broadcast(&device->bcn_tool_cond);
    }
-   if (wait && !device->bcn_slot_late[slot]) {
+   if ((wait || device->bcn_queue) && !device->bcn_slot_late[slot]) {
       struct timespec until;
       clock_gettime(CLOCK_REALTIME, &until);
       until.tv_sec += BCN_WAIT_SECONDS;
@@ -840,24 +860,43 @@ bcn_pipe(struct wrapper_device *device, int slot, bool wait)
             break;
          }
       }
-   } else if (device->bcn_cache_warm && device->bcn_queue) {
-      struct timespec until;
-      clock_gettime(CLOCK_REALTIME, &until);
-      until.tv_nsec += 250000000;
-      if (until.tv_nsec >= 1000000000) {
-         until.tv_sec++;
-         until.tv_nsec -= 1000000000;
-      }
-      while (device->bcn_slot_state[slot] == BCN_QUEUED ||
-             device->bcn_slot_state[slot] == BCN_BUILDING ||
-             device->bcn_slot_state[slot] == BCN_BUILT) {
-         if (pthread_cond_timedwait(&device->bcn_tool_cond, &device->bcn_tool_lock, &until))
-            break;
-      }
    }
    st = device->bcn_slot_state[slot];
    pthread_mutex_unlock(&device->bcn_tool_lock);
    return st == BCN_TESTED || (built_ok && st == BCN_BUILT) ? device->bcn_pipe[slot] : VK_NULL_HANDLE;
+}
+
+/* At device creation: the decoder and the encoders of the formats BC images
+ * are stored as start building on the worker, so that the first uploads find
+ * them built or close to it. */
+void
+wrapper_bcn_gpu_prebuild(struct wrapper_device *device)
+{
+   static const VkFormat formats[] = {
+      VK_FORMAT_BC1_RGBA_UNORM_BLOCK, VK_FORMAT_BC2_UNORM_BLOCK, VK_FORMAT_BC3_UNORM_BLOCK,
+      VK_FORMAT_BC4_UNORM_BLOCK, VK_FORMAT_BC5_UNORM_BLOCK, VK_FORMAT_BC6H_UFLOAT_BLOCK,
+      VK_FORMAT_BC7_UNORM_BLOCK,
+   };
+   if (device->physical->emulate_bcn < 2 || !wrapper_bcn_gpu_path() || !device->bcn_bda ||
+       !device->bcn_queue)
+      return;
+   uint32_t mask = 1u << BCN_SLOT_DECODE;
+   for (uint32_t i = 0; i < ARRAY_SIZE(formats); i++) {
+      VkFormat stored = get_format_for_bcn(formats[i]);
+      uint32_t astc = bcn_astc_block(stored);
+      if (is_astc_hdr_4x4(stored))
+         mask |= 1u << BCN_SLOT_HDR;
+      else if (astc)
+         mask |= 1u << (astc == 4 ? BCN_SLOT_ASTC4 : astc == 6 ? BCN_SLOT_ASTC6 : BCN_SLOT_ASTC8);
+   }
+   if (!bcn_tools_start(device))
+      return;
+   pthread_mutex_lock(&device->bcn_tool_lock);
+   for (int i = 0; i < BCN_SLOT_COUNT; i++)
+      if (((mask >> i) & 1u) && device->bcn_slot_state[i] == BCN_NONE)
+         device->bcn_slot_state[i] = BCN_QUEUED;
+   pthread_cond_broadcast(&device->bcn_tool_cond);
+   pthread_mutex_unlock(&device->bcn_tool_lock);
 }
 
 /* Before the first image stored as ASTC 4x4: when the GPU 4x4 encoder fails
@@ -1302,19 +1341,21 @@ wrapper_bcn_gpu_finish(struct wrapper_device *device)
       pthread_mutex_lock(&device->bcn_tool_lock);
       device->bcn_tool_stop = true;
       pthread_cond_broadcast(&device->bcn_tool_cond);
-      while (!device->bcn_tool_exited &&
+      while (device->bcn_tool_exited < device->bcn_tool_threads &&
              !pthread_cond_timedwait(&device->bcn_tool_cond, &device->bcn_tool_lock, &until))
          ;
-      bool exited = device->bcn_tool_exited;
+      bool exited = device->bcn_tool_exited == device->bcn_tool_threads;
       pthread_mutex_unlock(&device->bcn_tool_lock);
       device->bcn_tool_thread_live = false;
       if (!exited) {
          wrapper_diag_append("[BCN] GPU shader build still running at device destruction, "
                              "left to the process exit\n");
-         pthread_detach(device->bcn_tool_thread);
+         for (uint32_t i = 0; i < device->bcn_tool_threads; i++)
+            pthread_detach(device->bcn_tool_thread[i]);
          return;
       }
-      pthread_join(device->bcn_tool_thread, NULL);
+      for (uint32_t i = 0; i < device->bcn_tool_threads; i++)
+         pthread_join(device->bcn_tool_thread[i], NULL);
    }
    for (int i = 0; i < BCN_SLOT_COUNT; i++)
       if (device->bcn_pipe[i])
@@ -2127,6 +2168,10 @@ wrapper_bcn_gpu_upload(struct wrapper_command_buffer *wcb, struct wrapper_image 
                        struct wrapper_buffer *wb, VkImageLayout layout, uint32_t count,
                        const VkBufferImageCopy *regions)
 {
+   struct timespec now;
+   clock_gettime(CLOCK_MONOTONIC, &now);
+   __atomic_store_n(&wrapper_bcn_upload_ms, (uint64_t)now.tv_sec * 1000u + now.tv_nsec / 1000000,
+                    __ATOMIC_RELAXED);
    uint32_t done = 0;
    while (done < count && bcn_gpu_upload_region(wcb, wi, wb, wb->dispatch_handle, layout,
                                                 &regions[done], wb->device_only))
