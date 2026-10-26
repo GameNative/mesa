@@ -1231,6 +1231,7 @@ wrapper_CreateDevice(VkPhysicalDevice physicalDevice,
    device->imageless_fb_table = _mesa_hash_table_u64_create(NULL);
    device->dynamic_pipeline_table = _mesa_hash_table_u64_create(NULL);
    device->buffer_table = _mesa_hash_table_u64_create(NULL);
+   device->device_only_memory = _mesa_hash_table_u64_create(NULL);
    device->fence_table = _mesa_hash_table_u64_create(NULL);
    
    simple_mtx_init(&device->resource_mutex, mtx_plain);
@@ -1661,6 +1662,7 @@ wrapper_BindBufferMemory(VkDevice _device,
 
    wb->memory = memory;
    wb->offset = memoryOffset;
+   wb->device_only = wrapper_memory_device_only(device, memory);
 
    return VK_SUCCESS;
 }
@@ -1687,6 +1689,7 @@ wrapper_BindBufferMemory2(VkDevice _device,
       if (wb) {
          wb->memory = pBindInfos[i].memory;
          wb->offset = pBindInfos[i].memoryOffset;
+         wb->device_only = wrapper_memory_device_only(device, pBindInfos[i].memory);
       }
    }
 
@@ -4196,7 +4199,7 @@ wrapper_bcn_note_dropped(struct wrapper_device *device, struct wrapper_buffer *w
                          VkFormat format, uint32_t mip_drop, uint32_t regionCount,
                          const VkBufferImageCopy *pRegions)
 {
-   if (!bcn_cache_enabled() || !bcn_upload_enabled())
+   if (!bcn_cache_enabled() || !bcn_upload_enabled() || wb->device_only)
       return;
 
    simple_mtx_lock(&device->resource_mutex);
@@ -4339,6 +4342,14 @@ wrapper_bcn_cpu_copy_regions(struct wrapper_command_buffer *wcb,
 {
    VkResult res;
 
+   if (wb->device_only) {
+      static bool logged;
+      if (!logged)
+         WRAPPER_LOG(error, "BCn: upload from memory the host cannot map needs the GPU path");
+      logged = true;
+      return;
+   }
+
    simple_mtx_lock(&device->resource_mutex);
 
    if (!wb->is_mapped) {
@@ -4447,7 +4458,7 @@ wrapper_bcn_do_copy_regions(struct wrapper_command_buffer *wcb,
    bool gpu = wrapper_bcn_gpu_path();
    for (uint32_t i = 0; i < regionCount; i++) {
       /* the GPU path, or a region that has to be merged into whole ASTC blocks */
-      if ((gpu || wrapper_bcn_gpu_misaligned(wi, &pRegions[i])) &&
+      if ((gpu || wb->device_only || wrapper_bcn_gpu_misaligned(wi, &pRegions[i])) &&
           wrapper_bcn_gpu_upload(wcb, wi, wb, dstLayout, 1, &pRegions[i]))
          continue;
       wrapper_bcn_hq_write(device, wi, &pRegions[i].imageSubresource, pRegions[i].imageOffset,

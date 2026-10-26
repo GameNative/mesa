@@ -85,6 +85,7 @@ struct wrapper_device {
    struct list_head image_list;
    struct list_head fence_list;
    struct hash_table_u64 *buffer_table;
+   struct hash_table_u64 *device_only_memory; /* allocations the host cannot map */
    struct hash_table_u64 *image_table;
    struct hash_table_u64 *image_view_table;
    struct hash_table_u64 *imageless_fb_table;
@@ -188,6 +189,7 @@ struct wrapper_buffer {
    void *mapped_address;
    int is_mapped;
    VkDeviceMemory memory;
+   bool device_only;                     /* bound to memory the host cannot map */
    struct wrapper_command_buffer *wcb;
    VkImage bcn_image;                    /* transient BCn image freed with the command buffer */
    VkExternalMemoryHandleTypeFlags handle_types;
@@ -198,6 +200,9 @@ get_wrapper_buffer_from_handle_locked(struct wrapper_device *device, VkBuffer bu
 
 struct wrapper_buffer *
 get_wrapper_buffer_from_handle(struct wrapper_device *device, VkBuffer buffer);
+
+bool
+wrapper_memory_device_only(struct wrapper_device *device, VkDeviceMemory memory);
 
 #define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EMULATED_B8G8R8A8_CREATE_INFO_EXT 1000701234
 typedef struct VkEmulatedB8G8R8A8CreateInfoExt {
