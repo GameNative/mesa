@@ -208,14 +208,6 @@ void decode_channel(uint w0, uint w1, bool is_signed, out int vals[16])
    }
 }
 
-uint udiv(uint a, uint b)
-{
-   uint q = uint(float(a) / float(b));
-   q -= q * b > a ? 1u : 0u;
-   q += (q + 1u) * b <= a ? 1u : 0u;
-   return q;
-}
-
 /* bcdec's BC3 alpha uses the plain /7 and /5 interpolation. */
 void decode_alpha_bc3(uint w0, uint w1)
 {
@@ -223,17 +215,17 @@ void decode_alpha_bc3(uint w0, uint w1)
    a[0] = w0 & 0xffu;
    a[1] = (w0 >> 8) & 0xffu;
    if (a[0] > a[1]) {
-      a[2] = udiv(6u * a[0] + a[1], 7u);
-      a[3] = udiv(5u * a[0] + 2u * a[1], 7u);
-      a[4] = udiv(4u * a[0] + 3u * a[1], 7u);
-      a[5] = udiv(3u * a[0] + 4u * a[1], 7u);
-      a[6] = udiv(2u * a[0] + 5u * a[1], 7u);
-      a[7] = udiv(a[0] + 6u * a[1], 7u);
+      a[2] = (6u * a[0] + a[1]) / 7u;
+      a[3] = (5u * a[0] + 2u * a[1]) / 7u;
+      a[4] = (4u * a[0] + 3u * a[1]) / 7u;
+      a[5] = (3u * a[0] + 4u * a[1]) / 7u;
+      a[6] = (2u * a[0] + 5u * a[1]) / 7u;
+      a[7] = (a[0] + 6u * a[1]) / 7u;
    } else {
-      a[2] = udiv(4u * a[0] + a[1], 5u);
-      a[3] = udiv(3u * a[0] + 2u * a[1], 5u);
-      a[4] = udiv(2u * a[0] + 3u * a[1], 5u);
-      a[5] = udiv(a[0] + 4u * a[1], 5u);
+      a[2] = (4u * a[0] + a[1]) / 5u;
+      a[3] = (3u * a[0] + 2u * a[1]) / 5u;
+      a[4] = (2u * a[0] + 3u * a[1]) / 5u;
+      a[5] = (a[0] + 4u * a[1]) / 5u;
       a[6] = 0u;
       a[7] = 255u;
    }
