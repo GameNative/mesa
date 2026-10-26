@@ -918,7 +918,8 @@ void main()
       encode_bc6h(f == 9u);
    } else if (FMT_CLASS == 2u) {
       encode_bc7();
-      encode_bc7_modes();
+      if ((pc.flags & 8u) == 0u)
+         encode_bc7_modes();
    } else if (f == 0u || f == 1u) {
       uvec2 c = encode_bc1(f == 0u);
       ob[0] = c.x; ob[1] = c.y;
