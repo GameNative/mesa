@@ -120,7 +120,7 @@ struct wrapper_device {
    bool bcn_bda;                         /* bufferDeviceAddress enabled for them */
    int bcn_tool_state;                   /* 0 not started, 1 started, -1 off */
    uint32_t bcn_tool_family;               /* queue family of the self-test */
-   pthread_t bcn_tool_thread[2];
+   pthread_t bcn_tool_thread[4];
    uint32_t bcn_tool_threads;              /* workers started */
    bool bcn_tool_thread_live;
    bool bcn_tool_stop;

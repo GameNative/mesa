@@ -807,9 +807,12 @@ bcn_tools_start(struct wrapper_device *device)
                 bcn_tables_create(device) &&
                 pthread_create(&device->bcn_tool_thread[0], NULL, bcn_tools_worker, device) == 0;
       device->bcn_tool_threads = ok;
-      if (ok && sysconf(_SC_NPROCESSORS_ONLN) > 2 &&
-          pthread_create(&device->bcn_tool_thread[1], NULL, bcn_tools_worker, device) == 0)
-         device->bcn_tool_threads = 2;
+      long cores = sysconf(_SC_NPROCESSORS_ONLN);
+      uint32_t want = cores >= 6 ? 4 : cores > 2 ? 2 : 1;
+      while (ok && device->bcn_tool_threads < want &&
+             pthread_create(&device->bcn_tool_thread[device->bcn_tool_threads], NULL,
+                            bcn_tools_worker, device) == 0)
+         device->bcn_tool_threads++;
       device->bcn_tool_thread_live = ok;
       wrapper_diag_append("[BCN] GPU shaders: %s (bda=%d, pipeline cache %ld bytes from %s; "
                           "self-test on %s)\n",
