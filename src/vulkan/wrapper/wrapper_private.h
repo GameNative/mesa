@@ -91,6 +91,7 @@ struct wrapper_device {
    struct hash_table_u64 *divisor_pipeline_table;
    bool emulate_vertex_divisor;
    bool emulate_zero_divisor;
+   bool split_instance_rate;
    struct hash_table_u64 *fence_table;
    struct wrapper_physical_device *physical;
    struct vk_device_dispatch_table dispatch_table;
