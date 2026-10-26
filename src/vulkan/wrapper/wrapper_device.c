@@ -1869,6 +1869,7 @@ wrapper_CreateImage(VkDevice _device,
    create_info = *pCreateInfo;
 
    if (is_emulated_bcn(device->physical, pCreateInfo->format)) {
+      wrapper_bcn_gpu_storage_check(device, pCreateInfo->format);
       create_info.format = get_format_for_bcn(pCreateInfo->format);
       if (create_info.flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT)
          create_info.flags &= ~VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
@@ -1952,6 +1953,7 @@ wrapper_device_image_memory_requirements(struct wrapper_device *device,
    if (pInfo->pCreateInfo &&
        is_emulated_bcn(device->physical, pInfo->pCreateInfo->format)) {
       ci = *pInfo->pCreateInfo;
+      wrapper_bcn_gpu_storage_check(device, pInfo->pCreateInfo->format);
       ci.format = get_format_for_bcn(pInfo->pCreateInfo->format);
       ci.flags &= ~VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
       ci.pNext = NULL;

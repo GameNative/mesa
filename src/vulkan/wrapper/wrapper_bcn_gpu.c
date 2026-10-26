@@ -796,6 +796,32 @@ bcn_pipe(struct wrapper_device *device, int slot, bool wait)
    return st == BCN_TESTED || (built_ok && st == BCN_BUILT) ? device->bcn_pipe[slot] : VK_NULL_HANDLE;
 }
 
+/* Before the first image stored as ASTC 4x4: when the GPU 4x4 encoder fails
+ * its build or self-test, those formats are stored decoded instead, so that
+ * copies into them from uncompressed images still have a GPU path. */
+void
+wrapper_bcn_gpu_storage_check(struct wrapper_device *device, VkFormat format)
+{
+   static int decided;
+   static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+   if (__atomic_load_n(&decided, __ATOMIC_ACQUIRE) ||
+       !is_astc_4x4(get_format_for_bcn(format)))
+      return;
+   pthread_mutex_lock(&lock);
+   if (!decided && device->physical->emulate_bcn > 1 && wrapper_bcn_gpu_path() &&
+       device->bcn_bda && device->bcn_queue) {
+      bcn_pipe(device, BCN_SLOT_ASTC4, true);
+      if (__atomic_load_n(&device->bcn_slot_state[BCN_SLOT_ASTC4], __ATOMIC_ACQUIRE) ==
+          BCN_FAILED) {
+         wrapper_bcn_store_4x4_decoded();
+         wrapper_diag_append("[BCN] ASTC 4x4 encoder unusable on this GPU: BC formats stored "
+                             "as 4x4 are stored decoded\n");
+      }
+   }
+   __atomic_store_n(&decided, 1, __ATOMIC_RELEASE);
+   pthread_mutex_unlock(&lock);
+}
+
 static int
 bcn_encode_slot(int format_id)
 {
@@ -1020,9 +1046,14 @@ bcn_selftest(struct wrapper_device *device, VkQueue queue, uint32_t family)
       float rgba_mse = 0.0f;
       bool repeat = true;
       if (ok && s == BCN_SLOT_ASTC4) {
+         /* the block a correct build writes (Mali-G715 r48, PowerVR 24.3) */
+         static const uint32_t golden[4] = { 0xffc10253, 0xb57f7460, 0xd9d04b38, 0x01256a2b };
          repeat = !memcmp(o + 32, o + 48, 16);
          rgba_mse = wrapper_astc4_block_mse(o + 32, in[s].map + 128);
-         ok = repeat && rgba_mse >= 0.0f && rgba_mse < 300.0f;
+         float golden_mse = wrapper_astc4_block_mse((const uint8_t *)golden, in[s].map + 128);
+         ok = repeat && (!memcmp(o + 32, golden, 16) ||
+                         (rgba_mse >= 0.0f && golden_mse >= 0.0f &&
+                          rgba_mse <= golden_mse * 1.25f + 10.0f));
       }
       if (ok && s == BCN_SLOT_ASTC4 && device->bcn_slot_group[s] == 8) {
          uint8_t want[16];
