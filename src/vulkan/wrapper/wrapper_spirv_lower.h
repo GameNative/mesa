@@ -21,6 +21,10 @@ enum wrapper_spirv_lower_result
 wrapper_spirv_lower_to_1_3(const uint32_t *in, size_t words, uint32_t flags,
                            uint32_t **out_code, size_t *out_words);
 
+enum wrapper_spirv_lower_result
+wrapper_spirv_lower_int64(const uint32_t *in, size_t words,
+                          uint32_t **out_code, size_t *out_words);
+
 #ifdef __cplusplus
 }
 #endif

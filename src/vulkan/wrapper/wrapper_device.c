@@ -4764,6 +4764,42 @@ wrapper_max_spirv_version(const struct wrapper_physical_device *pdevice)
    return 0x00010300;
 }
 
+static VkResult
+wrapper_lower_int64_module(const VkShaderModuleCreateInfo *info,
+                           VkShaderModuleCreateInfo *out_info, uint32_t **out_code)
+{
+   uint32_t *code = NULL;
+   size_t words = 0;
+   enum wrapper_spirv_lower_result r =
+      wrapper_spirv_lower_int64(info->pCode, info->codeSize / 4, &code, &words);
+   if (r == WRAPPER_SPIRV_LOWERED) {
+      *out_info = *info;
+      out_info->pCode = code;
+      out_info->codeSize = words * 4;
+      *out_code = code;
+      return VK_SUCCESS;
+   }
+   if (r == WRAPPER_SPIRV_UNCHANGED)
+      return VK_SUCCESS;
+
+   uint64_t hash = 0xcbf29ce484222325ull;
+   const uint8_t *bytes = (const uint8_t *)info->pCode;
+   for (size_t i = 0; i < info->codeSize; i++)
+      hash = (hash ^ bytes[i]) * 0x100000001b3ull;
+   const char *name = "";
+   for (size_t i = 5; i < info->codeSize / 4 && (info->pCode[i] >> 16);
+        i += info->pCode[i] >> 16) {
+      if ((info->pCode[i] & 0xffff) == 7 && (info->pCode[i] >> 16) > 2) {
+         name = (const char *)&info->pCode[i + 2];
+         break;
+      }
+   }
+   WRAPPER_LOG(error, "Refusing shader %.64s (spirv hash %016llx): it uses 64-bit integers "
+               "beyond widening before a float conversion and the driver lacks shaderInt64",
+               name, (unsigned long long)hash);
+   return VK_ERROR_FEATURE_NOT_PRESENT;
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 wrapper_CreateShaderModule(VkDevice _device,
 						   const VkShaderModuleCreateInfo *pCreateInfo,
@@ -4775,6 +4811,16 @@ wrapper_CreateShaderModule(VkDevice _device,
    static int wrapper_no_patch_OpConstComp = -1;
 
    bcn_scan_shader(pCreateInfo->pCode, pCreateInfo->codeSize);
+
+   uint32_t *int64_code = NULL;
+   VkShaderModuleCreateInfo int64_info;
+   if (device->physical->lower_int64) {
+      VkResult ir = wrapper_lower_int64_module(pCreateInfo, &int64_info, &int64_code);
+      if (ir != VK_SUCCESS)
+         return ir;
+      if (int64_code)
+         pCreateInfo = &int64_info;
+   }
 
    if (wrapper_no_remove_clip_distance == -1)
       wrapper_no_remove_clip_distance = getenv("WRAPPER_NO_REMOVE_CLIP_DISTANCE") && atoi(getenv("WRAPPER_NO_REMOVE_CLIP_DISTANCE"));
@@ -4830,6 +4876,7 @@ wrapper_CreateShaderModule(VkDevice _device,
       wrapper_stride_note_module(device, *pShaderModule, create_info.pCode,
                                  create_info.codeSize);
    free(lowered);
+   free(int64_code);
    return result;
 }
 
