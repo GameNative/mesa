@@ -18,6 +18,7 @@
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 /* block edge, one pipeline per block size so the per-texel arrays fit */
 layout(constant_id = 0) const uint BLOCK = 4u;
+layout(constant_id = 1) const uint DIRECT = 1u;
 const uint NT = BLOCK * BLOCK;
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Words { uint w[]; };
 layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer OutWords { uint w[]; };
@@ -470,7 +471,7 @@ void main()
       return;
    }
 
-   if (BLOCK == 4u && (pc.kind & 4u) != 0u) {
+   if (DIRECT != 0u && BLOCK == 4u && (pc.kind & 4u) != 0u) {
       Words bc = Words(pc.bc);
       uint bo = ((gid.z * pc.blocks_y + gid.y) * pc.blocks_x + gid.x) * 4u;
       if (direct_block((pc.kind >> 8) & 255u, uvec4(bc.w[bo], bc.w[bo + 1u], bc.w[bo + 2u], bc.w[bo + 3u]))) {
@@ -496,7 +497,7 @@ void main()
    uint bsi = B == 4u ? 0u : B == 6u ? 1u : 2u;
 
    float best = 1e30;
-   uint best_out[4];
+   uvec4 best_out = uvec4(0u);
    [[dont_unroll]] for (uint cls = cls0; cls <= cls1; cls++) {
       bool dual = cls == 2u || cls == 5u;
       uint planes = dual ? 2u : 1u;
@@ -585,11 +586,11 @@ void main()
          [[dont_unroll]] for (uint b = 0u; b < ipos; b++)
             if (((ib[b >> 5] >> (b & 31u)) & 1u) != 0u)
                setbits(127u - b, 1u, 1u);
-         best_out = ob;
+         best_out = uvec4(ob[0], ob[1], ob[2], ob[3]);
       }
    }
-   d.w[off] = best_out[0];
-   d.w[off + 1u] = best_out[1];
-   d.w[off + 2u] = best_out[2];
-   d.w[off + 3u] = best_out[3];
+   d.w[off] = best_out.x;
+   d.w[off + 1u] = best_out.y;
+   d.w[off + 2u] = best_out.z;
+   d.w[off + 3u] = best_out.w;
 }

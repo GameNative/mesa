@@ -15,6 +15,7 @@
  * flags bit 1: write BC6H UF16 as B10G11R11 texels, as the CPU path packs them
  */
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(constant_id = 0) const uint FORMAT = 255u;
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Words { uint w[]; };
 layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer OutWords { uint w[]; };
 layout(push_constant) uniform PC {
@@ -471,7 +472,7 @@ void main()
    uvec3 id = gl_GlobalInvocationID;
    if (id.x >= pc.blocks_x || id.y >= pc.blocks_y)
       return;
-   uint fmt = pc.format;
+   uint fmt = FORMAT == 255u ? pc.format : FORMAT;
    uint bb = (fmt <= 1u || fmt == 4u || fmt == 5u) ? 8u : 16u;
    uint soff = id.z * pc.src_slice_pitch + id.y * pc.src_row_pitch + id.x * bb;
    Words s = Words(pc.src);
