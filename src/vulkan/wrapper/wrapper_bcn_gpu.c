@@ -467,12 +467,17 @@ bcn_create_pipeline_specs(struct wrapper_device *device, const uint32_t *code, s
    return r;
 }
 
+/* the pipeline cache the worker builds into: the device's, or with no saved
+ * data a fresh one per build, merged into the device's when the build works,
+ * so that a build the driver rejects leaves nothing in the cache saved */
+static __thread VkPipelineCache bcn_build_cache;
+
 static VkResult
 bcn_create_pipeline_spec(struct wrapper_device *device, const uint32_t *code, size_t size,
                          VkShaderModule *module, VkPipeline *pipeline, uint32_t spec)
 {
    return bcn_create_pipeline_specs(device, code, size, module, pipeline,
-                                    device->bcn_pipeline_cache, &spec, 1);
+                                    bcn_build_cache, &spec, 1);
 }
 
 /* The ASTC encoder for 4x4 and 6x6: 0 one invocation per block
@@ -559,7 +564,7 @@ bcn_build_split(struct wrapper_device *device, int slot, VkPipeline *out)
    if (slot == BCN_SLOT_ASTC4 && device->bcn_slot_group[slot] == 8) {
       const uint32_t spec[2] = { 4, 0 };
       return bcn_create_pipeline_specs(device, wrapper_astc_encode_spv,
-         sizeof(wrapper_astc_encode_spv), &device->bcn_split_modules[1], out, VK_NULL_HANDLE,
+         sizeof(wrapper_astc_encode_spv), &device->bcn_split_modules[1], out, bcn_build_cache,
          spec, 2);
    }
    if (slot != BCN_SLOT_DECODE)
@@ -568,7 +573,7 @@ bcn_build_split(struct wrapper_device *device, int slot, VkPipeline *out)
    for (uint32_t f = 0; f < ARRAY_SIZE(device->bcn_decode_fmt); f++) {
       VkResult r = bcn_create_pipeline_specs(device, wrapper_bcn_decode_spv,
          sizeof(wrapper_bcn_decode_spv), &device->bcn_split_modules[0],
-         &device->bcn_decode_fmt[f], VK_NULL_HANDLE, &f, 1);
+         &device->bcn_decode_fmt[f], bcn_build_cache, &f, 1);
       built |= (r == VK_SUCCESS) << f;
    }
    wrapper_diag_append("[BCN] GPU shader decode per format: built mask 0x%03x\n", built);
@@ -619,13 +624,49 @@ bcn_cache_save_locked(struct wrapper_device *device)
    free(data);
 }
 
+static pthread_mutex_t bcn_save_lock = PTHREAD_MUTEX_INITIALIZER;
+
 static void
 bcn_cache_save(struct wrapper_device *device)
 {
-   static pthread_mutex_t save_lock = PTHREAD_MUTEX_INITIALIZER;
-   pthread_mutex_lock(&save_lock);
+   pthread_mutex_lock(&bcn_save_lock);
    bcn_cache_save_locked(device);
-   pthread_mutex_unlock(&save_lock);
+   pthread_mutex_unlock(&bcn_save_lock);
+}
+
+/* Slots whose full shader the driver rejected once: later launches build
+ * their split variants at once. Kept next to the pipeline cache. */
+static uint32_t
+bcn_split_mask_read(struct wrapper_device *device)
+{
+   char path[272];
+   bcn_cache_path(device, path, sizeof(path) - 6);
+   strcat(path, ".split");
+   uint32_t mask = 0;
+   FILE *f = fopen(path, "rb");
+   if (f) {
+      if (fread(&mask, sizeof(mask), 1, f) != 1)
+         mask = 0;
+      fclose(f);
+   }
+   return mask;
+}
+
+static void
+bcn_split_mask_add(struct wrapper_device *device, int slot)
+{
+   char path[272];
+   bcn_cache_path(device, path, sizeof(path) - 6);
+   strcat(path, ".split");
+   pthread_mutex_lock(&bcn_save_lock);
+   uint32_t mask = __atomic_or_fetch(&device->bcn_split_slots, 1u << slot, __ATOMIC_RELAXED);
+   mkdir(BCN_CACHE_DIR, 0755);
+   FILE *f = fopen(path, "wb");
+   if (f) {
+      fwrite(&mask, sizeof(mask), 1, f);
+      fclose(f);
+   }
+   pthread_mutex_unlock(&bcn_save_lock);
 }
 
 #define BCN_WAIT_SECONDS 20
@@ -655,15 +696,52 @@ bcn_tools_worker(void *arg)
       struct timespec t0, t1;
       clock_gettime(CLOCK_MONOTONIC, &t0);
       VkPipeline p = VK_NULL_HANDLE;
-      VkResult r = bcn_build_slot(device, slot, &p);
+      VkPipelineCache temp = VK_NULL_HANDLE;
+      VkPipelineCacheCreateInfo pcci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO };
+      bcn_build_cache = device->bcn_pipeline_cache;
+      if (bcn_build_cache && !device->bcn_cache_warm &&
+          device->dispatch_table.CreatePipelineCache(device->dispatch_handle, &pcci, NULL,
+                                                     &temp) == VK_SUCCESS)
+         bcn_build_cache = temp;
+      bool known_split = (__atomic_load_n(&device->bcn_split_slots, __ATOMIC_RELAXED) >> slot) & 1u;
+      VkResult r = VK_ERROR_UNKNOWN;
+      if (known_split && slot == BCN_SLOT_ASTC4)
+         device->bcn_slot_group[slot] = 8;
+      if (!known_split || (slot != BCN_SLOT_DECODE && slot != BCN_SLOT_ASTC4))
+         r = bcn_build_slot(device, slot, &p);
       if (r != VK_SUCCESS) {
-         device->bcn_cache_tainted = true;
          VkResult first = r;
+         if (temp) {
+            device->dispatch_table.DestroyPipelineCache(device->dispatch_handle, temp, NULL);
+            temp = VK_NULL_HANDLE;
+            if (device->dispatch_table.CreatePipelineCache(device->dispatch_handle, &pcci, NULL,
+                                                           &temp) == VK_SUCCESS)
+               bcn_build_cache = temp;
+            else
+               bcn_build_cache = VK_NULL_HANDLE;
+         } else if (!known_split) {
+            device->bcn_cache_tainted = true;
+         }
          r = bcn_build_split(device, slot, &p);
+         if (r != VK_SUCCESS && bcn_build_cache && bcn_build_cache == device->bcn_pipeline_cache)
+            device->bcn_cache_tainted = true;
+         if (!known_split && r == VK_SUCCESS)
+            bcn_split_mask_add(device, slot);
          if (slot == BCN_SLOT_DECODE || slot == BCN_SLOT_ASTC4)
-            wrapper_diag_append("[BCN] GPU shader %s failed (VkResult %d), split variant VkResult %d\n",
-                                bcn_slot_names[slot], first, r);
+            wrapper_diag_append("[BCN] GPU shader %s %s (VkResult %d), split variant VkResult %d\n",
+                                bcn_slot_names[slot], known_split ? "known to fail" : "failed",
+                                first, r);
       }
+      if (temp) {
+         if (r == VK_SUCCESS) {
+            pthread_mutex_lock(&bcn_save_lock);
+            device->dispatch_table.MergePipelineCaches(device->dispatch_handle,
+                                                       device->bcn_pipeline_cache, 1, &temp);
+            pthread_mutex_unlock(&bcn_save_lock);
+         }
+         device->dispatch_table.DestroyPipelineCache(device->dispatch_handle, temp, NULL);
+      }
+      bcn_build_cache = VK_NULL_HANDLE;
       clock_gettime(CLOCK_MONOTONIC, &t1);
       if (r == VK_SUCCESS && !device->bcn_cache_tainted)
          bcn_cache_save(device);
@@ -791,6 +869,7 @@ bcn_tools_start(struct wrapper_device *device)
          fclose(f);
       }
       device->bcn_cache_warm = data != NULL;
+      device->bcn_split_slots = bcn_split_mask_read(device);
       VkPipelineCacheCreateInfo pcci = {
          .sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,
          .initialDataSize = data ? (size_t)len : 0,
