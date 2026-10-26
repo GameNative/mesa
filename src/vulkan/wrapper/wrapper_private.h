@@ -158,7 +158,7 @@ struct wrapper_device {
    VkDeviceMemory bcn_gate_memory;
    uint32_t *bcn_gate_map;
    uint32_t bcn_gate_used;
-   uint32_t bcn_gate_pending[64][5];
+   uint32_t bcn_gate_pending[64][6];
    uint32_t bcn_gate_pending_count;
    bool bcn_cache_warm;                    /* the pipeline cache file had data */
    VkQueue bcn_queue;                      /* where the worker runs the self-test */

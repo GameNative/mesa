@@ -389,7 +389,11 @@ int qbest(float x, int bits, int p, bool hasp, out int q)
 
 int bc7_w(uint ib, uint k)
 {
-   return ib == 2u ? w2[k] : ib == 3u ? w3[k] : w4[k];
+   if (ib == 2u)
+      return w2[k & 3u];
+   if (ib == 3u)
+      return w3[k & 7u];
+   return w4[k & 15u];
 }
 
 /* how far the selected texels are from their principal axis (RGB) */

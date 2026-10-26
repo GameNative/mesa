@@ -1135,6 +1135,13 @@ bcn_gate_create(struct wrapper_device *device)
 /* Counts of the gated dispatches whose pipeline has passed its self-test.
  * Those of a failed pipeline stay zero; those of a pipeline not tested yet
  * wait for a later test. Called with bcn_gpu_mutex held, after a self-test. */
+/* cond 1: only with every BC7 mode, 2: only with BC7 mode 6 alone */
+static bool
+bcn_gate_wanted(struct wrapper_device *device, uint32_t cond)
+{
+   return !cond || (cond == 2) == device->bcn_bc7_mode6;
+}
+
 static void
 bcn_gate_resolve(struct wrapper_device *device)
 {
@@ -1142,17 +1149,19 @@ bcn_gate_resolve(struct wrapper_device *device)
    for (uint32_t i = 0; i < device->bcn_gate_pending_count; i++) {
       uint32_t *p = device->bcn_gate_pending[i];
       int st = __atomic_load_n(&device->bcn_slot_state[p[1]], __ATOMIC_ACQUIRE);
-      if (st == BCN_TESTED)
-         memcpy(device->bcn_gate_map + p[0] * 3, p + 2, 3 * sizeof(uint32_t));
-      else if (st != BCN_FAILED)
-         memmove(device->bcn_gate_pending[kept++], p, 5 * sizeof(uint32_t));
+      if (st == BCN_TESTED) {
+         if (bcn_gate_wanted(device, p[5]))
+            memcpy(device->bcn_gate_map + p[0] * 3, p + 2, 3 * sizeof(uint32_t));
+      } else if (st != BCN_FAILED) {
+         memmove(device->bcn_gate_pending[kept++], p, 6 * sizeof(uint32_t));
+      }
    }
    device->bcn_gate_pending_count = kept;
 }
 
 static void
 bcn_gate_dispatch(struct wrapper_command_buffer *wcb, int slot, uint32_t x, uint32_t y,
-                  uint32_t z)
+                  uint32_t z, uint32_t cond)
 {
    struct wrapper_device *device = wcb->device;
    simple_mtx_lock(&device->bcn_gpu_mutex);
@@ -1170,13 +1179,17 @@ bcn_gate_dispatch(struct wrapper_command_buffer *wcb, int slot, uint32_t x, uint
    uint32_t e = device->bcn_gate_used++;
    uint32_t counts[3] = { x, y, z };
    if (__atomic_load_n(&device->bcn_slot_state[slot], __ATOMIC_ACQUIRE) == BCN_TESTED) {
-      memcpy(device->bcn_gate_map + e * 3, counts, sizeof(counts));
+      if (bcn_gate_wanted(device, cond))
+         memcpy(device->bcn_gate_map + e * 3, counts, sizeof(counts));
+      else
+         memset(device->bcn_gate_map + e * 3, 0, sizeof(counts));
    } else {
       memset(device->bcn_gate_map + e * 3, 0, sizeof(counts));
       uint32_t *p = device->bcn_gate_pending[device->bcn_gate_pending_count++];
       p[0] = e;
       p[1] = (uint32_t)slot;
       memcpy(p + 2, counts, sizeof(counts));
+      p[5] = cond;
    }
    simple_mtx_unlock(&device->bcn_gpu_mutex);
    device->dispatch_table.CmdDispatchIndirect(wcb->dispatch_handle, device->bcn_gate,
@@ -1184,8 +1197,8 @@ bcn_gate_dispatch(struct wrapper_command_buffer *wcb, int slot, uint32_t x, uint
 }
 
 static void
-bcn_dispatch(struct wrapper_command_buffer *wcb, VkPipeline pipeline, const struct bcn_pc *pc,
-             uint32_t layers)
+bcn_dispatch_cond(struct wrapper_command_buffer *wcb, VkPipeline pipeline,
+                  const struct bcn_pc *pc, uint32_t layers, uint32_t cond)
 {
    struct wrapper_device *device = wcb->device;
    struct bcn_pc p = *pc;
@@ -1205,9 +1218,9 @@ bcn_dispatch(struct wrapper_command_buffer *wcb, VkPipeline pipeline, const stru
             g = device->bcn_slot_group[i];
       }
    uint32_t gx = (pc->blocks_x + g - 1) / g, gy = (pc->blocks_y + g - 1) / g;
-   if (slot >= 0 &&
-       __atomic_load_n(&device->bcn_slot_state[slot], __ATOMIC_ACQUIRE) != BCN_TESTED)
-      bcn_gate_dispatch(wcb, slot, gx, gy, layers);
+   if (slot >= 0 && (cond ||
+       __atomic_load_n(&device->bcn_slot_state[slot], __ATOMIC_ACQUIRE) != BCN_TESTED))
+      bcn_gate_dispatch(wcb, slot, gx, gy, layers, cond);
    else
       device->dispatch_table.CmdDispatch(wcb->dispatch_handle, gx, gy, layers);
    bcn_barrier(wcb);
@@ -1217,6 +1230,13 @@ bcn_dispatch(struct wrapper_command_buffer *wcb, VkPipeline pipeline, const stru
    for (uint32_t i = 0; i < wcb->push_count; i++)
       device->dispatch_table.CmdPushConstants(wcb->dispatch_handle, wcb->push[i].layout,
          wcb->push[i].stages, wcb->push[i].offset, wcb->push[i].size, wcb->push[i].data);
+}
+
+static void
+bcn_dispatch(struct wrapper_command_buffer *wcb, VkPipeline pipeline, const struct bcn_pc *pc,
+             uint32_t layers)
+{
+   bcn_dispatch_cond(wcb, pipeline, pc, layers, 0);
 }
 
 static bool
@@ -1309,7 +1329,17 @@ bcn_encode_region(struct wrapper_command_buffer *wcb, struct wrapper_image *wi,
       .width = ext.width,
       .height = ext.height,
    };
-   bcn_dispatch(wcb, bcn_pipe(device, bcn_encode_slot(id), true), &pc, layers);
+   VkPipeline enc = bcn_pipe(device, bcn_encode_slot(id), true);
+   if (id == 10 && __atomic_load_n(&device->bcn_slot_state[BCN_SLOT_ENC_BC7],
+                                   __ATOMIC_ACQUIRE) != BCN_TESTED) {
+      /* which BC7 modes work is known once the self-test has run */
+      pc.flags &= ~8u;
+      bcn_dispatch_cond(wcb, enc, &pc, layers, 1);
+      pc.flags |= 8u;
+      bcn_dispatch_cond(wcb, enc, &pc, layers, 2);
+   } else {
+      bcn_dispatch(wcb, enc, &pc, layers);
+   }
    return blocks;
 }
 
