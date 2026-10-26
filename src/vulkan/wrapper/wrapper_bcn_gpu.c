@@ -472,6 +472,9 @@ bcn_cache_save(struct wrapper_device *device)
 static void
 bcn_selftest(struct wrapper_device *device, VkQueue queue, uint32_t family);
 
+static void
+bcn_gate_resolve(struct wrapper_device *device);
+
 static void *
 bcn_tools_worker(void *arg)
 {
@@ -649,8 +652,9 @@ bcn_tools_start(struct wrapper_device *device)
  * once it has passed its self-test; with a warm pipeline cache and the
  * wrapper's own queue the build and the check take milliseconds, so an
  * upload waits for them (up to 250 ms). Readbacks and copies, which have no
- * CPU path, wait for the build and the check; only without the wrapper's own
- * queue, where the check runs at the next submit, do they take it built. */
+ * CPU path, wait for the build and the check. Without the wrapper's own queue
+ * the check runs at the next submit: they take the pipeline built, and their
+ * dispatch is indirect with zero groups until the check passes. */
 static VkPipeline
 bcn_pipe(struct wrapper_device *device, int slot, bool wait)
 {
@@ -936,6 +940,7 @@ bcn_selftest(struct wrapper_device *device, VkQueue queue, uint32_t family)
       if (at >= sizeof(report))
          at = sizeof(report) - 1;
    }
+   bcn_gate_resolve(device);
    wrapper_diag_append("[BCN] GPU self-test ran=%d%s (%.0f ms)\n", ran, report,
                        (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6);
 
@@ -991,6 +996,10 @@ wrapper_bcn_gpu_finish(struct wrapper_device *device)
    for (int i = 0; i < 6; i++)
       if (modules[i])
          device->dispatch_table.DestroyShaderModule(d, modules[i], NULL);
+   if (device->bcn_gate)
+      device->dispatch_table.DestroyBuffer(d, device->bcn_gate, NULL);
+   if (device->bcn_gate_memory)
+      device->dispatch_table.FreeMemory(d, device->bcn_gate_memory, NULL);
    if (device->bcn_tables)
       device->dispatch_table.DestroyBuffer(d, device->bcn_tables, NULL);
    if (device->bcn_tables_memory)
@@ -1081,6 +1090,87 @@ bcn_image_barrier(struct wrapper_command_buffer *wcb, VkImage image, uint32_t la
 
 /* Runs one of the tool shaders in the application's command buffer and puts
  * back the compute pipeline and push constants the application had set. */
+#define BCN_GATE_ENTRIES 1024
+
+static bool
+bcn_gate_create(struct wrapper_device *device)
+{
+   VkDevice d = device->dispatch_handle;
+   VkBufferCreateInfo bci = {
+      .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+      .size = BCN_GATE_ENTRIES * 3 * sizeof(uint32_t),
+      .usage = VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
+      .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+   };
+   if (device->dispatch_table.CreateBuffer(d, &bci, NULL, &device->bcn_gate) != VK_SUCCESS)
+      return false;
+   VkMemoryRequirements mr;
+   device->dispatch_table.GetBufferMemoryRequirements(d, device->bcn_gate, &mr);
+   VkMemoryAllocateInfo ai = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      .allocationSize = mr.size,
+      .memoryTypeIndex = bcn_memory_type(device, mr.memoryTypeBits,
+         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
+   };
+   void *map;
+   if (ai.memoryTypeIndex == UINT32_MAX ||
+       device->dispatch_table.AllocateMemory(d, &ai, NULL, &device->bcn_gate_memory) !=
+          VK_SUCCESS ||
+       device->dispatch_table.BindBufferMemory(d, device->bcn_gate, device->bcn_gate_memory,
+                                               0) != VK_SUCCESS ||
+       device->dispatch_table.MapMemory(d, device->bcn_gate_memory, 0, VK_WHOLE_SIZE, 0,
+                                        &map) != VK_SUCCESS)
+      return false;
+   device->bcn_gate_map = map;
+   return true;
+}
+
+/* Counts of the gated dispatches whose pipeline has passed its self-test; the
+ * others stay zero. Called with bcn_gpu_mutex held, after a self-test. */
+static void
+bcn_gate_resolve(struct wrapper_device *device)
+{
+   for (uint32_t i = 0; i < device->bcn_gate_pending_count; i++) {
+      uint32_t *p = device->bcn_gate_pending[i];
+      if (__atomic_load_n(&device->bcn_slot_state[p[1]], __ATOMIC_ACQUIRE) == BCN_TESTED)
+         memcpy(device->bcn_gate_map + p[0] * 3, p + 2, 3 * sizeof(uint32_t));
+   }
+   device->bcn_gate_pending_count = 0;
+}
+
+static void
+bcn_gate_dispatch(struct wrapper_command_buffer *wcb, int slot, uint32_t x, uint32_t y,
+                  uint32_t z)
+{
+   struct wrapper_device *device = wcb->device;
+   simple_mtx_lock(&device->bcn_gpu_mutex);
+   if ((!device->bcn_gate_map && !bcn_gate_create(device)) ||
+       device->bcn_gate_used >= BCN_GATE_ENTRIES ||
+       device->bcn_gate_pending_count >= ARRAY_SIZE(device->bcn_gate_pending)) {
+      simple_mtx_unlock(&device->bcn_gpu_mutex);
+      static bool logged;
+      if (!logged)
+         wrapper_diag_append("[BCN] dispatch of an untested %s shader dropped\n",
+                             bcn_slot_names[slot]);
+      logged = true;
+      return;
+   }
+   uint32_t e = device->bcn_gate_used++;
+   uint32_t counts[3] = { x, y, z };
+   if (__atomic_load_n(&device->bcn_slot_state[slot], __ATOMIC_ACQUIRE) == BCN_TESTED) {
+      memcpy(device->bcn_gate_map + e * 3, counts, sizeof(counts));
+   } else {
+      memset(device->bcn_gate_map + e * 3, 0, sizeof(counts));
+      uint32_t *p = device->bcn_gate_pending[device->bcn_gate_pending_count++];
+      p[0] = e;
+      p[1] = (uint32_t)slot;
+      memcpy(p + 2, counts, sizeof(counts));
+   }
+   simple_mtx_unlock(&device->bcn_gpu_mutex);
+   device->dispatch_table.CmdDispatchIndirect(wcb->dispatch_handle, device->bcn_gate,
+                                              (VkDeviceSize)e * 3 * sizeof(uint32_t));
+}
+
 static void
 bcn_dispatch(struct wrapper_command_buffer *wcb, VkPipeline pipeline, const struct bcn_pc *pc,
              uint32_t layers)
@@ -1095,11 +1185,19 @@ bcn_dispatch(struct wrapper_command_buffer *wcb, VkPipeline pipeline, const stru
    device->dispatch_table.CmdPushConstants(wcb->dispatch_handle, device->bcn_tool_layout,
       VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(p), &p);
    uint32_t g = 8;
+   int slot = -1;
    for (int i = 0; i < BCN_SLOT_COUNT; i++)
-      if (device->bcn_pipe[i] == pipeline && device->bcn_slot_group[i])
-         g = device->bcn_slot_group[i];
-   device->dispatch_table.CmdDispatch(wcb->dispatch_handle, (pc->blocks_x + g - 1) / g,
-      (pc->blocks_y + g - 1) / g, layers);
+      if (device->bcn_pipe[i] == pipeline) {
+         slot = i;
+         if (device->bcn_slot_group[i])
+            g = device->bcn_slot_group[i];
+      }
+   uint32_t gx = (pc->blocks_x + g - 1) / g, gy = (pc->blocks_y + g - 1) / g;
+   if (slot >= 0 &&
+       __atomic_load_n(&device->bcn_slot_state[slot], __ATOMIC_ACQUIRE) != BCN_TESTED)
+      bcn_gate_dispatch(wcb, slot, gx, gy, layers);
+   else
+      device->dispatch_table.CmdDispatch(wcb->dispatch_handle, gx, gy, layers);
    bcn_barrier(wcb);
    if (wcb->compute_pipeline)
       device->dispatch_table.CmdBindPipeline(wcb->dispatch_handle,
