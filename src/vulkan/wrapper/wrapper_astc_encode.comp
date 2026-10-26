@@ -448,14 +448,39 @@ vec4 texel(uint i)
    return t;
 }
 
-/* The luminance or RGB class with a full weight grid, computed as below but
+/* A class whose block mode has a full weight grid, computed as below but
  * reading the texels again from memory in each pass instead of keeping them
- * in arrays. */
-void encode_full(uint cls, uint cand, uint cq)
+ * in arrays. Returns the block error; with pack set, writes the block. */
+vec4 cls_mask(uint cls)
+{
+   bool dual = cls == 2u || cls == 5u;
+   return cls == 0u ? vec4(1.0, 0.0, 0.0, 0.0) : cls <= 2u ? vec4(1.0, 0.0, 0.0, dual ? 0.0 : 1.0)
+        : cls == 3u ? vec4(1.0, 1.0, 1.0, 0.0) : vec4(1.0, 1.0, 1.0, dual ? 0.0 : 1.0);
+}
+
+uint full_cq(uint cls, uint cand)
+{
+   bool dual = cls == 2u || cls == 5u;
+   uint wbits = ise_size(N * (dual ? 2u : 1u), (cand >> 19) & 31u);
+   uint cbits = 128u - 17u - wbits - (dual ? 2u : 0u);
+   uint cq = 20u;
+   while (cq > 4u && ise_size(nvals(cls), cq) > cbits)
+      cq--;
+   return cq;
+}
+
+float encode_full(uint cls, uint cand, bool pack)
 {
    uint mode = cand & 2047u, wq = (cand >> 19) & 31u;
-   vec4 m = cls == 0u ? vec4(1.0, 0.0, 0.0, 0.0) : vec4(1.0, 1.0, 1.0, 0.0);
-   uint nc = cls == 0u ? 1u : 3u;
+   uint cq = full_cq(cls, cand);
+   bool dual = cls == 2u || cls == 5u;
+   uint planes = dual ? 2u : 1u;
+   vec4 m = cls_mask(cls);
+   uint cs = dual ? 3u : 4u;
+   vec4 m2 = vec4(0.0);
+   if (dual)
+      m2[cs] = 1.0;
+
    vec4 mean = vec4(0.0);
    [[dont_unroll]] for (uint i = 0u; i < N; i++)
       mean += texel(i);
@@ -485,67 +510,123 @@ void encode_full(uint cls, uint cand, uint cq)
       }
    }
    vec4 e0 = mean + a * tmin, e1 = mean + a * tmax;
+   if (dual) {
+      e0[cs] = lo[cs];
+      e1[cs] = hi[cs];
+   }
 
-   vec4 d = (e1 - e0) * m;
-   l = dot(d, d);
-   float aa = 0.0, ab = 0.0, bb = 0.0;
-   vec4 ax = vec4(0.0), bx = vec4(0.0);
+   vec4 d0 = (e1 - e0) * m, d1 = (e1 - e0) * m2;
+   float l0 = dot(d0, d0), l1 = dot(d1, d1);
+   vec2 aa = vec2(0.0), ab = vec2(0.0), bb = vec2(0.0);
+   vec4 ax0 = vec4(0.0), bx0 = vec4(0.0), ax1 = vec4(0.0), bx1 = vec4(0.0);
    [[dont_unroll]] for (uint i = 0u; i < N; i++) {
       vec4 t = texel(i);
-      float id = l > 0.0 ? clamp(dot((t - e0) * m, d) / l, 0.0, 1.0) : 0.0;
+      float id = l0 > 0.0 ? clamp(dot((t - e0) * m, d0) / l0, 0.0, 1.0) : 0.0;
       float w = float(wunq(wq, wquant(wq, uint(id * 64.0 + 0.5)))) / 64.0;
-      aa += (1.0 - w) * (1.0 - w);
-      ab += (1.0 - w) * w;
-      bb += w * w;
-      ax += (1.0 - w) * t;
-      bx += w * t;
-   }
-   float det = aa * bb - ab * ab;
-   if (abs(det) >= 1e-6) {
-      for (uint c = 0u; c < nc; c++) {
-         e0[c] = clamp((ax[c] * bb - bx[c] * ab) / det, 0.0, 255.0);
-         e1[c] = clamp((bx[c] * aa - ax[c] * ab) / det, 0.0, 255.0);
+      aa.x += (1.0 - w) * (1.0 - w);
+      ab.x += (1.0 - w) * w;
+      bb.x += w * w;
+      ax0 += (1.0 - w) * t;
+      bx0 += w * t;
+      if (dual) {
+         id = l1 > 0.0 ? clamp(dot((t - e0) * m2, d1) / l1, 0.0, 1.0) : 0.0;
+         w = float(wunq(wq, wquant(wq, uint(id * 64.0 + 0.5)))) / 64.0;
+         aa.y += (1.0 - w) * (1.0 - w);
+         ab.y += (1.0 - w) * w;
+         bb.y += w * w;
+         ax1 += (1.0 - w) * t;
+         bx1 += w * t;
       }
    }
+   for (uint c = 0u; c < 4u; c++) {
+      bool in1 = m[c] > 0.0, in2 = dual && c == cs;
+      if (!in1 && !in2)
+         continue;
+      uint p = in2 ? 1u : 0u;
+      float det = aa[p] * bb[p] - ab[p] * ab[p];
+      if (abs(det) < 1e-6)
+         continue;
+      float ax = in2 ? ax1[c] : ax0[c], bx = in2 ? bx1[c] : bx0[c];
+      e0[c] = clamp((ax * bb[p] - bx * ab[p]) / det, 0.0, 255.0);
+      e1[c] = clamp((bx * aa[p] - ax * ab[p]) / det, 0.0, 255.0);
+   }
    quantize_endpoints(cq, e0, e1);
-   if (cls == 3u && ue1.r + ue1.g + ue1.b < ue0.r + ue0.g + ue0.b) {
+   if (cls >= 3u && ue1.r + ue1.g + ue1.b < ue0.r + ue0.g + ue0.b) {
       uvec4 t = qe0; qe0 = qe1; qe1 = t;
       t = ue0; ue0 = ue1; ue1 = t;
    }
 
-   ob[0] = 0u; ob[1] = 0u; ob[2] = 0u; ob[3] = 0u;
-   setbits(0u, 11u, mode);
-   setbits(13u, 4u, mode_bits_cem(cls));
-   ise_vals[0] = qe0.r; ise_vals[1] = qe1.r;
-   ise_vals[2] = qe0.g; ise_vals[3] = qe1.g;
-   ise_vals[4] = qe0.b; ise_vals[5] = qe1.b;
-   ise_encode(nvals(cls), cq);
-   [[dont_unroll]] for (uint b = 0u; b < ipos; b++)
-      if (((ib[b >> 5] >> (b & 31u)) & 1u) != 0u)
-         setbits(17u + b, 1u, 1u);
-
    vec4 de0 = vec4(ue0), de1 = vec4(ue1);
-   d = (de1 - de0) * m;
-   l = dot(d, d);
+   d0 = (de1 - de0) * m;
+   d1 = (de1 - de0) * m2;
+   l0 = dot(d0, d0);
+   l1 = dot(d1, d1);
    bool plain = !qr_trits(wq) && !qr_quints(wq);
    uint wb = qr_bits(wq);
-   [[dont_unroll]] for (uint i = 0u; i < N; i++) {
-      float id = l > 0.0 ? clamp(dot((texel(i) - de0) * m, d) / l, 0.0, 1.0) : 0.0;
-      uint v = wquant(wq, uint(id * 64.0 + 0.5));
-      if (plain) {
-         [[dont_unroll]] for (uint k = 0u; k < wb; k++)
-            if (((v >> k) & 1u) != 0u)
-               setbits(127u - (i * wb + k), 1u, 1u);
+   uint nw = N * planes;
+   if (pack) {
+      ob[0] = 0u; ob[1] = 0u; ob[2] = 0u; ob[3] = 0u;
+      setbits(0u, 11u, mode);
+      setbits(13u, 4u, mode_bits_cem(cls));
+      uint n = 0u;
+      if (cls == 0u) {
+         ise_vals[n++] = qe0.r; ise_vals[n++] = qe1.r;
+      } else if (cls <= 2u) {
+         ise_vals[n++] = qe0.r; ise_vals[n++] = qe1.r;
+         ise_vals[n++] = qe0.a; ise_vals[n++] = qe1.a;
       } else {
-         ise_vals[i] = v;
+         [[dont_unroll]] for (uint c = 0u; c < (cls == 3u ? 3u : 4u); c++) {
+            ise_vals[n++] = qe0[c];
+            ise_vals[n++] = qe1[c];
+         }
+      }
+      ise_encode(n, cq);
+      [[dont_unroll]] for (uint b = 0u; b < ipos; b++)
+         if (((ib[b >> 5] >> (b & 31u)) & 1u) != 0u)
+            setbits(17u + b, 1u, 1u);
+      if (dual)
+         setbits(128u - ise_size(nw, wq) - 2u, 2u, cs);
+   }
+   float err = 0.0;
+   [[dont_unroll]] for (uint i = 0u; i < N; i++) {
+      vec4 t = texel(i);
+      float id = l0 > 0.0 ? clamp(dot((t - de0) * m, d0) / l0, 0.0, 1.0) : 0.0;
+      uint v0 = wquant(wq, uint(id * 64.0 + 0.5)), v1 = 0u;
+      float w0 = float(wunq(wq, v0)) / 64.0, w1 = 0.0;
+      if (dual) {
+         id = l1 > 0.0 ? clamp(dot((t - de0) * m2, d1) / l1, 0.0, 1.0) : 0.0;
+         v1 = wquant(wq, uint(id * 64.0 + 0.5));
+         w1 = float(wunq(wq, v1)) / 64.0;
+      }
+      if (pack) {
+         [[dont_unroll]] for (uint p = 0u; p < planes; p++) {
+            uint v = p == 0u ? v0 : v1, k = i * planes + p;
+            if (plain) {
+               [[dont_unroll]] for (uint b = 0u; b < wb; b++)
+                  if (((v >> b) & 1u) != 0u)
+                     setbits(127u - (k * wb + b), 1u, 1u);
+            } else {
+               ise_vals[k] = v;
+            }
+         }
+      } else {
+         for (uint c = 0u; c < 4u; c++) {
+            bool in2 = dual && c == cs;
+            if (!(m[c] > 0.0) && !in2)
+               continue;
+            float v = mix(float(ue0[c]), float(ue1[c]), in2 ? w1 : w0);
+            float e = v - t[c];
+            err += e * e;
+         }
       }
    }
-   if (!plain) {
-      ise_encode(N, wq);
+   if (pack && !plain) {
+      ise_encode(nw, wq);
       [[dont_unroll]] for (uint b = 0u; b < ipos; b++)
          if (((ib[b >> 5] >> (b & 31u)) & 1u) != 0u)
             setbits(127u - b, 1u, 1u);
    }
+   return err;
 }
 
 void main()
@@ -592,23 +673,32 @@ void main()
    }
 
    uint bsi = B == 4u ? 0u : B == 6u ? 1u : 2u;
-   if ((kind == 0u && lo.a == 255.0) || kind == 1u) {
-      uint cls = kind == 1u ? 0u : 3u;
-      uint ci = bsi * 6u + cls;
-      uint cand = astc_cand[astc_cand_off[ci]];
-      if (astc_cand_off[ci + 1u] == astc_cand_off[ci] + 1u &&
-          ((cand >> 11) & 15u) == B && ((cand >> 15) & 15u) == B) {
-         uint wbits = ise_size(N, (cand >> 19) & 31u);
-         uint cq = 20u;
-         while (cq > 4u && ise_size(nvals(cls), cq) > 128u - 17u - wbits)
-            cq--;
-         encode_full(cls, cand, cq);
-         d.w[off] = ob[0];
-         d.w[off + 1u] = ob[1];
-         d.w[off + 2u] = ob[2];
-         d.w[off + 3u] = ob[3];
-         return;
+   uint fc0 = kind == 1u ? 0u : kind == 2u ? 1u : lo.a == 255.0 ? 3u : 4u;
+   uint fc1 = kind == 1u ? 0u : kind == 2u ? 2u : lo.a == 255.0 ? 3u : 5u;
+   bool full = true;
+   for (uint cls = fc0; cls <= fc1; cls++) {
+      uint ci = bsi * 6u + cls, cand = astc_cand[astc_cand_off[ci]];
+      full = full && astc_cand_off[ci + 1u] == astc_cand_off[ci] + 1u &&
+             ((cand >> 11) & 15u) == B && ((cand >> 15) & 15u) == B;
+   }
+   if (full) {
+      uint pick = fc0;
+      if (fc1 > fc0) {
+         float best = 1e30;
+         [[dont_unroll]] for (uint cls = fc0; cls <= fc1; cls++) {
+            float err = encode_full(cls, astc_cand[astc_cand_off[bsi * 6u + cls]], false);
+            if (!(err >= best)) {
+               best = err;
+               pick = cls;
+            }
+         }
       }
+      encode_full(pick, astc_cand[astc_cand_off[bsi * 6u + pick]], true);
+      d.w[off] = ob[0];
+      d.w[off + 1u] = ob[1];
+      d.w[off + 2u] = ob[2];
+      d.w[off + 3u] = ob[3];
+      return;
    }
 
    [[dont_unroll]] for (uint i = 0u; i < N; i++)
