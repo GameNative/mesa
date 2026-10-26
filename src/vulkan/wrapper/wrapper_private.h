@@ -165,6 +165,7 @@ struct wrapper_device {
    VkShaderModule bcn_split_modules[2];    /* decode per format, ASTC 4x4 without the direct step */
    VkPipeline bcn_decode_fmt[11];          /* per-format decoders when the full one does not build */
    bool bcn_decode_split;
+   uint32_t bcn_decode_bad;                /* format ids whose GPU decode failed the self-test */
    VkPipeline bcn_pipe[BCN_SLOT_COUNT];
    uint32_t bcn_slot_group[BCN_SLOT_COUNT]; /* blocks per workgroup edge */
    uint32_t bcn_astc_block_only;           /* slots whose workgroup encoder failed */

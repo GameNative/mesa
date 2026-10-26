@@ -894,7 +894,7 @@ bcn_selftest(struct wrapper_device *device, VkQueue queue, uint32_t family)
    bool bufs = true;
    for (int k = 0; k < n && bufs; k++)
       bufs = bcn_selftest_buffer(device, 256, &in[todo[k]]) &&
-             bcn_selftest_buffer(device, 128, &out[todo[k]]);
+             bcn_selftest_buffer(device, 256, &out[todo[k]]);
    if (bufs &&
        device->dispatch_table.CreateCommandPool(device->dispatch_handle, &cpci, NULL, &pool) ==
           VK_SUCCESS &&
@@ -967,6 +967,31 @@ bcn_selftest(struct wrapper_device *device, VkQueue queue, uint32_t family)
             pc.bc[1] = (uint32_t)(ba >> 32);
             bcn_selftest_push(device, cb, device->bcn_pipe[s], &pc);
          }
+         VkPipeline bc2_decoder = s != BCN_SLOT_DECODE ? VK_NULL_HANDLE :
+                                  device->bcn_decode_split ? device->bcn_decode_fmt[2] :
+                                  device->bcn_pipe[s];
+         if (bc2_decoder) {
+            /* BC2: explicit alpha 0..15, red and blue endpoints, decoded twice */
+            static const uint8_t bc2[16] = { 0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe,
+                                             0x00, 0xf8, 0x1f, 0x00, 0x1b, 0x6c, 0xb1, 0xe4 };
+            memcpy(src + 64, bc2, 16);
+            VkDeviceAddress ba = in[s].address + 64;
+            for (int r = 0; r < 2; r++) {
+               VkDeviceAddress da = out[s].address + 64 + 64 * r;
+               struct bcn_pc q = pc;
+               q.src[0] = (uint32_t)ba;
+               q.src[1] = (uint32_t)(ba >> 32);
+               q.dst[0] = (uint32_t)da;
+               q.dst[1] = (uint32_t)(da >> 32);
+               q.src_row_pitch = 16;
+               q.src_slice_pitch = 16;
+               q.dst_row_pitch = 16;
+               q.dst_slice_pitch = 64;
+               q.format = 2;
+               q.flags = 0;
+               bcn_selftest_push(device, cb, bc2_decoder, &q);
+            }
+         }
          if (s == BCN_SLOT_ASTC4) {
             /* varying alpha (the BC2 case), encoded twice */
             uint8_t *t = src + 128;
@@ -1021,6 +1046,18 @@ bcn_selftest(struct wrapper_device *device, VkQueue queue, uint32_t family)
          ok = true;
          for (int i = 0; i < 16; i++)
             ok = ok && !memcmp(o + i * 4, pal[i & 3], 4);
+         if (ok && (device->bcn_decode_split ? device->bcn_decode_fmt[2] : device->bcn_pipe[s])) {
+            uint8_t want[64];
+            bool bc2_ok = true;
+            wrapper_bcn_decode_bc2_block(in[s].map + 64, want);
+            for (int i = 0; i < 64 && bc2_ok; i++)
+               bc2_ok = o[64 + i] == o[128 + i] && abs((int)o[64 + i] - (int)want[i]) <= 1;
+            if (!bc2_ok) {
+               __atomic_or_fetch(&device->bcn_decode_bad, 1u << 2, __ATOMIC_RELEASE);
+               at += snprintf(report + at, sizeof(report) - MIN2(at, sizeof(report)),
+                              " decode-bc2=off");
+            }
+         }
       } else if (o && (s == BCN_SLOT_HDR || s <= BCN_SLOT_ASTC8)) {
          uint32_t w0;
          memcpy(&w0, o, 4);
@@ -1771,6 +1808,8 @@ bcn_gpu_upload_region(struct wrapper_command_buffer *wcb, struct wrapper_image *
    VkPipeline decoder = bcn_pipe(device, BCN_SLOT_DECODE, wait);
    if (decoder && device->bcn_decode_split)
       decoder = id == 0 ? decoder : device->bcn_decode_fmt[id];
+   if ((__atomic_load_n(&device->bcn_decode_bad, __ATOMIC_ACQUIRE) >> id) & 1u)
+      decoder = VK_NULL_HANDLE;
    VkPipeline encoder = hdr ? bcn_pipe(device, BCN_SLOT_HDR, wait) :
                         astc ? bcn_pipe(device, astc == 4 ? BCN_SLOT_ASTC4 :
                                         astc == 6 ? BCN_SLOT_ASTC6 : BCN_SLOT_ASTC8, wait) :

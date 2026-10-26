@@ -1622,3 +1622,9 @@ bcn_scan_shader(const uint32_t *code, size_t size)
    }
    return 1;
 }
+
+void
+wrapper_bcn_decode_bc2_block(const uint8_t blk[16], uint8_t rgba[64])
+{
+   bcdec_bc2(blk, rgba, 16);
+}
