@@ -10,6 +10,9 @@ get_format_for_bcn(VkFormat bcn_format);
 void
 wrapper_bcn_store_4x4_decoded(void);
 
+void
+wrapper_bcn_decode_bc2_block(const uint8_t blk[16], uint8_t rgba[64]);
+
 VkFormat
 get_decode_format_for_bcn(VkFormat bcn_format);
 

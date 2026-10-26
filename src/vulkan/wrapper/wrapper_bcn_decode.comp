@@ -148,7 +148,7 @@ uint rgb565_r(uint c) { return ((c >> 11) & 31u); }
 uint rgb565_g(uint c) { return ((c >> 5) & 63u); }
 uint rgb565_b(uint c) { return (c & 31u); }
 
-void decode_color(uint w0, uint w1, bool only_opaque)
+void decode_color(uint w0, uint w1, bool only_opaque, bool explicit_alpha)
 {
    uint c0 = w0 & 0xffffu, c1 = w0 >> 16;
    uint r0 = rgb565_r(c0), g0 = rgb565_g(c0), b0 = rgb565_b(c0);
@@ -166,8 +166,14 @@ void decode_color(uint w0, uint w1, bool only_opaque)
                ((((g0 + g1) * 4145u + 1019u) >> 11) << 8) | (((r0 + r1) * 1053u + 125u) >> 8);
       ref[3] = 0u;
    }
-   for (uint i = 0u; i < 16u; i++)
-      texels[i] = ref[(w1 >> (2u * i)) & 3u];
+   for (uint i = 0u; i < 16u; i++) {
+      uint c = ref[(w1 >> (2u * i)) & 3u];
+      if (explicit_alpha) {
+         uint a = ((i < 8u ? blk.x : blk.y) >> (4u * (i & 7u))) & 15u;
+         c = (c & 0x00ffffffu) | ((a * 17u) << 24);
+      }
+      texels[i] = c;
+   }
 }
 
 /* BC3/BC4 style 8-value channel block, bcdec precise integer weights. */
@@ -485,18 +491,13 @@ void main()
    if ((pc.flags & 2u) != 0u && fmt == 8u)
       tsize = 4u;
    if (fmt <= 1u) {
-      decode_color(blk.x, blk.y, false);
+      decode_color(blk.x, blk.y, false, false);
       if (fmt == 1u)
          for (uint i = 0u; i < 16u; i++) texels[i] |= 0xff000000u;
    } else if (fmt == 2u) {
-      decode_color(blk.z, blk.w, true);
-      for (uint i = 0u; i < 16u; i++) {
-         uint word = i < 8u ? blk.x : blk.y;
-         uint a = (word >> (4u * (i & 7u))) & 15u;
-         texels[i] = (texels[i] & 0x00ffffffu) | ((a * 17u) << 24);
-      }
+      decode_color(blk.z, blk.w, true, true);
    } else if (fmt == 3u) {
-      decode_color(blk.z, blk.w, true);
+      decode_color(blk.z, blk.w, true, false);
       decode_alpha_bc3(blk.x, blk.y);
    } else if (fmt == 4u || fmt == 5u) {
       int v[16];
