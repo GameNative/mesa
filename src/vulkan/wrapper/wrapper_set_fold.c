@@ -652,7 +652,7 @@ fold_instance_create(struct wrapper_device *device, struct fold_merge *m,
          uint32_t limit = fold_member_limit(inst, k, l->bindings[b].vk.binding);
          if (count > limit && !inst->truncation_logged) {
             inst->truncation_logged = true;
-            WRAPPER_LOG(error, "Folded heap set %p: binding %u holds %u descriptors but only %u "
+            WRAPPER_LOG(info, "Folded heap set %p: binding %u holds %u descriptors but only %u "
                         "fit under the set budget; descriptors above %u are dropped",
                         (void *)inst, l->bindings[b].vk.binding, count, limit, limit - 1);
          }
@@ -697,7 +697,7 @@ fold_resolve(struct wrapper_device *device, VkDescriptorSet *set, uint32_t *bind
    if (*element >= limit) {
       if (!fs->instance->truncation_logged) {
          fs->instance->truncation_logged = true;
-         WRAPPER_LOG(error, "Folded heap set %p: descriptor %u of binding %u is above the array size %u; "
+         WRAPPER_LOG(info, "Folded heap set %p: descriptor %u of binding %u is above the array size %u; "
                      "accesses above it are dropped", (void *)(uintptr_t)fs->instance->set,
                      *element, *binding, limit);
       }
