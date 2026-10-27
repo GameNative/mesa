@@ -127,6 +127,7 @@ void write_to_logfile(const char *fmt, const char *level, ...)  {
       fprintf(stderr, "[%s]: ", level);
       vfprintf(stderr, fmt, va2);
       fprintf(stderr, "\n");
+      fflush(stderr);
       va_end(va2);
    }
 
