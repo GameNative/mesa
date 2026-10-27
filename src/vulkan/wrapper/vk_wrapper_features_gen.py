@@ -167,6 +167,7 @@ TEMPLATE_C = Template(COPYRIGHT + """
 /* This file generated from ${filename}, don't edit directly. */
 
 #include "wrapper_private.h"
+#include "wrapper_log.h"
 #include "vk_physical_device_features.h"
 #include "vk_util.h"
 
@@ -194,6 +195,60 @@ wrapper_setup_device_features(struct wrapper_physical_device *physical_device)
    vk_set_physical_device_features(&physical_device->vk.supported_features,
                                    &supported_features2);
 }
+
+#define MASK(s, name, flat) \\
+   if ((s)->name && !base->flat) { \\
+      WRAPPER_LOG(info, "Not requesting %s.%s from the driver: unsupported", what, #name); \\
+      (s)->name = VK_FALSE; \\
+      dropped++; \\
+   }
+
+static unsigned
+wrapper_mask_features_1_0(const struct vk_features *base, VkPhysicalDeviceFeatures *f,
+                          const char *what)
+{
+   unsigned dropped = 0;
+% for flag in pdev_features:
+   MASK(f, ${flag}, ${flag})
+% endfor
+   return dropped;
+}
+
+unsigned
+wrapper_mask_feature_chain(const struct wrapper_physical_device *physical_device,
+                           VkPhysicalDeviceFeatures *enabled_features,
+                           void *chain)
+{
+   const struct vk_features *base = &physical_device->base_supported_features;
+   unsigned dropped = 0;
+
+   if (enabled_features)
+      dropped += wrapper_mask_features_1_0(base, enabled_features, "VkPhysicalDeviceFeatures");
+
+   vk_foreach_struct(ext, chain) {
+      switch (ext->sType) {
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2:
+         dropped += wrapper_mask_features_1_0(base,
+            &((VkPhysicalDeviceFeatures2 *)ext)->features, "VkPhysicalDeviceFeatures2");
+         break;
+% for f in feature_structs:
+      case ${f.s_type}: {
+         ${f.c_type} *s = (void *)ext;
+         const char *what = "${f.c_type}";
+% for flag in f.features:
+         MASK(s, ${flag}, ${get_renamed_feature(f.c_type, flag)})
+% endfor
+         break;
+      }
+% endfor
+      default:
+         break;
+      }
+   }
+   return dropped;
+}
+
+#undef MASK
 """)
 
 def get_pdev_features(doc):

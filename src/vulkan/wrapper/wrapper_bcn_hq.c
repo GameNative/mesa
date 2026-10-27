@@ -309,7 +309,7 @@ wrapper_bcn_hq_capture(struct wrapper_command_buffer *wcb, struct wrapper_image 
    struct wrapper_device *device = wcb->device;
    VkFormat format = wi->info.format;
    wrapper_bcn_hq_write(device, wi, &c->imageSubresource, c->imageOffset, c->imageExtent);
-   if (!hq_enabled() || !wb || wb->device_only || wi->mip_drop ||
+   if (!hq_enabled() || !wb || wb->device_only || wi->mip_drop || wcb->secondary ||
        wi->info.sharingMode != VK_SHARING_MODE_EXCLUSIVE)
       return;
    struct bcn_hq *hq = hq_get(device);

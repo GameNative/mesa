@@ -63,6 +63,14 @@ wrapper_effective_api_version(struct wrapper_physical_device *pdevice,
       }
    }
 
+   if (requested > base_api_version && base_api_version < VK_API_VERSION_1_3 &&
+       !pdevice->emulate_vulkan13 && engine && !strcmp(engine, "mesa zink")) {
+      WRAPPER_LOG(info, "Reporting the base Vulkan %u.%u to zink",
+                  VK_API_VERSION_MAJOR(base_api_version),
+                  VK_API_VERSION_MINOR(base_api_version));
+      return base_api_version;
+   }
+
    return requested ? requested : base_api_version;
 }
 
@@ -79,6 +87,30 @@ get_driver_version(const uint32_t driverVersion)
 	asprintf(&driver_version, "%d.%d.%d", major, minor, patch);
 
 	return driver_version;
+}
+
+/* DXVK 2.5+ uploads textures on a family without graphics when one exists;
+ * Xclipse 960 loses those uploads. Keep DXVK on the graphics queue. */
+static void
+wrapper_hide_compute_queue_families(struct wrapper_physical_device *pdevice)
+{
+   uint32_t count = 0;
+   pdevice->dispatch_table.GetPhysicalDeviceQueueFamilyProperties(
+      pdevice->dispatch_handle, &count, NULL);
+   VkQueueFamilyProperties *families = calloc(count, sizeof(*families));
+   if (!families)
+      return;
+   pdevice->dispatch_table.GetPhysicalDeviceQueueFamilyProperties(
+      pdevice->dispatch_handle, &count, families);
+   uint32_t visible = count;
+   while (visible && !(families[visible - 1].queueFlags & VK_QUEUE_GRAPHICS_BIT))
+      visible--;
+   free(families);
+   if (!visible || visible == count)
+      return;
+   WRAPPER_LOG(info, "Reporting %u of %u queue families: DXVK uploads on the graphics queue",
+               visible, count);
+   pdevice->queue_family_count = visible;
 }
 
 static VkResult
@@ -141,6 +173,41 @@ wrapper_wsi_proc_addr(VkPhysicalDevice physicalDevice, const char *pName)
 {
    VK_FROM_HANDLE(vk_physical_device, pdevice, physicalDevice);
    return vk_instance_get_proc_addr_unchecked(pdevice->instance, pName);
+}
+
+static void
+wrapper_setup_coherent_memory_types(struct wrapper_physical_device *pdevice)
+{
+   const VkPhysicalDeviceMemoryProperties *props = &pdevice->memory_properties;
+   const char *engine = pdevice->instance->vk.app_info.engine_name;
+   const VkMemoryPropertyFlags host =
+      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+   bool remap = engine && strstr(engine, "vkd3d") &&
+      pdevice->instance->vk.app_info.engine_version < VK_MAKE_VERSION(3, 0, 0);
+
+   for (uint32_t i = 0; i < VK_MAX_MEMORY_TYPES; i++)
+      pdevice->coherent_memory_type[i] = i;
+
+   if (!remap)
+      return;
+
+   for (uint32_t i = 0; i < props->memoryTypeCount; i++) {
+      VkMemoryPropertyFlags flags = props->memoryTypes[i].propertyFlags;
+      if ((flags & host) != VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
+         continue;
+      for (uint32_t j = 0; j < props->memoryTypeCount; j++) {
+         VkMemoryPropertyFlags other = props->memoryTypes[j].propertyFlags;
+         if (props->memoryTypes[j].heapIndex == props->memoryTypes[i].heapIndex &&
+             (other & host) == host &&
+             (other & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) ==
+                (flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
+             !(other & VK_MEMORY_PROPERTY_PROTECTED_BIT)) {
+            WRAPPER_LOG(info, "Backing non-coherent memory type %u with coherent type %u", i, j);
+            pdevice->coherent_memory_type[i] = j;
+            break;
+         }
+      }
+   }
 }
 
 /* Auto mode: a BC format the base driver can sample and copy into in optimal
@@ -323,21 +390,40 @@ VkResult enumerate_physical_device(struct vk_instance *_instance)
       pdevice->dispatch_table.GetPhysicalDeviceProperties2(
          pdevice->dispatch_handle, &pdevice->properties2);
 
+      /* Only DXVK needs the raised limit; vkd3d-proton works within the real
+       * one. The raised limit is not real storage: DXVK's independent GPL
+       * layouts push 224 bytes and overrun the driver's command buffer. */
+      const char *engine = pdevice->instance->vk.app_info.engine_name;
+      pdevice->raises_push_constant_limit =
+         pdevice->driver_properties.driverID == VK_DRIVER_ID_SAMSUNG_PROPRIETARY &&
+         pdevice->properties2.properties.limits.maxPushConstantsSize < 256 &&
+         !(engine && strstr(engine, "vkd3d"));
+      if (pdevice->raises_push_constant_limit &&
+          pdevice->vk.supported_extensions.EXT_graphics_pipeline_library) {
+         WRAPPER_LOG(info, "Hiding VK_EXT_graphics_pipeline_library: the driver stores only %u bytes of push constants",
+                     pdevice->properties2.properties.limits.maxPushConstantsSize);
+         pdevice->vk.supported_extensions.EXT_graphics_pipeline_library = false;
+      }
+
       /* Raising the reported core version above the base ICD requires
        * substantial lowering. Keep it opt-in and select it from the actual API
        * gap, not from a vendor ID. */
       pdevice->emulate_vulkan13 =
-         getenv("WRAPPER_EMULATE_VULKAN_1_3") &&
-         atoi(getenv("WRAPPER_EMULATE_VULKAN_1_3")) &&
-         pdevice->properties2.properties.apiVersion < VK_API_VERSION_1_3;
+         wrapper_core13_wanted(pdevice, instance->vk.app_info.engine_name);
       if (pdevice->emulate_vulkan13)
-         WRAPPER_LOG(info, "Lowering Vulkan 1.3 core calls for a %u.%u base driver "
-                           "(WRAPPER_EMULATE_VULKAN_1_3)",
-                     VK_API_VERSION_MAJOR(pdevice->properties2.properties.apiVersion),
-                     VK_API_VERSION_MINOR(pdevice->properties2.properties.apiVersion));
-         
+         wrapper_core13_init_physical_device(pdevice);
+      pdevice->fold_sets = pdevice->emulate_vulkan13 &&
+         instance->vk.app_info.engine_name &&
+         strstr(instance->vk.app_info.engine_name, "vkd3d") &&
+         pdevice->properties2.properties.limits.maxBoundDescriptorSets < 8 &&
+         debug_get_bool_option("WRAPPER_FOLD_DESCRIPTOR_SETS", true);
+      if (pdevice->fold_sets)
+         WRAPPER_LOG(info, "Reporting 8 descriptor sets (driver has %u); bindless sets are folded",
+                     pdevice->properties2.properties.limits.maxBoundDescriptorSets);
+
       pdevice->dispatch_table.GetPhysicalDeviceMemoryProperties(
          pdevice->dispatch_handle, &pdevice->memory_properties);
+      wrapper_setup_coherent_memory_types(pdevice);
 
      WRAPPER_LOG(info, "GPU Name: %s", pdevice->properties2.properties.deviceName);
      WRAPPER_LOG(info, "Driver Version: %s", get_driver_version(pdevice->properties2.properties.driverVersion));
@@ -364,7 +450,7 @@ VkResult enumerate_physical_device(struct vk_instance *_instance)
 
       if (!pdevice->base_supported_features.hostQueryReset &&
           debug_get_bool_option("WRAPPER_EMULATE_HOST_QUERY_RESET",
-                                nvidia_proprietary)) {
+                                nvidia_proprietary || pdevice->emulate_vulkan13)) {
          WRAPPER_LOG(info, "Emulating VK_EXT_host_query_reset "
                            "(base driver lacks it; resets go through a command buffer)");
          pdevice->vk.supported_extensions.EXT_host_query_reset = true;
@@ -419,8 +505,17 @@ VkResult enumerate_physical_device(struct vk_instance *_instance)
           * forwards whichever alias the base driver actually has, and
           * process_pnext_chain aliases the feature struct EXT<->KHR to match. */
          WRAPPER_LOG(info, "Spoofing VK_EXT/KHR_vertex_attribute_divisor as supported");
+         pdevice->emulate_vertex_divisor =
+            !pdevice->base_supported_extensions.EXT_vertex_attribute_divisor &&
+            !pdevice->base_supported_extensions.KHR_vertex_attribute_divisor;
+         pdevice->emulate_zero_divisor = !pdevice->emulate_vertex_divisor &&
+            !pdevice->base_supported_features.vertexAttributeInstanceRateZeroDivisor;
          pdevice->vk.supported_extensions.EXT_vertex_attribute_divisor = true;
          pdevice->vk.supported_extensions.KHR_vertex_attribute_divisor = true;
+         if (pdevice->emulate_vertex_divisor) {
+            supported_features->vertexAttributeInstanceRateDivisor = true;
+            supported_features->vertexAttributeInstanceRateZeroDivisor = true;
+         }
          WRAPPER_LOG(info, "Disabling VK_EXT_calibrated_timestamps");
          pdevice->vk.supported_extensions.EXT_calibrated_timestamps = false;
          if (!is_d3d) {
@@ -428,6 +523,13 @@ VkResult enumerate_physical_device(struct vk_instance *_instance)
             pdevice->vk.supported_extensions.EXT_extended_dynamic_state = false;
             pdevice->vk.supported_extensions.EXT_extended_dynamic_state2 = false;
          }
+      }
+
+      if (pdevice->driver_properties.driverID == VK_DRIVER_ID_IMAGINATION_PROPRIETARY &&
+          !strstr(engine_name, "DXVK") && !strstr(engine_name, "vkd3d")) {
+         WRAPPER_LOG(info, "Disabling VK_EXT_extended_dynamic_state and VK_EXT_extended_dynamic_state3");
+         pdevice->vk.supported_extensions.EXT_extended_dynamic_state = false;
+         pdevice->vk.supported_extensions.EXT_extended_dynamic_state3 = false;
       }
 
       /* Samsung Xclipse: vkd3d 3.x needs VK_EXT_dynamic_rendering_unused_attachments
@@ -446,6 +548,10 @@ VkResult enumerate_physical_device(struct vk_instance *_instance)
          }
       }
 
+      if (strstr(engine_name, "DXVK") &&
+          debug_get_bool_option("WRAPPER_GRAPHICS_QUEUE_FAMILY_ONLY", true))
+         wrapper_hide_compute_queue_families(pdevice);
+
       /* DXVK > 2.4.1 requires VK_KHR_maintenance5. Some drivers (e.g. Xclipse)
        * don't expose it. Emulate it for any D3D client whose base driver lacks
        * it (NOT Samsung-gated -- the base-lacks guard limits it to drivers that
@@ -456,7 +562,29 @@ VkResult enumerate_physical_device(struct vk_instance *_instance)
          if (is_d3d && !pdevice->base_supported_extensions.KHR_maintenance5) {
             WRAPPER_LOG(info, "Faking VK_KHR_maintenance5 (base driver lacks it)");
             pdevice->vk.supported_extensions.KHR_maintenance5 = true;
+            if (strstr(engine_name, "DXVK"))
+               supported_features->maintenance5 = true;
          }
+      }
+
+      if (strstr(engine_name, "DXVK") && engine_version >= VK_MAKE_VERSION(2, 7, 0)) {
+         if (!pdevice->base_supported_extensions.KHR_pipeline_library) {
+            WRAPPER_LOG(info, "Faking VK_KHR_pipeline_library (base driver lacks it)");
+            pdevice->vk.supported_extensions.KHR_pipeline_library = true;
+         }
+         if (!pdevice->base_supported_features.shaderInt64) {
+            WRAPPER_LOG(info, "Faking shaderInt64 (base driver lacks it)");
+            supported_features->shaderInt64 = true;
+         }
+      }
+
+      if (strstr(engine_name, "vkd3d") && pdevice->emulate_vulkan13 &&
+          !pdevice->base_supported_features.shaderInt64 &&
+          debug_get_bool_option("WRAPPER_FAKE_SHADER_INT64", false)) {
+         WRAPPER_LOG(info, "Faking shaderInt64 for vkd3d; 64-bit widening before a float "
+                     "conversion is lowered, other 64-bit integer shaders are refused");
+         supported_features->shaderInt64 = true;
+         pdevice->lower_int64 = true;
       }
 
       /* VK_KHR_push_descriptor: vkd3d/DXVK effectively require it, but some
@@ -547,6 +675,36 @@ wrapper_EnumerateDeviceExtensionProperties(VkPhysicalDevice physicalDevice,
 }
 
 VKAPI_ATTR void VKAPI_CALL
+wrapper_GetPhysicalDeviceQueueFamilyProperties(VkPhysicalDevice physicalDevice,
+                                               uint32_t *pQueueFamilyPropertyCount,
+                                               VkQueueFamilyProperties *pQueueFamilyProperties)
+{
+   VK_FROM_HANDLE(wrapper_physical_device, pdevice, physicalDevice);
+   uint32_t limit = pdevice->queue_family_count;
+   if (limit && pQueueFamilyProperties && *pQueueFamilyPropertyCount > limit)
+      *pQueueFamilyPropertyCount = limit;
+   pdevice->dispatch_table.GetPhysicalDeviceQueueFamilyProperties(
+      pdevice->dispatch_handle, pQueueFamilyPropertyCount, pQueueFamilyProperties);
+   if (limit && *pQueueFamilyPropertyCount > limit)
+      *pQueueFamilyPropertyCount = limit;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wrapper_GetPhysicalDeviceQueueFamilyProperties2(VkPhysicalDevice physicalDevice,
+                                                uint32_t *pQueueFamilyPropertyCount,
+                                                VkQueueFamilyProperties2 *pQueueFamilyProperties)
+{
+   VK_FROM_HANDLE(wrapper_physical_device, pdevice, physicalDevice);
+   uint32_t limit = pdevice->queue_family_count;
+   if (limit && pQueueFamilyProperties && *pQueueFamilyPropertyCount > limit)
+      *pQueueFamilyPropertyCount = limit;
+   pdevice->dispatch_table.GetPhysicalDeviceQueueFamilyProperties2(
+      pdevice->dispatch_handle, pQueueFamilyPropertyCount, pQueueFamilyProperties);
+   if (limit && *pQueueFamilyPropertyCount > limit)
+      *pQueueFamilyPropertyCount = limit;
+}
+
+VKAPI_ATTR void VKAPI_CALL
 wrapper_GetPhysicalDeviceFeatures(VkPhysicalDevice physicalDevice,
                                   VkPhysicalDeviceFeatures* pFeatures) 
 {
@@ -628,11 +786,12 @@ wrapper_GetPhysicalDeviceProperties(VkPhysicalDevice physicalDevice,
 
    if (api_version > 0)
       pProperties->apiVersion = api_version;
+   if (pdevice->fold_sets)
+      pProperties->limits.maxBoundDescriptorSets = 8;
 
    /* See wrapper_GetPhysicalDeviceProperties2: bump push constant size to the
     * DXVK-required minimum on Xclipse. */
-   if (pdevice->driver_properties.driverID == VK_DRIVER_ID_SAMSUNG_PROPRIETARY &&
-       pProperties->limits.maxPushConstantsSize < 256)
+   if (pdevice->raises_push_constant_limit)
       pProperties->limits.maxPushConstantsSize = 256;
 }
 
@@ -660,6 +819,23 @@ wrapper_GetPhysicalDeviceProperties(VkPhysicalDevice physicalDevice,
    if ((p)->maxDescriptorSetUpdateAfterBindSampledImages < _t)     (p)->maxDescriptorSetUpdateAfterBindSampledImages = _t; \
    if ((p)->maxDescriptorSetUpdateAfterBindStorageImages < _t)     (p)->maxDescriptorSetUpdateAfterBindStorageImages = _t; \
 } while (0)
+
+static void
+wrapper_keep_real_ubo_limits(struct wrapper_physical_device *pdevice,
+                             uint32_t *per_stage, uint32_t *per_set)
+{
+   static bool logged;
+   if (!pdevice->fold_sets)
+      return;
+   *per_stage = pdevice->vk.properties.maxPerStageDescriptorUpdateAfterBindUniformBuffers;
+   *per_set = pdevice->vk.properties.maxDescriptorSetUpdateAfterBindUniformBuffers;
+   if (!logged) {
+      logged = true;
+      WRAPPER_LOG(info, "Reporting the driver's update-after-bind uniform buffer limits "
+                  "(%u per stage, %u per set) so heap CBVs go to storage buffers",
+                  *per_stage, *per_set);
+   }
+}
 
 VKAPI_ATTR void VKAPI_CALL
 wrapper_GetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice,
@@ -696,6 +872,8 @@ wrapper_GetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice,
 
    if (api_version > 0)
       pProperties->properties.apiVersion = api_version;
+   if (pdevice->fold_sets)
+      pProperties->properties.limits.maxBoundDescriptorSets = 8;
 
    /* DXVK 2.6+ requires maxPushConstantsSize >= 256 (its unified "push data"
     * model) and skips the adapter otherwise. Xclipse reports less; the RDNA
@@ -703,14 +881,25 @@ wrapper_GetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice,
     * just reports conservatively -- bump it so DXVK proceeds. NOTE: unlike the
     * extension fakes, this is a real driver limit; if the driver enforces it in
     * vkCreatePipelineLayout this will surface as pipeline-creation failures. */
-   if (pdevice->driver_properties.driverID == VK_DRIVER_ID_SAMSUNG_PROPRIETARY &&
-       pProperties->properties.limits.maxPushConstantsSize < 256)
+   if (pdevice->raises_push_constant_limit)
       pProperties->properties.limits.maxPushConstantsSize = 256;
+
+   if (pdevice->emulate_vulkan13)
+      wrapper_core13_fill_properties(pdevice, pProperties);
 
    vk_foreach_struct(prop, pProperties->pNext) {
       switch (prop->sType) {
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_PROPERTIES_EXT:
       {
+         if (pdevice->emulate_vertex_divisor) {
+            ((VkPhysicalDeviceVertexAttributeDivisorPropertiesEXT *)prop)->maxVertexAttribDivisor =
+               UINT32_MAX;
+            break;
+         }
+         /* A driver with only the EXT extension already filled this struct;
+          * its KHR query would come back empty. */
+         if (!pdevice->base_supported_extensions.KHR_vertex_attribute_divisor)
+            break;
          VkPhysicalDeviceVertexAttributeDivisorPropertiesKHR khr_vad = {
             .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_PROPERTIES_KHR,
          };
@@ -724,6 +913,13 @@ wrapper_GetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice,
             khr_vad.maxVertexAttribDivisor;
          break;
       }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_PROPERTIES_KHR:
+         if (pdevice->emulate_vertex_divisor) {
+            VkPhysicalDeviceVertexAttributeDivisorPropertiesKHR *vad = (void *)prop;
+            vad->maxVertexAttribDivisor = UINT32_MAX;
+            vad->supportsNonZeroFirstInstance = VK_TRUE;
+         }
+         break;
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_PROPERTIES_EXT:
       {
          VkPhysicalDeviceMapMemoryPlacedPropertiesEXT *placed_prop =
@@ -807,15 +1003,24 @@ wrapper_GetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice,
          strcpy(vk12_prop->driverName, "Wrapper driver");
 
          /* Vulkan12Properties folds in the descriptor-indexing limits. */
-         if (is_d3d)
+         if (is_d3d) {
             BUMP_UAB(vk12_prop, WRAPPER_D3D_BINDLESS_LIMIT);
+            wrapper_keep_real_ubo_limits(pdevice,
+               &vk12_prop->maxPerStageDescriptorUpdateAfterBindUniformBuffers,
+               &vk12_prop->maxDescriptorSetUpdateAfterBindUniformBuffers);
+         }
          break;
       }
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_PROPERTIES:
       {
-         if (is_d3d)
-            BUMP_UAB((VkPhysicalDeviceDescriptorIndexingProperties *)prop,
-                     WRAPPER_D3D_BINDLESS_LIMIT);
+         if (is_d3d) {
+            VkPhysicalDeviceDescriptorIndexingProperties *di =
+               (VkPhysicalDeviceDescriptorIndexingProperties *)prop;
+            BUMP_UAB(di, WRAPPER_D3D_BINDLESS_LIMIT);
+            wrapper_keep_real_ubo_limits(pdevice,
+               &di->maxPerStageDescriptorUpdateAfterBindUniformBuffers,
+               &di->maxDescriptorSetUpdateAfterBindUniformBuffers);
+         }
          break;
       }
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES:
@@ -1072,6 +1277,9 @@ wrapper_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice,
 
    pdevice->dispatch_table.GetPhysicalDeviceFormatProperties2(pdevice->dispatch_handle,
       format, pFormatProperties);
+   if (pdevice->properties2.properties.apiVersion < VK_API_VERSION_1_3 &&
+       !pdevice->base_supported_extensions.KHR_format_feature_flags2)
+      wrapper_format_properties3_from_legacy(pdevice, format, pFormatProperties);
 
    switch (format) {
    case VK_FORMAT_BC1_RGB_UNORM_BLOCK:
@@ -1114,6 +1322,16 @@ wrapper_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice,
    }
 }
 
+static void
+wrapper_report_coherent_memory_types(struct wrapper_physical_device *pdevice,
+                                     VkPhysicalDeviceMemoryProperties *props)
+{
+   for (uint32_t i = 0; i < props->memoryTypeCount; i++) {
+      if (pdevice->coherent_memory_type[i] != i)
+         props->memoryTypes[i].propertyFlags |= VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+   }
+}
+
 VKAPI_ATTR void VKAPI_CALL
 wrapper_GetPhysicalDeviceMemoryProperties(VkPhysicalDevice physicalDevice,
 										  VkPhysicalDeviceMemoryProperties *pMemoryProperties)
@@ -1130,6 +1348,8 @@ wrapper_GetPhysicalDeviceMemoryProperties(VkPhysicalDevice physicalDevice,
 
    if (wrapper_vmem_max_size > 0)
       pMemoryProperties->memoryHeaps[0].size = (VkDeviceSize)wrapper_vmem_max_size * 1048576;   
+
+   wrapper_report_coherent_memory_types(pdevice, pMemoryProperties);
 }
 
 VKAPI_ATTR void VKAPI_CALL                                                                                      
@@ -1148,4 +1368,6 @@ wrapper_GetPhysicalDeviceMemoryProperties2(VkPhysicalDevice physicalDevice,
 
    if (wrapper_vmem_max_size > 0)
       pMemoryProperties->memoryProperties.memoryHeaps[0].size = (VkDeviceSize)wrapper_vmem_max_size * 1048576;
+
+   wrapper_report_coherent_memory_types(pdevice, &pMemoryProperties->memoryProperties);
 }
