@@ -62,6 +62,14 @@ wrapper_effective_api_version(struct wrapper_physical_device *pdevice,
       }
    }
 
+   if (requested > base_api_version && base_api_version < VK_API_VERSION_1_3 &&
+       !pdevice->emulate_vulkan13 && engine && !strcmp(engine, "mesa zink")) {
+      WRAPPER_LOG(info, "Reporting the base Vulkan %u.%u to zink",
+                  VK_API_VERSION_MAJOR(base_api_version),
+                  VK_API_VERSION_MINOR(base_api_version));
+      return base_api_version;
+   }
+
    return requested ? requested : base_api_version;
 }
 
@@ -140,6 +148,41 @@ wrapper_wsi_proc_addr(VkPhysicalDevice physicalDevice, const char *pName)
 {
    VK_FROM_HANDLE(vk_physical_device, pdevice, physicalDevice);
    return vk_instance_get_proc_addr_unchecked(pdevice->instance, pName);
+}
+
+static void
+wrapper_setup_coherent_memory_types(struct wrapper_physical_device *pdevice)
+{
+   const VkPhysicalDeviceMemoryProperties *props = &pdevice->memory_properties;
+   const char *engine = pdevice->instance->vk.app_info.engine_name;
+   const VkMemoryPropertyFlags host =
+      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+   bool remap = engine && strstr(engine, "vkd3d") &&
+      pdevice->instance->vk.app_info.engine_version < VK_MAKE_VERSION(3, 0, 0);
+
+   for (uint32_t i = 0; i < VK_MAX_MEMORY_TYPES; i++)
+      pdevice->coherent_memory_type[i] = i;
+
+   if (!remap)
+      return;
+
+   for (uint32_t i = 0; i < props->memoryTypeCount; i++) {
+      VkMemoryPropertyFlags flags = props->memoryTypes[i].propertyFlags;
+      if ((flags & host) != VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
+         continue;
+      for (uint32_t j = 0; j < props->memoryTypeCount; j++) {
+         VkMemoryPropertyFlags other = props->memoryTypes[j].propertyFlags;
+         if (props->memoryTypes[j].heapIndex == props->memoryTypes[i].heapIndex &&
+             (other & host) == host &&
+             (other & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) ==
+                (flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
+             !(other & VK_MEMORY_PROPERTY_PROTECTED_BIT)) {
+            WRAPPER_LOG(info, "Backing non-coherent memory type %u with coherent type %u", i, j);
+            pdevice->coherent_memory_type[i] = j;
+            break;
+         }
+      }
+   }
 }
 
 VkResult enumerate_physical_device(struct vk_instance *_instance)
@@ -297,6 +340,7 @@ VkResult enumerate_physical_device(struct vk_instance *_instance)
          
       pdevice->dispatch_table.GetPhysicalDeviceMemoryProperties(
          pdevice->dispatch_handle, &pdevice->memory_properties);
+      wrapper_setup_coherent_memory_types(pdevice);
 
      WRAPPER_LOG(info, "GPU Name: %s", pdevice->properties2.properties.deviceName);
      WRAPPER_LOG(info, "Driver Version: %s", get_driver_version(pdevice->properties2.properties.driverVersion));
@@ -378,6 +422,11 @@ VkResult enumerate_physical_device(struct vk_instance *_instance)
           * forwards whichever alias the base driver actually has, and
           * process_pnext_chain aliases the feature struct EXT<->KHR to match. */
          WRAPPER_LOG(info, "Spoofing VK_EXT/KHR_vertex_attribute_divisor as supported");
+         pdevice->emulate_vertex_divisor =
+            !pdevice->base_supported_extensions.EXT_vertex_attribute_divisor &&
+            !pdevice->base_supported_extensions.KHR_vertex_attribute_divisor;
+         pdevice->emulate_zero_divisor = !pdevice->emulate_vertex_divisor &&
+            !pdevice->base_supported_features.vertexAttributeInstanceRateZeroDivisor;
          pdevice->vk.supported_extensions.EXT_vertex_attribute_divisor = true;
          pdevice->vk.supported_extensions.KHR_vertex_attribute_divisor = true;
          WRAPPER_LOG(info, "Disabling VK_EXT_calibrated_timestamps");
@@ -387,6 +436,13 @@ VkResult enumerate_physical_device(struct vk_instance *_instance)
             pdevice->vk.supported_extensions.EXT_extended_dynamic_state = false;
             pdevice->vk.supported_extensions.EXT_extended_dynamic_state2 = false;
          }
+      }
+
+      if (pdevice->driver_properties.driverID == VK_DRIVER_ID_IMAGINATION_PROPRIETARY &&
+          !strstr(engine_name, "DXVK") && !strstr(engine_name, "vkd3d")) {
+         WRAPPER_LOG(info, "Disabling VK_EXT_extended_dynamic_state and VK_EXT_extended_dynamic_state3");
+         pdevice->vk.supported_extensions.EXT_extended_dynamic_state = false;
+         pdevice->vk.supported_extensions.EXT_extended_dynamic_state3 = false;
       }
 
       /* Samsung Xclipse: vkd3d 3.x needs VK_EXT_dynamic_rendering_unused_attachments
@@ -415,6 +471,19 @@ VkResult enumerate_physical_device(struct vk_instance *_instance)
          if (is_d3d && !pdevice->base_supported_extensions.KHR_maintenance5) {
             WRAPPER_LOG(info, "Faking VK_KHR_maintenance5 (base driver lacks it)");
             pdevice->vk.supported_extensions.KHR_maintenance5 = true;
+            if (strstr(engine_name, "DXVK"))
+               supported_features->maintenance5 = true;
+         }
+      }
+
+      if (strstr(engine_name, "DXVK") && engine_version >= VK_MAKE_VERSION(2, 7, 0)) {
+         if (!pdevice->base_supported_extensions.KHR_pipeline_library) {
+            WRAPPER_LOG(info, "Faking VK_KHR_pipeline_library (base driver lacks it)");
+            pdevice->vk.supported_extensions.KHR_pipeline_library = true;
+         }
+         if (!pdevice->base_supported_features.shaderInt64) {
+            WRAPPER_LOG(info, "Faking shaderInt64 (base driver lacks it)");
+            supported_features->shaderInt64 = true;
          }
       }
 
@@ -678,9 +747,16 @@ wrapper_GetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice,
          pdevice->dispatch_table.GetPhysicalDeviceProperties2(
             pdevice->dispatch_handle, &p2);
          ((VkPhysicalDeviceVertexAttributeDivisorPropertiesEXT *)prop)->maxVertexAttribDivisor =
-            khr_vad.maxVertexAttribDivisor;
+            pdevice->emulate_vertex_divisor ? UINT32_MAX : khr_vad.maxVertexAttribDivisor;
          break;
       }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_PROPERTIES_KHR:
+         if (pdevice->emulate_vertex_divisor) {
+            VkPhysicalDeviceVertexAttributeDivisorPropertiesKHR *vad = (void *)prop;
+            vad->maxVertexAttribDivisor = UINT32_MAX;
+            vad->supportsNonZeroFirstInstance = VK_TRUE;
+         }
+         break;
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_PROPERTIES_EXT:
       {
          VkPhysicalDeviceMapMemoryPlacedPropertiesEXT *placed_prop =
@@ -1068,6 +1144,16 @@ wrapper_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice,
    }
 }
 
+static void
+wrapper_report_coherent_memory_types(struct wrapper_physical_device *pdevice,
+                                     VkPhysicalDeviceMemoryProperties *props)
+{
+   for (uint32_t i = 0; i < props->memoryTypeCount; i++) {
+      if (pdevice->coherent_memory_type[i] != i)
+         props->memoryTypes[i].propertyFlags |= VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+   }
+}
+
 VKAPI_ATTR void VKAPI_CALL
 wrapper_GetPhysicalDeviceMemoryProperties(VkPhysicalDevice physicalDevice,
 										  VkPhysicalDeviceMemoryProperties *pMemoryProperties)
@@ -1084,6 +1170,8 @@ wrapper_GetPhysicalDeviceMemoryProperties(VkPhysicalDevice physicalDevice,
 
    if (wrapper_vmem_max_size > 0)
       pMemoryProperties->memoryHeaps[0].size = (VkDeviceSize)wrapper_vmem_max_size * 1048576;   
+
+   wrapper_report_coherent_memory_types(pdevice, pMemoryProperties);
 }
 
 VKAPI_ATTR void VKAPI_CALL                                                                                      
@@ -1102,4 +1190,6 @@ wrapper_GetPhysicalDeviceMemoryProperties2(VkPhysicalDevice physicalDevice,
 
    if (wrapper_vmem_max_size > 0)
       pMemoryProperties->memoryProperties.memoryHeaps[0].size = (VkDeviceSize)wrapper_vmem_max_size * 1048576;
+
+   wrapper_report_coherent_memory_types(pdevice, &pMemoryProperties->memoryProperties);
 }

@@ -541,7 +541,8 @@ wrapper_create_null_resources(struct wrapper_device *device)
       .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
       .size = 65536,
       .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-               VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT,
+               VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT |
+               VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
       .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
    };
    if (dt->CreateBuffer(dev, &bci, NULL, &device->null_buffer) != VK_SUCCESS)
@@ -683,21 +684,39 @@ wrapper_CmdBindVertexBuffers2(VkCommandBuffer commandBuffer, uint32_t firstBindi
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
    struct wrapper_device *device = wcb->device;
    VkBuffer *bufs = NULL;
+   VkDeviceSize *offsets = NULL, *sizes = NULL;
    if (device->emulate_null_descriptor && pBuffers) {
       bufs = malloc(sizeof(VkBuffer) * bindingCount);
-      for (uint32_t i = 0; i < bindingCount; i++)
+      offsets = malloc(sizeof(VkDeviceSize) * bindingCount);
+      sizes = pSizes ? malloc(sizeof(VkDeviceSize) * bindingCount) : NULL;
+      for (uint32_t i = 0; i < bindingCount; i++) {
          bufs[i] = pBuffers[i] ? pBuffers[i] : device->null_buffer;
+         offsets[i] = pBuffers[i] ? pOffsets[i] : 0;
+         if (sizes)
+            sizes[i] = pBuffers[i] ? pSizes[i] : VK_WHOLE_SIZE;
+      }
+      pBuffers = bufs;
+      pOffsets = offsets;
+      if (sizes)
+         pSizes = sizes;
+   }
+   if ((device->emulate_vertex_divisor || device->emulate_zero_divisor) && pBuffers)
+      wrapper_divisor_track(wcb, firstBinding, bindingCount, pBuffers, pOffsets, pSizes,
+                            pStrides);
+   if (device->emulate_dynamic_stride && pStrides) {
+      wrapper_stride_set(wcb, firstBinding, bindingCount, pStrides);
+      pStrides = NULL;
    }
    if (device->dispatch_table.CmdBindVertexBuffers2)
       device->dispatch_table.CmdBindVertexBuffers2(wcb->dispatch_handle,
-         firstBinding, bindingCount, bufs ? bufs : pBuffers, pOffsets, pSizes,
-         pStrides);
+         firstBinding, bindingCount, pBuffers, pOffsets, pSizes, pStrides);
    else if (wrapper_lowers_core13(device) &&
             device->dispatch_table.CmdBindVertexBuffers2EXT)
       device->dispatch_table.CmdBindVertexBuffers2EXT(wcb->dispatch_handle,
-         firstBinding, bindingCount, bufs ? bufs : pBuffers, pOffsets, pSizes,
-         pStrides);
+         firstBinding, bindingCount, pBuffers, pOffsets, pSizes, pStrides);
    free(bufs);
+   free(offsets);
+   free(sizes);
 }
 
 /* Core 1.3 dynamic state may be supplied by EXT_extended_dynamic_state{,2} on
@@ -892,14 +911,22 @@ wrapper_CmdBindVertexBuffers(VkCommandBuffer commandBuffer, uint32_t firstBindin
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
    struct wrapper_device *device = wcb->device;
    VkBuffer *bufs = NULL;
+   VkDeviceSize *offsets = NULL;
    if (device->emulate_null_descriptor && pBuffers) {
       bufs = malloc(sizeof(VkBuffer) * bindingCount);
-      for (uint32_t i = 0; i < bindingCount; i++)
+      offsets = malloc(sizeof(VkDeviceSize) * bindingCount);
+      for (uint32_t i = 0; i < bindingCount; i++) {
          bufs[i] = pBuffers[i] ? pBuffers[i] : device->null_buffer;
+         offsets[i] = pBuffers[i] ? pOffsets[i] : 0;
+      }
    }
+   if ((device->emulate_vertex_divisor || device->emulate_zero_divisor) && pBuffers)
+      wrapper_divisor_track(wcb, firstBinding, bindingCount, bufs ? bufs : pBuffers,
+                            offsets ? offsets : pOffsets, NULL, NULL);
    device->dispatch_table.CmdBindVertexBuffers(wcb->dispatch_handle, firstBinding,
-      bindingCount, bufs ? bufs : pBuffers, pOffsets);
+      bindingCount, bufs ? bufs : pBuffers, offsets ? offsets : pOffsets);
    free(bufs);
+   free(offsets);
 }
 
 
@@ -1171,6 +1198,9 @@ wrapper_CreateDevice(VkPhysicalDevice physicalDevice,
    device->image_view_table = _mesa_hash_table_u64_create(NULL);
    device->imageless_fb_table = _mesa_hash_table_u64_create(NULL);
    device->dynamic_pipeline_table = _mesa_hash_table_u64_create(NULL);
+   device->stride_pipeline_table = _mesa_hash_table_u64_create(NULL);
+   device->divisor_pipeline_table = _mesa_hash_table_u64_create(NULL);
+   device->shader_code_table = _mesa_hash_table_u64_create(NULL);
    device->buffer_table = _mesa_hash_table_u64_create(NULL);
    device->fence_table = _mesa_hash_table_u64_create(NULL);
    
@@ -1259,10 +1289,32 @@ if (pdf2 && pdf2->features.f) { \
    DISABLE_FEATURE(shaderCullDistance);
    DISABLE_FEATURE(dualSrcBlend);
    DISABLE_FEATURE(multiDrawIndirect);
+   DISABLE_FEATURE(shaderInt64);
 
 #undef DISABLE_FEATURE
 
    process_pnext_chain((VkBaseInStructure *)&wrapper_create_info, device->physical);
+   wrapper_mask_feature_chain(physical_device,
+                              (VkPhysicalDeviceFeatures *)wrapper_create_info.pEnabledFeatures,
+                              (void *)wrapper_create_info.pNext);
+
+   device->emulate_dynamic_stride = debug_get_bool_option("WRAPPER_EMULATE_DYNAMIC_STRIDE",
+      physical_device->driver_properties.driverID == VK_DRIVER_ID_ARM_PROPRIETARY &&
+      VK_API_VERSION_MAJOR(physical_device->properties2.properties.driverVersion) < 44);
+   if (device->emulate_dynamic_stride)
+      WRAPPER_LOG(info, "Emulating dynamic vertex input binding strides");
+
+   device->emulate_vertex_divisor = debug_get_bool_option("WRAPPER_EMULATE_VERTEX_DIVISOR",
+      physical_device->emulate_vertex_divisor);
+   device->emulate_zero_divisor = !device->emulate_vertex_divisor &&
+      physical_device->emulate_zero_divisor;
+   if (device->emulate_vertex_divisor)
+      WRAPPER_LOG(info, "Emulating vertex attribute divisors");
+   else if (device->emulate_zero_divisor)
+      WRAPPER_LOG(info, "Emulating the zero vertex attribute divisor");
+
+   device->cmdbuf_entry_barrier = debug_get_bool_option("WRAPPER_CMDBUF_ENTRY_BARRIER",
+      physical_device->driver_properties.driverID == VK_DRIVER_ID_IMAGINATION_PROPRIETARY);
 
    VkPhysicalDeviceTextureCompressionASTCHDRFeatures astc_hdr_features = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXTURE_COMPRESSION_ASTC_HDR_FEATURES,
@@ -1303,7 +1355,7 @@ if (pdf2 && pdf2->features.f) { \
    }
 
    if (wrapper_safe_create_device == -1) {
-      wrapper_safe_create_device = getenv("WRAPPER_SAFE_CREATE_DEVICE") ? atoi(getenv("WRAPPER_SAFE_CREATE_DEVICE")) : 1;
+      wrapper_safe_create_device = getenv("WRAPPER_SAFE_CREATE_DEVICE") ? atoi(getenv("WRAPPER_SAFE_CREATE_DEVICE")) : 0;
    }
    
    const bool emulate_query_reset = device->vk.enabled_features.hostQueryReset &&
@@ -1324,7 +1376,9 @@ if (pdf2 && pdf2->features.f) { \
 
    if (result != VK_SUCCESS) {
       if (wrapper_safe_create_device) {
-         WRAPPER_LOG(info, "Forcing device creation with a NULL pNext chain");
+         WRAPPER_LOG(error, "Driver vkCreateDevice failed (%d) with the feature chain, "
+                            "retrying with a NULL pNext chain: every requested "
+                            "extension feature is dropped", result);
          wrapper_create_info.pNext = NULL;
          used_fallback_create = true;
          result = physical_device->dispatch_table.CreateDevice(
@@ -1841,8 +1895,76 @@ wrapper_device_image_memory_requirements(struct wrapper_device *device,
       info.pCreateInfo = &ci;
    }
 
-   device->dispatch_table.GetDeviceImageMemoryRequirements(device->dispatch_handle,
-      &info, pMemoryRequirements);
+   if (device->dispatch_table.GetDeviceImageMemoryRequirements) {
+      device->dispatch_table.GetDeviceImageMemoryRequirements(device->dispatch_handle,
+         &info, pMemoryRequirements);
+      return;
+   }
+
+   VkImage image;
+   if (device->dispatch_table.CreateImage(device->dispatch_handle, info.pCreateInfo,
+                                          NULL, &image) != VK_SUCCESS) {
+      pMemoryRequirements->memoryRequirements = (VkMemoryRequirements){ 0 };
+      return;
+   }
+   VkImageMemoryRequirementsInfo2 image_info = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2,
+      .image = image,
+   };
+   device->dispatch_table.GetImageMemoryRequirements2(device->dispatch_handle,
+      &image_info, pMemoryRequirements);
+   device->dispatch_table.DestroyImage(device->dispatch_handle, image, NULL);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wrapper_GetDeviceBufferMemoryRequirements(VkDevice _device,
+      const VkDeviceBufferMemoryRequirements *pInfo,
+      VkMemoryRequirements2 *pMemoryRequirements)
+{
+   VK_FROM_HANDLE(wrapper_device, device, _device);
+
+   if (device->dispatch_table.GetDeviceBufferMemoryRequirements) {
+      device->dispatch_table.GetDeviceBufferMemoryRequirements(device->dispatch_handle,
+         pInfo, pMemoryRequirements);
+      return;
+   }
+
+   VkBufferCreateInfo create_info = *pInfo->pCreateInfo;
+   const VkBufferUsageFlags2CreateInfo *usage2 = __vk_find_struct(
+      (void *)create_info.pNext, VK_STRUCTURE_TYPE_BUFFER_USAGE_FLAGS_2_CREATE_INFO);
+   if (usage2 && !device->physical->base_supported_extensions.KHR_maintenance5)
+      create_info.usage |= (VkBufferUsageFlags)usage2->usage;
+
+   VkBuffer buffer;
+   if (device->dispatch_table.CreateBuffer(device->dispatch_handle, &create_info,
+                                           NULL, &buffer) != VK_SUCCESS) {
+      pMemoryRequirements->memoryRequirements = (VkMemoryRequirements){ 0 };
+      return;
+   }
+   VkBufferMemoryRequirementsInfo2 buffer_info = {
+      .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_REQUIREMENTS_INFO_2,
+      .buffer = buffer,
+   };
+   device->dispatch_table.GetBufferMemoryRequirements2(device->dispatch_handle,
+      &buffer_info, pMemoryRequirements);
+   device->dispatch_table.DestroyBuffer(device->dispatch_handle, buffer, NULL);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wrapper_GetDeviceImageSparseMemoryRequirements(VkDevice _device,
+      const VkDeviceImageMemoryRequirements *pInfo,
+      uint32_t *pSparseMemoryRequirementCount,
+      VkSparseImageMemoryRequirements2 *pSparseMemoryRequirements)
+{
+   VK_FROM_HANDLE(wrapper_device, device, _device);
+
+   if (device->dispatch_table.GetDeviceImageSparseMemoryRequirements) {
+      device->dispatch_table.GetDeviceImageSparseMemoryRequirements(device->dispatch_handle,
+         pInfo, pSparseMemoryRequirementCount, pSparseMemoryRequirements);
+      return;
+   }
+
+   *pSparseMemoryRequirementCount = 0;
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -2193,6 +2315,13 @@ wrapper_CmdBindIndexBuffer2KHR(VkCommandBuffer commandBuffer, VkBuffer buffer,
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
    struct wrapper_device *device = wcb->device;
 
+   if (buffer == VK_NULL_HANDLE && device->emulate_null_descriptor &&
+       device->null_buffer != VK_NULL_HANDLE) {
+      buffer = device->null_buffer;
+      offset = 0;
+      size = VK_WHOLE_SIZE;
+   }
+
    if (device->dispatch_table.CmdBindIndexBuffer2)
       device->dispatch_table.CmdBindIndexBuffer2(wcb->dispatch_handle, buffer, offset, size, indexType);
    else if (device->dispatch_table.CmdBindIndexBuffer2KHR)
@@ -2270,7 +2399,20 @@ wrapper_GetDeviceImageSubresourceLayoutKHR(VkDevice _device,
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
 wrapper_GetDeviceProcAddr(VkDevice _device, const char* pName) {
    VK_FROM_HANDLE(wrapper_device, device, _device);
-   return vk_device_get_proc_addr(&device->vk, pName);
+   PFN_vkVoidFunction func = vk_device_get_proc_addr(&device->vk, pName);
+   if (func || !pName)
+      return func;
+
+   static const char *const suffixes[] = { "KHR", "EXT" };
+   for (unsigned i = 0; i < ARRAY_SIZE(suffixes); i++) {
+      char alias[256];
+      if (snprintf(alias, sizeof(alias), "%s%s", pName, suffixes[i]) >= (int)sizeof(alias))
+         continue;
+      func = vk_device_get_proc_addr(&device->vk, alias);
+      if (func)
+         return func;
+   }
+   return NULL;
 }
 
 /* ---- VK_KHR_push_descriptor emulation -------------------------------------
@@ -2732,11 +2874,24 @@ wrapper_BeginCommandBuffer(VkCommandBuffer commandBuffer,
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
    wrapper_dynamic_render_objects_reset(wcb);
+   wrapper_stride_reset(wcb);
+   wrapper_divisor_reset(wcb);
    if (wcb->device->emulate_push_descriptor)
       wrapper_push_pool_reset_all(wcb);
    VkResult begin_result =
       wcb->device->dispatch_table.BeginCommandBuffer(wcb->dispatch_handle,
                                                      pBeginInfo);
+   if (begin_result == VK_SUCCESS && wcb->device->cmdbuf_entry_barrier &&
+       !wcb->secondary) {
+      VkMemoryBarrier barrier = {
+         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+         .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+         .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+      };
+      wcb->device->dispatch_table.CmdPipelineBarrier(wcb->dispatch_handle,
+         VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+         0, 1, &barrier, 0, NULL, 0, NULL);
+   }
    return begin_result;
 }
 
@@ -3259,6 +3414,105 @@ wrapper_CmdEndRendering(VkCommandBuffer commandBuffer)
    wcb->dynamic_rendering_active = false;
 }
 
+static bool
+wrapper_lowers_maintenance5(const struct wrapper_device *device)
+{
+   return device->vk.enabled_extensions.KHR_maintenance5 &&
+          !device->physical->base_supported_extensions.KHR_maintenance5;
+}
+
+static VkPipelineCreateFlags
+wrapper_fold_pipeline_flags2(const void **pNext, VkPipelineCreateFlags flags)
+{
+   const VkPipelineCreateFlags2CreateInfo *flags2 =
+      vk_find_struct_const(*pNext, PIPELINE_CREATE_FLAGS_2_CREATE_INFO);
+   if (!flags2)
+      return flags;
+   if (*pNext == (const void *)flags2)
+      *pNext = flags2->pNext;
+   return (VkPipelineCreateFlags)flags2->flags;
+}
+
+static VkResult
+wrapper_lower_inline_shader_stage(struct wrapper_device *device,
+                                  VkPipelineShaderStageCreateInfo *stage,
+                                  VkShaderModule *modules, uint32_t *module_count)
+{
+   const VkShaderModuleCreateInfo *module_info;
+
+   if (stage->module != VK_NULL_HANDLE ||
+       !(module_info = vk_find_struct_const(stage->pNext, SHADER_MODULE_CREATE_INFO)))
+      return VK_SUCCESS;
+
+   VkShaderModuleCreateInfo info = *module_info;
+   info.pNext = NULL;
+   VkResult result = wrapper_CreateShaderModule(wrapper_device_to_handle(device),
+                                                &info, NULL, &modules[*module_count]);
+   if (result != VK_SUCCESS)
+      return result;
+
+   stage->module = modules[(*module_count)++];
+   if (stage->pNext == (const void *)module_info)
+      stage->pNext = module_info->pNext;
+   return VK_SUCCESS;
+}
+
+static void
+wrapper_destroy_lowered_modules(struct wrapper_device *device,
+                                VkShaderModule *modules, uint32_t count)
+{
+   for (uint32_t i = 0; i < count; i++) {
+      if (device->emulate_dynamic_stride)
+         wrapper_stride_forget_module(device, modules[i]);
+      device->dispatch_table.DestroyShaderModule(device->dispatch_handle,
+                                                 modules[i], NULL);
+   }
+   free(modules);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+wrapper_CreateComputePipelines(VkDevice _device, VkPipelineCache pipelineCache,
+                               uint32_t createInfoCount,
+                               const VkComputePipelineCreateInfo *pCreateInfos,
+                               const VkAllocationCallbacks *pAllocator,
+                               VkPipeline *pPipelines)
+{
+   VK_FROM_HANDLE(wrapper_device, device, _device);
+
+   if (!wrapper_lowers_maintenance5(device) || !createInfoCount)
+      return device->dispatch_table.CreateComputePipelines(device->dispatch_handle,
+         pipelineCache, createInfoCount, pCreateInfos, pAllocator, pPipelines);
+
+   VkComputePipelineCreateInfo *infos = malloc(createInfoCount * sizeof(*infos));
+   VkShaderModule *modules = malloc(createInfoCount * sizeof(*modules));
+   uint32_t module_count = 0;
+   VkResult result = VK_SUCCESS;
+
+   if (!infos || !modules) {
+      free(infos);
+      free(modules);
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
+
+   memcpy(infos, pCreateInfos, createInfoCount * sizeof(*infos));
+   for (uint32_t i = 0; i < createInfoCount && result == VK_SUCCESS; i++) {
+      infos[i].flags = wrapper_fold_pipeline_flags2(&infos[i].pNext, infos[i].flags);
+      result = wrapper_lower_inline_shader_stage(device, &infos[i].stage,
+                                                 modules, &module_count);
+   }
+
+   if (result == VK_SUCCESS)
+      result = device->dispatch_table.CreateComputePipelines(device->dispatch_handle,
+         pipelineCache, createInfoCount, infos, pAllocator, pPipelines);
+   else
+      for (uint32_t i = 0; i < createInfoCount; i++)
+         pPipelines[i] = VK_NULL_HANDLE;
+
+   wrapper_destroy_lowered_modules(device, modules, module_count);
+   free(infos);
+   return result;
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 wrapper_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
                                 uint32_t createInfoCount,
@@ -3270,6 +3524,55 @@ wrapper_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
    VkGraphicsPipelineCreateInfo *legacy = NULL;
    VkRenderPass *render_passes = NULL;
    const VkGraphicsPipelineCreateInfo *driver_infos = pCreateInfos;
+   VkGraphicsPipelineCreateInfo *m5_infos = NULL;
+   VkPipelineShaderStageCreateInfo *m5_stages = NULL;
+   VkShaderModule *m5_modules = NULL;
+   uint32_t m5_module_count = 0;
+
+   if (wrapper_lowers_maintenance5(device) && createInfoCount) {
+      uint32_t stage_count = 0;
+      for (uint32_t i = 0; i < createInfoCount; i++)
+         stage_count += pCreateInfos[i].stageCount;
+
+      m5_infos = malloc(createInfoCount * sizeof(*m5_infos));
+      m5_stages = malloc(MAX2(stage_count, 1) * sizeof(*m5_stages));
+      m5_modules = malloc(MAX2(stage_count, 1) * sizeof(*m5_modules));
+      if (!m5_infos || !m5_stages || !m5_modules) {
+         free(m5_infos);
+         free(m5_stages);
+         free(m5_modules);
+         return VK_ERROR_OUT_OF_HOST_MEMORY;
+      }
+
+      memcpy(m5_infos, pCreateInfos, createInfoCount * sizeof(*m5_infos));
+      VkResult m5_result = VK_SUCCESS;
+      uint32_t s = 0;
+      for (uint32_t i = 0; i < createInfoCount; i++) {
+         m5_infos[i].flags = wrapper_fold_pipeline_flags2(&m5_infos[i].pNext,
+                                                          m5_infos[i].flags);
+         if (!pCreateInfos[i].stageCount)
+            continue;
+         memcpy(&m5_stages[s], pCreateInfos[i].pStages,
+                pCreateInfos[i].stageCount * sizeof(*m5_stages));
+         m5_infos[i].pStages = &m5_stages[s];
+         for (uint32_t j = 0; j < pCreateInfos[i].stageCount && m5_result == VK_SUCCESS; j++)
+            m5_result = wrapper_lower_inline_shader_stage(device, &m5_stages[s + j],
+                                                          m5_modules, &m5_module_count);
+         s += pCreateInfos[i].stageCount;
+      }
+
+      if (m5_result != VK_SUCCESS) {
+         wrapper_destroy_lowered_modules(device, m5_modules, m5_module_count);
+         free(m5_infos);
+         free(m5_stages);
+         for (uint32_t i = 0; i < createInfoCount; i++)
+            pPipelines[i] = VK_NULL_HANDLE;
+         return m5_result;
+      }
+
+      pCreateInfos = m5_infos;
+      driver_infos = m5_infos;
+   }
 
    if (wrapper_lowers_core13(device) &&
        !device->dispatch_table.CmdBeginRendering && createInfoCount) {
@@ -3278,6 +3581,11 @@ wrapper_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
       if (!legacy || !render_passes) {
          free(legacy);
          free(render_passes);
+         if (m5_infos) {
+            wrapper_destroy_lowered_modules(device, m5_modules, m5_module_count);
+            free(m5_infos);
+            free(m5_stages);
+         }
          return VK_ERROR_OUT_OF_HOST_MEMORY;
       }
       memcpy(legacy, pCreateInfos, createInfoCount * sizeof(*legacy));
@@ -3299,6 +3607,11 @@ wrapper_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
                      device->dispatch_handle, render_passes[j], NULL);
             free(legacy);
             free(render_passes);
+            if (m5_infos) {
+               wrapper_destroy_lowered_modules(device, m5_modules, m5_module_count);
+               free(m5_infos);
+               free(m5_stages);
+            }
             return rp_result;
          }
          legacy[i].renderPass = render_passes[i];
@@ -3318,9 +3631,51 @@ wrapper_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
       driver_infos = legacy;
    }
 
-   VkResult result = device->dispatch_table.CreateGraphicsPipelines(
-      device->dispatch_handle, pipelineCache, createInfoCount, driver_infos,
-      pAllocator, pPipelines);
+   VkGraphicsPipelineCreateInfo *div_infos = NULL;
+   void **div_lowerings = NULL;
+   if ((device->emulate_vertex_divisor || device->emulate_zero_divisor) && createInfoCount) {
+      div_infos = malloc(createInfoCount * sizeof(*div_infos));
+      div_lowerings = calloc(createInfoCount, sizeof(*div_lowerings));
+      if (div_infos && div_lowerings) {
+         for (uint32_t i = 0; i < createInfoCount; i++)
+            div_lowerings[i] = wrapper_divisor_lower(device, &driver_infos[i], &div_infos[i]);
+         driver_infos = div_infos;
+      }
+   }
+
+   VkResult result = VK_SUCCESS;
+   bool stride_emulated = false;
+   for (uint32_t i = 0; i < createInfoCount && !stride_emulated; i++)
+      stride_emulated = wrapper_stride_wants(device, &driver_infos[i]);
+
+   if (stride_emulated) {
+      for (uint32_t i = 0; i < createInfoCount; i++) {
+         VkResult r = wrapper_stride_wants(device, &driver_infos[i])
+            ? wrapper_stride_create(device, pipelineCache, &driver_infos[i], pAllocator,
+                                    &pPipelines[i])
+            : device->dispatch_table.CreateGraphicsPipelines(device->dispatch_handle,
+                 pipelineCache, 1, &driver_infos[i], pAllocator, &pPipelines[i]);
+         if (r != VK_SUCCESS) {
+            pPipelines[i] = VK_NULL_HANDLE;
+            if (result == VK_SUCCESS)
+               result = r;
+         }
+      }
+   } else {
+      result = device->dispatch_table.CreateGraphicsPipelines(
+         device->dispatch_handle, pipelineCache, createInfoCount, driver_infos,
+         pAllocator, pPipelines);
+   }
+
+   if (div_lowerings) {
+      for (uint32_t i = 0; i < createInfoCount; i++) {
+         if (div_infos == driver_infos)
+            wrapper_divisor_record(device, div_lowerings[i], pPipelines[i]);
+         free(div_lowerings[i]);
+      }
+   }
+   free(div_lowerings);
+   free(div_infos);
 
    if (render_passes) {
       for (uint32_t i = 0; i < createInfoCount; i++) {
@@ -3347,6 +3702,11 @@ wrapper_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
    }
    free(legacy);
    free(render_passes);
+   if (m5_infos) {
+      wrapper_destroy_lowered_modules(device, m5_modules, m5_module_count);
+      free(m5_infos);
+      free(m5_stages);
+   }
    WRAPPER_LOG(info, "CreateGraphicsPipelines result %d", result);
    return result;
 }
@@ -3366,6 +3726,10 @@ wrapper_DestroyPipeline(VkDevice _device, VkPipeline pipeline,
                                   (uint64_t)pipeline);
    simple_mtx_unlock(&device->resource_mutex);
 
+   if (device->emulate_dynamic_stride)
+      wrapper_stride_destroy(device, pipeline);
+   if ((device->emulate_vertex_divisor || device->emulate_zero_divisor))
+      wrapper_divisor_destroy(device, pipeline);
    device->dispatch_table.DestroyPipeline(device->dispatch_handle, pipeline,
                                            pAllocator);
    if (dynamic) {
@@ -3381,6 +3745,12 @@ wrapper_CmdDraw(VkCommandBuffer commandBuffer, uint32_t vertexCount,
                 uint32_t firstInstance)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   if (wcb->divisor_pipeline &&
+       wrapper_divisor_draw(wcb, false, vertexCount, instanceCount, firstVertex, 0,
+                            firstInstance))
+      return;
+   if (wcb->stride_pipeline)
+      wrapper_stride_flush(wcb);
    wcb->device->dispatch_table.CmdDraw(wcb->dispatch_handle, vertexCount,
                                        instanceCount, firstVertex, firstInstance);
 }
@@ -3391,9 +3761,137 @@ wrapper_CmdDrawIndexed(VkCommandBuffer commandBuffer, uint32_t indexCount,
                        int32_t vertexOffset, uint32_t firstInstance)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   if (wcb->divisor_pipeline &&
+       wrapper_divisor_draw(wcb, true, indexCount, instanceCount, firstIndex, vertexOffset,
+                            firstInstance))
+      return;
+   if (wcb->stride_pipeline)
+      wrapper_stride_flush(wcb);
    wcb->device->dispatch_table.CmdDrawIndexed(
       wcb->dispatch_handle, indexCount, instanceCount, firstIndex,
       vertexOffset, firstInstance);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wrapper_CmdDrawIndirect(VkCommandBuffer commandBuffer, VkBuffer buffer,
+                        VkDeviceSize offset, uint32_t drawCount, uint32_t stride)
+{
+   VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   bool divisor = wcb->divisor_pipeline && wrapper_divisor_begin_indirect(wcb);
+   if (wcb->stride_pipeline && !divisor)
+      wrapper_stride_flush(wcb);
+   wcb->device->dispatch_table.CmdDrawIndirect(wcb->dispatch_handle, buffer, offset,
+                                               drawCount, stride);
+   if (divisor)
+      wrapper_divisor_end_indirect(wcb);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wrapper_CmdDrawIndexedIndirect(VkCommandBuffer commandBuffer, VkBuffer buffer,
+                               VkDeviceSize offset, uint32_t drawCount, uint32_t stride)
+{
+   VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   bool divisor = wcb->divisor_pipeline && wrapper_divisor_begin_indirect(wcb);
+   if (wcb->stride_pipeline && !divisor)
+      wrapper_stride_flush(wcb);
+   wcb->device->dispatch_table.CmdDrawIndexedIndirect(wcb->dispatch_handle, buffer, offset,
+                                                      drawCount, stride);
+   if (divisor)
+      wrapper_divisor_end_indirect(wcb);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wrapper_CmdDrawIndirectCount(VkCommandBuffer commandBuffer, VkBuffer buffer,
+                             VkDeviceSize offset, VkBuffer countBuffer,
+                             VkDeviceSize countBufferOffset, uint32_t maxDrawCount,
+                             uint32_t stride)
+{
+   VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   bool divisor = wcb->divisor_pipeline && wrapper_divisor_begin_indirect(wcb);
+   if (wcb->stride_pipeline && !divisor)
+      wrapper_stride_flush(wcb);
+   wcb->device->dispatch_table.CmdDrawIndirectCount(wcb->dispatch_handle, buffer, offset,
+      countBuffer, countBufferOffset, maxDrawCount, stride);
+   if (divisor)
+      wrapper_divisor_end_indirect(wcb);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wrapper_CmdDrawIndexedIndirectCount(VkCommandBuffer commandBuffer, VkBuffer buffer,
+                                    VkDeviceSize offset, VkBuffer countBuffer,
+                                    VkDeviceSize countBufferOffset, uint32_t maxDrawCount,
+                                    uint32_t stride)
+{
+   VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   bool divisor = wcb->divisor_pipeline && wrapper_divisor_begin_indirect(wcb);
+   if (wcb->stride_pipeline && !divisor)
+      wrapper_stride_flush(wcb);
+   wcb->device->dispatch_table.CmdDrawIndexedIndirectCount(wcb->dispatch_handle, buffer,
+      offset, countBuffer, countBufferOffset, maxDrawCount, stride);
+   if (divisor)
+      wrapper_divisor_end_indirect(wcb);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wrapper_CmdDrawMultiEXT(VkCommandBuffer commandBuffer, uint32_t drawCount,
+                        const VkMultiDrawInfoEXT *pVertexInfo, uint32_t instanceCount,
+                        uint32_t firstInstance, uint32_t stride)
+{
+   VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   if (wcb->divisor_pipeline && drawCount) {
+      const uint8_t *info = (const uint8_t *)pVertexInfo;
+      bool handled = true;
+      for (uint32_t i = 0; i < drawCount && handled; i++) {
+         const VkMultiDrawInfoEXT *d = (const void *)(info + (size_t)i * stride);
+         handled = wrapper_divisor_draw(wcb, false, d->vertexCount, instanceCount,
+                                        d->firstVertex, 0, firstInstance);
+      }
+      if (handled)
+         return;
+   }
+   if (wcb->stride_pipeline)
+      wrapper_stride_flush(wcb);
+   wcb->device->dispatch_table.CmdDrawMultiEXT(wcb->dispatch_handle, drawCount, pVertexInfo,
+                                               instanceCount, firstInstance, stride);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wrapper_CmdDrawMultiIndexedEXT(VkCommandBuffer commandBuffer, uint32_t drawCount,
+                               const VkMultiDrawIndexedInfoEXT *pIndexInfo,
+                               uint32_t instanceCount, uint32_t firstInstance,
+                               uint32_t stride, const int32_t *pVertexOffset)
+{
+   VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   if (wcb->divisor_pipeline && drawCount) {
+      const uint8_t *info = (const uint8_t *)pIndexInfo;
+      bool handled = true;
+      for (uint32_t i = 0; i < drawCount && handled; i++) {
+         const VkMultiDrawIndexedInfoEXT *d = (const void *)(info + (size_t)i * stride);
+         handled = wrapper_divisor_draw(wcb, true, d->indexCount, instanceCount, d->firstIndex,
+                                        pVertexOffset ? *pVertexOffset : d->vertexOffset,
+                                        firstInstance);
+      }
+      if (handled)
+         return;
+   }
+   if (wcb->stride_pipeline)
+      wrapper_stride_flush(wcb);
+   wcb->device->dispatch_table.CmdDrawMultiIndexedEXT(wcb->dispatch_handle, drawCount,
+      pIndexInfo, instanceCount, firstInstance, stride, pVertexOffset);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wrapper_CmdDrawIndirectByteCountEXT(VkCommandBuffer commandBuffer, uint32_t instanceCount,
+                                    uint32_t firstInstance, VkBuffer counterBuffer,
+                                    VkDeviceSize counterBufferOffset,
+                                    uint32_t counterOffset, uint32_t vertexStride)
+{
+   VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   if (wcb->stride_pipeline)
+      wrapper_stride_flush(wcb);
+   wcb->device->dispatch_table.CmdDrawIndirectByteCountEXT(wcb->dispatch_handle,
+      instanceCount, firstInstance, counterBuffer, counterBufferOffset, counterOffset,
+      vertexStride);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -3402,6 +3900,8 @@ wrapper_ResetCommandBuffer(VkCommandBuffer commandBuffer,
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
    wrapper_dynamic_render_objects_reset(wcb);
+   wrapper_stride_reset(wcb);
+   wrapper_divisor_reset(wcb);
    if (wcb->device->emulate_push_descriptor)
       wrapper_push_pool_reset_all(wcb);
    return wcb->device->dispatch_table.ResetCommandBuffer(wcb->dispatch_handle,
@@ -3921,8 +4421,39 @@ wrapper_CreateShaderModule(VkDevice _device,
    if (WRAPPER_LOG_LEVEL(shader))
       dump_shader_code(create_info.pCode, create_info.codeSize);
    
-   return device->dispatch_table.CreateShaderModule(
+   VkResult result = device->dispatch_table.CreateShaderModule(
       device->dispatch_handle, &create_info, pAllocator, pShaderModule);
+   if (result == VK_SUCCESS &&
+       (device->emulate_dynamic_stride || device->emulate_vertex_divisor))
+      wrapper_stride_note_module(device, *pShaderModule, create_info.pCode,
+                                 create_info.codeSize);
+   return result;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wrapper_DestroyShaderModule(VkDevice _device, VkShaderModule shaderModule,
+                            const VkAllocationCallbacks *pAllocator)
+{
+   VK_FROM_HANDLE(wrapper_device, device, _device);
+   if (device->emulate_dynamic_stride || device->emulate_vertex_divisor)
+      wrapper_stride_forget_module(device, shaderModule);
+   device->dispatch_table.DestroyShaderModule(device->dispatch_handle, shaderModule,
+                                              pAllocator);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wrapper_CmdBindPipeline(VkCommandBuffer commandBuffer,
+                        VkPipelineBindPoint pipelineBindPoint, VkPipeline pipeline)
+{
+   VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   if (wcb->device->emulate_dynamic_stride &&
+       pipelineBindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS)
+      wrapper_stride_bind(wcb, pipeline);
+   if ((wcb->device->emulate_vertex_divisor || wcb->device->emulate_zero_divisor) &&
+       pipelineBindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS)
+      wrapper_divisor_bind(wcb, pipeline);
+   wcb->device->dispatch_table.CmdBindPipeline(wcb->dispatch_handle, pipelineBindPoint,
+                                               pipeline);
 }						   						   
 
 static VkResult
@@ -3989,6 +4520,8 @@ wrapper_AllocateCommandBuffers(VkDevice _device,
          pCommandBuffers + i);
       if (result != VK_SUCCESS)
          break;
+      wrapper_command_buffer_from_handle(pCommandBuffers[i])->secondary =
+         pAllocateInfo->level == VK_COMMAND_BUFFER_LEVEL_SECONDARY;
    }
 
    if (result != VK_SUCCESS) {
@@ -5257,6 +5790,8 @@ wrapper_DestroyDevice(VkDevice _device, const VkAllocationCallbacks* pAllocator)
    hash_table_u64_foreach(device->imageless_fb_table, entry)
       free(entry.data);
    _mesa_hash_table_u64_destroy(device->dynamic_pipeline_table);
+   wrapper_stride_finish(device);
+   wrapper_divisor_finish(device);
    _mesa_hash_table_u64_destroy(device->image_view_table);
    _mesa_hash_table_u64_destroy(device->imageless_fb_table);
 
