@@ -467,8 +467,10 @@ bcn_create_pipeline_specs(struct wrapper_device *device, const uint32_t *code, s
    return r;
 }
 
-/* the pipeline cache the worker builds into */
+/* the pipeline cache the worker builds into, and whether the driver
+ * rejected a pipeline of the build (its cache is then not saved) */
 static __thread VkPipelineCache bcn_build_cache;
+static __thread bool bcn_build_failed;
 
 static VkResult
 bcn_create_pipeline_spec(struct wrapper_device *device, const uint32_t *code, size_t size,
@@ -582,7 +584,7 @@ bcn_build_split(struct wrapper_device *device, int slot, VkPipeline *out)
       failed |= (r != VK_SUCCESS) << f;
    }
    if (failed) {
-      device->bcn_cache_tainted = true;
+      bcn_build_failed = true;
       bcn_split_mask_add(device, 0, failed);
    }
    wrapper_diag_append("[BCN] GPU shader decode per format: built mask 0x%03x, known to fail 0x%03x\n",
@@ -608,20 +610,65 @@ bcn_cache_path(struct wrapper_device *device, char *path, size_t size)
                        sizeof(wrapper_astc_fast_spv) * 5u + sizeof(wrapper_astc_fast_sg_spv) * 11u));
 }
 
+static pthread_mutex_t bcn_save_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* One pipeline cache file per slot: a build only ever goes into the cache
+ * saved by the same build, never into one holding other pipelines. */
 static void
-bcn_cache_save_locked(struct wrapper_device *device)
+bcn_slot_cache_path(struct wrapper_device *device, int slot, char *path, size_t size)
+{
+   char base[256];
+   bcn_cache_path(device, base, sizeof(base));
+   size_t n = strlen(base);
+   if (n > 4)
+      base[n - 4] = 0;
+   snprintf(path, size, "%s_s%d.bin", base, slot);
+}
+
+static VkPipelineCache
+bcn_slot_cache_load(struct wrapper_device *device, int slot, long *len)
+{
+   char path[272];
+   bcn_slot_cache_path(device, slot, path, sizeof(path));
+   void *data = NULL;
+   *len = 0;
+   FILE *f = fopen(path, "rb");
+   if (f) {
+      if (!fseek(f, 0, SEEK_END) && (*len = ftell(f)) > 0 && !fseek(f, 0, SEEK_SET) &&
+          (data = malloc(*len)) && fread(data, 1, *len, f) != (size_t)*len) {
+         free(data);
+         data = NULL;
+      }
+      fclose(f);
+   }
+   if (!data)
+      *len = 0;
+   VkPipelineCacheCreateInfo pcci = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,
+      .initialDataSize = data ? (size_t)*len : 0,
+      .pInitialData = data,
+   };
+   VkPipelineCache cache = VK_NULL_HANDLE;
+   if (device->dispatch_table.CreatePipelineCache(device->dispatch_handle, &pcci, NULL,
+                                                  &cache) != VK_SUCCESS)
+      cache = VK_NULL_HANDLE;
+   free(data);
+   return cache;
+}
+
+static void
+bcn_slot_cache_save(struct wrapper_device *device, int slot, VkPipelineCache cache)
 {
    VkDevice d = device->dispatch_handle;
    size_t out = 0;
    void *data;
-   if (!device->bcn_pipeline_cache || device->bcn_cache_tainted ||
-       device->dispatch_table.GetPipelineCacheData(d, device->bcn_pipeline_cache, &out, NULL) !=
-          VK_SUCCESS || !out || !(data = malloc(out)))
+   if (device->dispatch_table.GetPipelineCacheData(d, cache, &out, NULL) != VK_SUCCESS || !out ||
+       !(data = malloc(out)))
       return;
-   char path[256], tmp[272];
-   bcn_cache_path(device, path, sizeof(path));
-   if (device->dispatch_table.GetPipelineCacheData(d, device->bcn_pipeline_cache, &out, data) ==
-       VK_SUCCESS) {
+   char path[272], tmp[288];
+   bcn_slot_cache_path(device, slot, path, sizeof(path));
+   if (device->dispatch_table.GetPipelineCacheData(d, cache, &out, data) == VK_SUCCESS) {
+      pthread_mutex_lock(&bcn_save_lock);
       mkdir(BCN_CACHE_DIR, 0755);
       snprintf(tmp, sizeof(tmp), "%s.%d", path, (int)getpid());
       FILE *f = fopen(tmp, "wb");
@@ -630,18 +677,9 @@ bcn_cache_save_locked(struct wrapper_device *device)
          ok = !fclose(f) && ok;
       if (!ok || rename(tmp, path))
          remove(tmp);
+      pthread_mutex_unlock(&bcn_save_lock);
    }
    free(data);
-}
-
-static pthread_mutex_t bcn_save_lock = PTHREAD_MUTEX_INITIALIZER;
-
-static void
-bcn_cache_save(struct wrapper_device *device)
-{
-   pthread_mutex_lock(&bcn_save_lock);
-   bcn_cache_save_locked(device);
-   pthread_mutex_unlock(&bcn_save_lock);
 }
 
 /* Shaders the driver rejected once, kept next to the pipeline cache: the
@@ -712,7 +750,10 @@ bcn_tools_worker(void *arg)
       struct timespec t0, t1;
       clock_gettime(CLOCK_MONOTONIC, &t0);
       VkPipeline p = VK_NULL_HANDLE;
-      bcn_build_cache = device->bcn_pipeline_cache;
+      long cached = 0;
+      VkPipelineCache cache = bcn_slot_cache_load(device, slot, &cached);
+      bcn_build_cache = cache;
+      bcn_build_failed = false;
       bool known_split = (__atomic_load_n(&device->bcn_split_slots, __ATOMIC_RELAXED) >> slot) & 1u;
       VkResult r = VK_ERROR_UNKNOWN;
       if (known_split && slot == BCN_SLOT_ASTC4)
@@ -722,10 +763,10 @@ bcn_tools_worker(void *arg)
       if (r != VK_SUCCESS) {
          VkResult first = r;
          if (!known_split)
-            device->bcn_cache_tainted = true;
+            bcn_build_failed = true;
          r = bcn_build_split(device, slot, &p);
          if (r != VK_SUCCESS)
-            device->bcn_cache_tainted = true;
+            bcn_build_failed = true;
          else if (!known_split)
             bcn_split_mask_add(device, 1u << slot, 0);
          if (slot == BCN_SLOT_DECODE || slot == BCN_SLOT_ASTC4)
@@ -735,11 +776,15 @@ bcn_tools_worker(void *arg)
       }
       bcn_build_cache = VK_NULL_HANDLE;
       clock_gettime(CLOCK_MONOTONIC, &t1);
-      if (r == VK_SUCCESS && !device->bcn_cache_tainted)
-         bcn_cache_save(device);
-      wrapper_diag_append("[BCN] GPU shader %s built in %.0f ms (VkResult %d)\n",
-                          bcn_slot_names[slot],
-                          (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6, r);
+      if (cache) {
+         if (r == VK_SUCCESS && !bcn_build_failed)
+            bcn_slot_cache_save(device, slot, cache);
+         device->dispatch_table.DestroyPipelineCache(device->dispatch_handle, cache, NULL);
+      }
+      wrapper_diag_append("[BCN] GPU shader %s built in %.0f ms (VkResult %d, pipeline cache %ld "
+                          "bytes)\n", bcn_slot_names[slot],
+                          (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6, r,
+                          cached);
       pthread_mutex_lock(&device->bcn_tool_lock);
       device->bcn_pipe[slot] = p;
       device->bcn_slot_state[slot] = r == VK_SUCCESS ? BCN_BUILT : BCN_FAILED;
@@ -849,28 +894,7 @@ bcn_tools_start(struct wrapper_device *device)
       };
       char path[256];
       bcn_cache_path(device, path, sizeof(path));
-      void *data = NULL;
-      long len = 0;
-      FILE *f = fopen(path, "rb");
-      if (f) {
-         if (!fseek(f, 0, SEEK_END) && (len = ftell(f)) > 0 && !fseek(f, 0, SEEK_SET) &&
-             (data = malloc(len)) && fread(data, 1, len, f) != (size_t)len) {
-            free(data);
-            data = NULL;
-         }
-         fclose(f);
-      }
-      device->bcn_cache_warm = data != NULL;
       bcn_split_mask_read(device);
-      VkPipelineCacheCreateInfo pcci = {
-         .sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,
-         .initialDataSize = data ? (size_t)len : 0,
-         .pInitialData = data,
-      };
-      if (device->dispatch_table.CreatePipelineCache(d, &pcci, NULL,
-                                                     &device->bcn_pipeline_cache) != VK_SUCCESS)
-         device->bcn_pipeline_cache = VK_NULL_HANDLE;
-      free(data);
       bool ok = device->bcn_bda &&
                 device->dispatch_table.CreatePipelineLayout(d, &plci, NULL,
                                                             &device->bcn_tool_layout) ==
@@ -885,10 +909,10 @@ bcn_tools_start(struct wrapper_device *device)
                             bcn_tools_worker, device) == 0)
          device->bcn_tool_threads++;
       device->bcn_tool_thread_live = ok;
-      wrapper_diag_append("[BCN] GPU shaders: %s (bda=%d, pipeline cache %ld bytes from %s; "
+      wrapper_diag_append("[BCN] GPU shaders: %s (bda=%d, pipeline caches next to %s; "
                           "self-test on %s)\n",
                           ok ? "built in the background" : "off, upload=cpu", device->bcn_bda,
-                          device->bcn_cache_warm ? len : 0L, path,
+                          path,
                           device->bcn_queue_shares_query_reset ? "the query reset queue" :
                           device->bcn_queue ? "a private queue" : "the next submit");
       __atomic_store_n(&device->bcn_tool_state, ok ? 1 : -1, __ATOMIC_RELEASE);
@@ -1457,8 +1481,6 @@ wrapper_bcn_gpu_finish(struct wrapper_device *device)
       device->dispatch_table.DestroyBuffer(d, device->bcn_tables, NULL);
    if (device->bcn_tables_memory)
       device->dispatch_table.FreeMemory(d, device->bcn_tables_memory, NULL);
-   if (device->bcn_pipeline_cache)
-      device->dispatch_table.DestroyPipelineCache(d, device->bcn_pipeline_cache, NULL);
    if (device->bcn_tool_layout)
       device->dispatch_table.DestroyPipelineLayout(d, device->bcn_tool_layout, NULL);
    pthread_cond_destroy(&device->bcn_tool_cond);

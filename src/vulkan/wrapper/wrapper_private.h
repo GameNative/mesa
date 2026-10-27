@@ -128,7 +128,6 @@ struct wrapper_device {
    pthread_mutex_t bcn_tool_lock;
    pthread_cond_t bcn_tool_cond;
    uint32_t bcn_tool_untested;             /* a pipeline was built since the last check */
-   VkPipelineCache bcn_pipeline_cache;
    VkPipelineLayout bcn_tool_layout;
    VkBuffer bcn_tables;                    /* ASTC encoder tables */
    VkDeviceMemory bcn_tables_memory;
@@ -156,8 +155,6 @@ struct wrapper_device {
    uint32_t bcn_gate_used;
    uint32_t bcn_gate_pending[64][6];
    uint32_t bcn_gate_pending_count;
-   bool bcn_cache_warm;                    /* the pipeline cache file had data */
-   bool bcn_cache_tainted;                 /* a build failed: the cache is not saved */
    uint32_t bcn_split_slots;               /* slots built as their split variants */
    uint32_t bcn_split_decode_bad;          /* per-format decoders the driver rejects */
    VkQueue bcn_queue;                      /* where the worker runs the self-test */
