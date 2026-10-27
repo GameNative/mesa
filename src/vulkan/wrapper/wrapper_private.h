@@ -184,6 +184,7 @@ struct wrapper_device {
    bool bcn_cache_warm;                    /* the pipeline cache file had data */
    bool bcn_cache_tainted;                 /* a build failed: the cache is not saved */
    uint32_t bcn_split_slots;               /* slots built as their split variants */
+   uint32_t bcn_split_decode_bad;          /* per-format decoders the driver rejects */
    VkQueue bcn_queue;                      /* where the worker runs the self-test */
    uint32_t bcn_queue_family;
    uint32_t bcn_queue_index;

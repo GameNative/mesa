@@ -1170,6 +1170,13 @@ wrapper_bcn_astc_encode_cpu(const void *blocks, int w, int h, VkFormat format, u
 }
 
 void
+wrapper_bcn_decode_for_astc(const void *blocks, int w, int h, int block_x_src, VkFormat format,
+                            void *out)
+{
+   bcn_decode_for_astc(blocks, w, h, block_x_src, format, out);
+}
+
+void
 decompress_bcn_format(void *srcBuffer,
 					  void *dstBuffer,
 					  int w,
