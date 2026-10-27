@@ -38,11 +38,14 @@ struct wrapper_physical_device {
 
    int dma_heap_fd;
    int emulate_bcn;
+   uint32_t native_bcn_mask;
    bool is_vkd3d;
    uint32_t queue_family_count;
    bool emulate_imageless_framebuffer;
    bool emulate_vulkan13;
    bool raises_push_constant_limit;
+   bool lower_int64;
+   bool fold_sets;
    bool emulate_vertex_divisor;
    bool emulate_zero_divisor;
    char *resource_type;
@@ -71,6 +74,13 @@ struct wrapper_queue {
 VK_DEFINE_HANDLE_CASTS(wrapper_queue, vk.base, VkQueue,
                        VK_OBJECT_TYPE_QUEUE)
 
+enum {
+   BCN_SLOT_DECODE, BCN_SLOT_ASTC4, BCN_SLOT_ASTC6, BCN_SLOT_ASTC8, BCN_SLOT_HDR,
+   BCN_SLOT_ENC_BC15, BCN_SLOT_ENC_BC6H, BCN_SLOT_ENC_BC7, BCN_SLOT_COUNT
+};
+
+enum { BCN_NONE, BCN_QUEUED, BCN_BUILDING, BCN_BUILT, BCN_TESTED, BCN_FAILED };
+
 struct wrapper_device {
    struct vk_device vk;
 
@@ -82,6 +92,7 @@ struct wrapper_device {
    struct list_head image_list;
    struct list_head fence_list;
    struct hash_table_u64 *buffer_table;
+   struct hash_table_u64 *device_only_memory; /* allocations the host cannot map */
    struct hash_table_u64 *image_table;
    struct hash_table_u64 *image_view_table;
    struct hash_table_u64 *imageless_fb_table;
@@ -89,6 +100,17 @@ struct wrapper_device {
    struct hash_table_u64 *stride_pipeline_table;
    struct hash_table_u64 *shader_code_table;
    bool emulate_dynamic_stride;
+   bool emulate_eds;
+   bool emulate_eds2;
+   bool fold_sets;
+   simple_mtx_t fold_mutex;
+   struct hash_table_u64 *fold_layout_table;
+   struct hash_table_u64 *fold_pl_table;
+   struct hash_table_u64 *fold_set_table;
+   struct fold_merge *fold_merges;
+   uint32_t fold_max_pool_count;
+   uint32_t fold_set_budget;
+   uint32_t max_viewports;
    struct hash_table_u64 *divisor_pipeline_table;
    bool emulate_vertex_divisor;
    bool emulate_zero_divisor;
@@ -118,14 +140,59 @@ struct wrapper_device {
    VkImageView null_image_view;
    VkSampler null_sampler;
 
-   /* BCn->ASTC GPU transcode (compute), lazily initialized. */
+   /* BC decode/encode and ASTC encode compute shaders, lazily initialized. */
    simple_mtx_t bcn_gpu_mutex;
-   int bcn_gpu_state;                    /* 0 uninit, 1 ready, -1 disabled */
-   VkShaderModule bcn_shader;
-   VkDescriptorSetLayout bcn_set_layout;
-   VkPipelineLayout bcn_pipe_layout;
-   VkPipeline bcn_pipeline;
-   VkDeviceSize bcn_gpu_inflight;        /* transient GPU-transcode bytes not yet freed */
+   bool bcn_bda;                         /* bufferDeviceAddress enabled for them */
+   int bcn_tool_state;                   /* 0 not started, 1 started, -1 off */
+   uint32_t bcn_tool_family;               /* queue family of the self-test */
+   pthread_t bcn_tool_thread[4];
+   uint32_t bcn_tool_threads;              /* workers started */
+   bool bcn_tool_thread_live;
+   bool bcn_tool_stop;
+   uint32_t bcn_tool_exited;               /* workers finished */
+   pthread_mutex_t bcn_tool_lock;
+   pthread_cond_t bcn_tool_cond;
+   uint32_t bcn_tool_untested;             /* a pipeline was built since the last check */
+   VkPipelineLayout bcn_tool_layout;
+   VkBuffer bcn_tables;                    /* ASTC encoder tables */
+   VkDeviceMemory bcn_tables_memory;
+   VkDeviceAddress bcn_tables_address;
+   VkShaderModule bcn_decode_module;
+   VkShaderModule bcn_encode_module;
+   VkShaderModule bcn_astc_module;
+   VkShaderModule bcn_astc_hdr_module;
+   VkShaderModule bcn_astc_fast_module;
+   VkShaderModule bcn_astc_fast_sg_module;
+   VkShaderModule bcn_split_modules[2];    /* decode per format, ASTC 4x4 without the direct step */
+   VkPipeline bcn_decode_fmt[11];          /* per-format decoders when the full one does not build */
+   bool bcn_decode_split;
+   uint32_t bcn_decode_bad;                /* format ids whose GPU decode failed the self-test */
+   VkPipeline bcn_pipe[BCN_SLOT_COUNT];
+   uint32_t bcn_slot_group[BCN_SLOT_COUNT]; /* blocks per workgroup edge */
+   uint32_t bcn_astc_block_only;           /* slots whose workgroup encoder failed */
+   bool bcn_direct;                        /* the ASTC 4x4 encoder maps BC blocks directly */
+   bool bcn_bc7_mode6;                     /* BC7 readbacks use mode 6 only */
+   /* indirect group counts of dispatches recorded before their pipeline's
+    * self-test (no private queue): zero until the test at the next submit */
+   VkBuffer bcn_gate;
+   VkDeviceMemory bcn_gate_memory;
+   uint32_t *bcn_gate_map;
+   uint32_t bcn_gate_used;
+   uint32_t bcn_gate_pending[64][6];
+   uint32_t bcn_gate_pending_count;
+   uint32_t bcn_split_slots;               /* slots built as their split variants */
+   uint32_t bcn_split_decode_bad;          /* per-format decoders the driver rejects */
+   VkQueue bcn_queue;                      /* where the worker runs the self-test */
+   uint32_t bcn_queue_family;
+   uint32_t bcn_queue_index;
+   bool bcn_queue_reserved;
+   bool bcn_queue_shares_query_reset;
+   simple_mtx_t bcn_queue_mutex;
+   int bcn_slot_state[BCN_SLOT_COUNT];
+   bool bcn_slot_late[BCN_SLOT_COUNT];     /* a wait for its build timed out */
+   VkPipeline bcn_retired[BCN_SLOT_COUNT]; /* dropped by the self-test */
+   struct bcn_hq *bcn_hq;                  /* background astcenc stage */
+   uint32_t bcn_hq_active;                 /* its jobs not yet copied or dropped */
 
    /* Private queue and synchronous command buffer for host query reset. */
    simple_mtx_t query_reset_mutex;
@@ -152,11 +219,9 @@ struct wrapper_buffer {
    void *mapped_address;
    int is_mapped;
    VkDeviceMemory memory;
+   bool device_only;                     /* bound to memory the host cannot map */
    struct wrapper_command_buffer *wcb;
-   /* For transient GPU-transcode buffers: a descriptor pool destroyed with it,
-    * and bytes to release from the device's in-flight counter when freed. */
-   VkDescriptorPool desc_pool;
-   VkDeviceSize bcn_inflight;
+   VkImage bcn_image;                    /* transient BCn image freed with the command buffer */
    VkExternalMemoryHandleTypeFlags handle_types;
 };
 
@@ -165,6 +230,9 @@ get_wrapper_buffer_from_handle_locked(struct wrapper_device *device, VkBuffer bu
 
 struct wrapper_buffer *
 get_wrapper_buffer_from_handle(struct wrapper_device *device, VkBuffer buffer);
+
+bool
+wrapper_memory_device_only(struct wrapper_device *device, VkDeviceMemory memory);
 
 #define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EMULATED_B8G8R8A8_CREATE_INFO_EXT 1000701234
 typedef struct VkEmulatedB8G8R8A8CreateInfoExt {
@@ -184,6 +252,10 @@ struct wrapper_image {
    bool is_wsi_image;
    VkExternalMemoryHandleTypeFlags handle_types;
    uint32_t mip_drop;
+   uint32_t bcn_hq_jobs;                  /* background ASTC jobs for this image */
+   VkImageLayout bcn_layout;              /* last layout recorded while it has some */
+   struct wrapper_command_buffer *bcn_touch; /* last command buffer that moved it */
+   uint32_t bcn_owner;                    /* queue family owning it after a transfer, + 1 */
 };
 
 struct wrapper_image *
@@ -198,18 +270,50 @@ struct wrapper_fence {
 	struct wrapper_device *device;
 	struct list_head link;
 	VkFence dispatch_handle;
-	struct list_head staging_buffers_list;
 };
 
 /* One chunked descriptor pool used to service emulated push-descriptor sets for
  * a single command buffer recording. Pools live on the command buffer and are
  * reset (not freed) at Begin/Reset -- safe because a CB can't be re-recorded
  * while still executing -- and destroyed when the command buffer is freed. */
+enum wrapper_eds_field {
+   WRAPPER_EDS_CULL,
+   WRAPPER_EDS_FRONT,
+   WRAPPER_EDS_TOPOLOGY,
+   WRAPPER_EDS_DEPTH_TEST,
+   WRAPPER_EDS_DEPTH_WRITE,
+   WRAPPER_EDS_DEPTH_COMPARE,
+   WRAPPER_EDS_DEPTH_BOUNDS,
+   WRAPPER_EDS_STENCIL_TEST,
+   WRAPPER_EDS_FRONT_FAIL,
+   WRAPPER_EDS_FRONT_PASS,
+   WRAPPER_EDS_FRONT_DEPTH_FAIL,
+   WRAPPER_EDS_FRONT_COMPARE,
+   WRAPPER_EDS_BACK_FAIL,
+   WRAPPER_EDS_BACK_PASS,
+   WRAPPER_EDS_BACK_DEPTH_FAIL,
+   WRAPPER_EDS_BACK_COMPARE,
+   WRAPPER_EDS_RASTER_DISCARD,
+   WRAPPER_EDS_DEPTH_BIAS,
+   WRAPPER_EDS_PRIM_RESTART,
+   WRAPPER_EDS_VIEWPORTS,
+   WRAPPER_EDS_SCISSORS,
+   WRAPPER_EDS_COUNT,
+};
+
 struct wrapper_push_pool {
    struct wrapper_push_pool *next;
    VkDescriptorPool pool;
    VkDescriptorSetLayout layout;   /* the set layout this pool is sized for */
    uint32_t remaining;             /* sets left before this pool is exhausted */
+};
+
+struct wrapper_push_record {
+   VkPipelineLayout layout;
+   VkShaderStageFlags stages;
+   uint32_t offset;
+   uint32_t size;
+   uint8_t data[256];
 };
 
 struct wrapper_command_buffer {
@@ -228,6 +332,14 @@ struct wrapper_command_buffer {
    VkPipeline stride_bound;
    uint32_t vertex_strides[32];
    uint32_t vertex_strides_valid;
+   struct list_head bcn_transients;
+   /* Compute pipeline and push constants the application set, put back after
+    * a BCn shader dispatch. */
+   VkPipeline compute_pipeline;
+   uint32_t push_count;
+   struct wrapper_push_record push[8];
+   uint32_t eds[WRAPPER_EDS_COUNT];
+   uint32_t eds_valid;
    const struct wrapper_divisor_pipeline *divisor_pipeline;
    VkBuffer vb_buffer[32];
    VkDeviceSize vb_offset[32];
@@ -327,6 +439,46 @@ wrapper_device_memory_destroy(struct wrapper_device_memory *mem);
 int wrapper_diag_on(void);
 void wrapper_diag_append(const char *fmt, ...);
 
+bool wrapper_core13_wanted(const struct wrapper_physical_device *pdevice,
+                           const char *engine_name);
+void wrapper_core13_init_physical_device(struct wrapper_physical_device *pdevice);
+void wrapper_core13_fill_properties(struct wrapper_physical_device *pdevice,
+                                    VkPhysicalDeviceProperties2 *props);
+void wrapper_format_properties3_from_legacy(struct wrapper_physical_device *pdevice,
+                                            VkFormat format,
+                                            VkFormatProperties2 *props);
+void *wrapper_core13_lower_device_create(struct wrapper_device *device,
+                                         VkDeviceCreateInfo *info,
+                                         const char **exts, uint32_t *ext_count);
+void wrapper_core13_free_device_create(void *storage);
+
+void wrapper_fold_init(struct wrapper_device *device);
+void wrapper_fold_note_pool(struct wrapper_device *device, const VkDescriptorPoolCreateInfo *info);
+void wrapper_fold_note_layout(struct wrapper_device *device,
+                              const VkDescriptorSetLayoutCreateInfo *info,
+                              VkDescriptorSetLayout handle);
+bool wrapper_fold_create_pipeline_layout(struct wrapper_device *device,
+                                         const VkPipelineLayoutCreateInfo *info,
+                                         const VkAllocationCallbacks *alloc,
+                                         VkPipelineLayout *out, VkResult *result);
+void wrapper_fold_destroy_pipeline_layout(struct wrapper_device *device, VkPipelineLayout layout);
+bool wrapper_fold_layout_folded(struct wrapper_device *device, VkPipelineLayout layout);
+uint32_t wrapper_fold_set_index(struct wrapper_device *device, VkPipelineLayout layout,
+                                uint32_t set);
+uint32_t *wrapper_fold_remap_spirv(struct wrapper_device *device, VkPipelineLayout layout,
+                                   const uint32_t *code, size_t words);
+void wrapper_fold_note_sets(struct wrapper_device *device, const VkDescriptorSetAllocateInfo *info,
+                            const VkDescriptorSet *sets);
+void wrapper_fold_free_sets(struct wrapper_device *device, uint32_t count,
+                            const VkDescriptorSet *sets);
+void wrapper_fold_reset_pool(struct wrapper_device *device, VkDescriptorPool pool);
+bool wrapper_fold_remap_updates(struct wrapper_device *device,
+                                uint32_t *write_count, VkWriteDescriptorSet **writes,
+                                uint32_t *copy_count, VkCopyDescriptorSet **copies);
+bool wrapper_fold_bind(struct wrapper_command_buffer *wcb, VkPipelineBindPoint bind_point,
+                       VkPipelineLayout layout, uint32_t first, uint32_t count,
+                       const VkDescriptorSet *sets, uint32_t dyn_count, const uint32_t *dyn);
+
 struct wrapper_stride_pipeline;
 
 void wrapper_stride_note_module(struct wrapper_device *device, VkShaderModule module,
@@ -344,6 +496,8 @@ void wrapper_stride_bind(struct wrapper_command_buffer *wcb, VkPipeline pipeline
 void wrapper_stride_set(struct wrapper_command_buffer *wcb, uint32_t first, uint32_t count,
                         const VkDeviceSize *strides);
 void wrapper_stride_flush(struct wrapper_command_buffer *wcb);
+void wrapper_eds_set(struct wrapper_command_buffer *wcb, enum wrapper_eds_field field,
+                     uint32_t value);
 void wrapper_stride_reset(struct wrapper_command_buffer *wcb);
 void wrapper_stride_finish(struct wrapper_device *device);
 

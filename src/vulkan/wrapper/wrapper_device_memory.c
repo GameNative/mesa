@@ -3,6 +3,7 @@
 #include "wrapper_entrypoints.h"
 #include "vk_common_entrypoints.h"
 #include "util/os_file.h"
+#include "util/hash_table.h"
 #include "vk_util.h"
 
 #include <android/hardware_buffer.h>
@@ -663,8 +664,23 @@ out:
    return result;
 
 fallback:
-   return device->dispatch_table.AllocateMemory(device->dispatch_handle,
+   result = device->dispatch_table.AllocateMemory(device->dispatch_handle,
       pAllocateInfo, pAllocator, pMemory);
+   if (result == VK_SUCCESS && !(property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
+      simple_mtx_lock(&device->resource_mutex);
+      _mesa_hash_table_u64_insert(device->device_only_memory, (uint64_t)*pMemory, device);
+      simple_mtx_unlock(&device->resource_mutex);
+   }
+   return result;
+}
+
+bool
+wrapper_memory_device_only(struct wrapper_device *device, VkDeviceMemory memory)
+{
+   simple_mtx_lock(&device->resource_mutex);
+   bool found = _mesa_hash_table_u64_search(device->device_only_memory, (uint64_t)memory) != NULL;
+   simple_mtx_unlock(&device->resource_mutex);
+   return found;
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -680,6 +696,9 @@ wrapper_FreeMemory(VkDevice _device, VkDeviceMemory _memory,
       return wrapper_device_memory_destroy(mem);
    }
 
+   simple_mtx_lock(&device->resource_mutex);
+   _mesa_hash_table_u64_remove(device->device_only_memory, (uint64_t)_memory);
+   simple_mtx_unlock(&device->resource_mutex);
    device->dispatch_table.FreeMemory(device->dispatch_handle,
                                      _memory,
                                      pAllocator);

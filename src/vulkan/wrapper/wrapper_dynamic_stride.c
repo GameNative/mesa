@@ -6,6 +6,9 @@
 #include "vk_util.h"
 #include "util/ralloc.h"
 #include "util/hash_table.h"
+#include "util/bitscan.h"
+#include "util/macros.h"
+#include "util/u_math.h"
 
 #define WRAPPER_STRIDE_MAX_BINDINGS 32
 
@@ -14,8 +17,13 @@ struct wrapper_stride_code {
    size_t size;
 };
 
-struct wrapper_stride_variant {
+struct wrapper_variant_key {
    uint32_t strides[WRAPPER_STRIDE_MAX_BINDINGS];
+   uint32_t eds[WRAPPER_EDS_COUNT];
+};
+
+struct wrapper_stride_variant {
+   struct wrapper_variant_key key;
    VkPipeline pipeline;
 };
 
@@ -26,6 +34,12 @@ struct wrapper_stride_pipeline {
    VkGraphicsPipelineCreateInfo info;
    VkPipelineVertexInputStateCreateInfo vi;
    VkVertexInputBindingDescription *bindings;
+   VkPipelineInputAssemblyStateCreateInfo *ia;
+   VkPipelineRasterizationStateCreateInfo *rs;
+   VkPipelineDepthStencilStateCreateInfo *ds;
+   VkPipelineViewportStateCreateInfo *vp;
+   uint32_t eds_dynamic;
+   bool stride_dynamic;
    VkShaderModule *modules;
    uint32_t module_count;
    uint32_t variant_count;
@@ -93,17 +107,78 @@ has_dynamic_stride(const VkPipelineDynamicStateCreateInfo *dyn)
    return false;
 }
 
+static uint32_t
+eds_state_mask(const struct wrapper_device *device, VkDynamicState state)
+{
+   if (device->emulate_eds) {
+      switch (state) {
+      case VK_DYNAMIC_STATE_CULL_MODE:
+         return BITFIELD_BIT(WRAPPER_EDS_CULL);
+      case VK_DYNAMIC_STATE_FRONT_FACE:
+         return BITFIELD_BIT(WRAPPER_EDS_FRONT);
+      case VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY:
+         return BITFIELD_BIT(WRAPPER_EDS_TOPOLOGY);
+      case VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT:
+         return BITFIELD_BIT(WRAPPER_EDS_VIEWPORTS);
+      case VK_DYNAMIC_STATE_SCISSOR_WITH_COUNT:
+         return BITFIELD_BIT(WRAPPER_EDS_SCISSORS);
+      case VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE:
+         return BITFIELD_BIT(WRAPPER_EDS_DEPTH_TEST);
+      case VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE:
+         return BITFIELD_BIT(WRAPPER_EDS_DEPTH_WRITE);
+      case VK_DYNAMIC_STATE_DEPTH_COMPARE_OP:
+         return BITFIELD_BIT(WRAPPER_EDS_DEPTH_COMPARE);
+      case VK_DYNAMIC_STATE_DEPTH_BOUNDS_TEST_ENABLE:
+         return BITFIELD_BIT(WRAPPER_EDS_DEPTH_BOUNDS);
+      case VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE:
+         return BITFIELD_BIT(WRAPPER_EDS_STENCIL_TEST);
+      case VK_DYNAMIC_STATE_STENCIL_OP:
+         return BITFIELD_RANGE(WRAPPER_EDS_FRONT_FAIL, 8);
+      default:
+         break;
+      }
+   }
+   if (device->emulate_eds2) {
+      switch (state) {
+      case VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE:
+         return BITFIELD_BIT(WRAPPER_EDS_RASTER_DISCARD);
+      case VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE:
+         return BITFIELD_BIT(WRAPPER_EDS_DEPTH_BIAS);
+      case VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE:
+         return BITFIELD_BIT(WRAPPER_EDS_PRIM_RESTART);
+      default:
+         break;
+      }
+   }
+   return 0;
+}
+
+static uint32_t
+eds_dynamic_mask(const struct wrapper_device *device,
+                 const VkPipelineDynamicStateCreateInfo *dyn)
+{
+   uint32_t mask = 0;
+   if (!dyn)
+      return 0;
+   for (uint32_t i = 0; i < dyn->dynamicStateCount; i++)
+      mask |= eds_state_mask(device, dyn->pDynamicStates[i]);
+   return mask;
+}
+
 bool
 wrapper_stride_wants(const struct wrapper_device *device,
                      const VkGraphicsPipelineCreateInfo *info)
 {
-   return device->emulate_dynamic_stride &&
-          !(info->flags & VK_PIPELINE_CREATE_LIBRARY_BIT_KHR) &&
-          !vk_find_struct_const(info->pNext, PIPELINE_LIBRARY_CREATE_INFO_KHR) &&
-          !vk_find_struct_const(info->pNext, GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT) &&
-          info->pVertexInputState &&
-          info->pVertexInputState->vertexBindingDescriptionCount <= WRAPPER_STRIDE_MAX_BINDINGS &&
-          has_dynamic_stride(info->pDynamicState);
+   if (!device->emulate_dynamic_stride && !device->emulate_eds && !device->emulate_eds2)
+      return false;
+   if ((info->flags & VK_PIPELINE_CREATE_LIBRARY_BIT_KHR) ||
+       vk_find_struct_const(info->pNext, PIPELINE_LIBRARY_CREATE_INFO_KHR) ||
+       vk_find_struct_const(info->pNext, GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT) ||
+       !info->pVertexInputState ||
+       info->pVertexInputState->vertexBindingDescriptionCount > WRAPPER_STRIDE_MAX_BINDINGS)
+      return false;
+   return (device->emulate_dynamic_stride && has_dynamic_stride(info->pDynamicState)) ||
+          eds_dynamic_mask(device, info->pDynamicState);
 }
 
 static void *
@@ -254,6 +329,11 @@ copy_create_info(struct wrapper_device *device, struct wrapper_stride_pipeline *
       v->pViewports = copy_array(mem, v->pViewports, v->viewportCount * sizeof(VkViewport));
       v->pScissors = copy_array(mem, v->pScissors, v->scissorCount * sizeof(VkRect2D));
       dst->pViewportState = v;
+   } else if (sp->eds_dynamic & (BITFIELD_BIT(WRAPPER_EDS_VIEWPORTS) |
+                                 BITFIELD_BIT(WRAPPER_EDS_SCISSORS))) {
+      VkPipelineViewportStateCreateInfo *v = rzalloc(mem, VkPipelineViewportStateCreateInfo);
+      v->sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+      dst->pViewportState = v;
    }
    COPY_STATE(pRasterizationState, VkPipelineRasterizationStateCreateInfo);
    if (src->pMultisampleState) {
@@ -274,15 +354,113 @@ copy_create_info(struct wrapper_device *device, struct wrapper_stride_pipeline *
 
    const VkPipelineDynamicStateCreateInfo *dyn = src->pDynamicState;
    VkPipelineDynamicStateCreateInfo *d = ralloc_memdup(mem, dyn, sizeof(*d));
-   VkDynamicState *states = ralloc_array(mem, VkDynamicState, dyn->dynamicStateCount);
+   VkDynamicState *states = ralloc_array(mem, VkDynamicState, dyn->dynamicStateCount + 2);
+   bool has_viewport = false, has_scissor = false;
    d->pNext = NULL;
    d->dynamicStateCount = 0;
-   for (uint32_t i = 0; i < dyn->dynamicStateCount; i++)
-      if (dyn->pDynamicStates[i] != VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE)
-         states[d->dynamicStateCount++] = dyn->pDynamicStates[i];
+   for (uint32_t i = 0; i < dyn->dynamicStateCount; i++) {
+      VkDynamicState state = dyn->pDynamicStates[i];
+      if (state == VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE && sp->stride_dynamic)
+         continue;
+      if (state == VK_DYNAMIC_STATE_VIEWPORT)
+         has_viewport = true;
+      if (state == VK_DYNAMIC_STATE_SCISSOR)
+         has_scissor = true;
+      if (eds_state_mask(device, state))
+         continue;
+      states[d->dynamicStateCount++] = state;
+   }
+   if ((sp->eds_dynamic & BITFIELD_BIT(WRAPPER_EDS_VIEWPORTS)) && !has_viewport)
+      states[d->dynamicStateCount++] = VK_DYNAMIC_STATE_VIEWPORT;
+   if ((sp->eds_dynamic & BITFIELD_BIT(WRAPPER_EDS_SCISSORS)) && !has_scissor)
+      states[d->dynamicStateCount++] = VK_DYNAMIC_STATE_SCISSOR;
    d->pDynamicStates = states;
    dst->pDynamicState = d;
+
+   sp->ia = (VkPipelineInputAssemblyStateCreateInfo *)dst->pInputAssemblyState;
+   sp->rs = (VkPipelineRasterizationStateCreateInfo *)dst->pRasterizationState;
+   sp->ds = (VkPipelineDepthStencilStateCreateInfo *)dst->pDepthStencilState;
+   sp->vp = (VkPipelineViewportStateCreateInfo *)dst->pViewportState;
    return true;
+}
+
+static void
+base_key(const struct wrapper_stride_pipeline *sp, struct wrapper_variant_key *key)
+{
+   memset(key, 0, sizeof(*key));
+   for (uint32_t b = 0; b < sp->vi.vertexBindingDescriptionCount; b++)
+      key->strides[sp->bindings[b].binding % WRAPPER_STRIDE_MAX_BINDINGS] = sp->bindings[b].stride;
+   uint32_t *e = key->eds;
+   if (sp->rs) {
+      e[WRAPPER_EDS_CULL] = sp->rs->cullMode;
+      e[WRAPPER_EDS_FRONT] = sp->rs->frontFace;
+      e[WRAPPER_EDS_RASTER_DISCARD] = sp->rs->rasterizerDiscardEnable;
+      e[WRAPPER_EDS_DEPTH_BIAS] = sp->rs->depthBiasEnable;
+   }
+   if (sp->ia) {
+      e[WRAPPER_EDS_TOPOLOGY] = sp->ia->topology;
+      e[WRAPPER_EDS_PRIM_RESTART] = sp->ia->primitiveRestartEnable;
+   }
+   if (sp->ds) {
+      e[WRAPPER_EDS_DEPTH_TEST] = sp->ds->depthTestEnable;
+      e[WRAPPER_EDS_DEPTH_WRITE] = sp->ds->depthWriteEnable;
+      e[WRAPPER_EDS_DEPTH_COMPARE] = sp->ds->depthCompareOp;
+      e[WRAPPER_EDS_DEPTH_BOUNDS] = sp->ds->depthBoundsTestEnable;
+      e[WRAPPER_EDS_STENCIL_TEST] = sp->ds->stencilTestEnable;
+      e[WRAPPER_EDS_FRONT_FAIL] = sp->ds->front.failOp;
+      e[WRAPPER_EDS_FRONT_PASS] = sp->ds->front.passOp;
+      e[WRAPPER_EDS_FRONT_DEPTH_FAIL] = sp->ds->front.depthFailOp;
+      e[WRAPPER_EDS_FRONT_COMPARE] = sp->ds->front.compareOp;
+      e[WRAPPER_EDS_BACK_FAIL] = sp->ds->back.failOp;
+      e[WRAPPER_EDS_BACK_PASS] = sp->ds->back.passOp;
+      e[WRAPPER_EDS_BACK_DEPTH_FAIL] = sp->ds->back.depthFailOp;
+      e[WRAPPER_EDS_BACK_COMPARE] = sp->ds->back.compareOp;
+   }
+   if (sp->vp) {
+      e[WRAPPER_EDS_VIEWPORTS] = MAX2(sp->vp->viewportCount, 1);
+      e[WRAPPER_EDS_SCISSORS] = MAX2(sp->vp->scissorCount, 1);
+   }
+}
+
+static void
+apply_key(struct wrapper_stride_pipeline *sp, const struct wrapper_variant_key *key)
+{
+   const uint32_t *e = key->eds;
+   for (uint32_t b = 0; b < sp->vi.vertexBindingDescriptionCount; b++)
+      sp->bindings[b].stride = key->strides[sp->bindings[b].binding % WRAPPER_STRIDE_MAX_BINDINGS];
+   if (sp->rs) {
+      sp->rs->cullMode = e[WRAPPER_EDS_CULL];
+      sp->rs->frontFace = e[WRAPPER_EDS_FRONT];
+      sp->rs->rasterizerDiscardEnable = e[WRAPPER_EDS_RASTER_DISCARD];
+      sp->rs->depthBiasEnable = e[WRAPPER_EDS_DEPTH_BIAS];
+   }
+   if (sp->ia) {
+      sp->ia->topology = e[WRAPPER_EDS_TOPOLOGY];
+      sp->ia->primitiveRestartEnable = e[WRAPPER_EDS_PRIM_RESTART];
+   }
+   if (sp->ds) {
+      sp->ds->depthTestEnable = e[WRAPPER_EDS_DEPTH_TEST];
+      sp->ds->depthWriteEnable = e[WRAPPER_EDS_DEPTH_WRITE];
+      sp->ds->depthCompareOp = e[WRAPPER_EDS_DEPTH_COMPARE];
+      sp->ds->depthBoundsTestEnable = e[WRAPPER_EDS_DEPTH_BOUNDS];
+      sp->ds->stencilTestEnable = e[WRAPPER_EDS_STENCIL_TEST];
+      sp->ds->front.failOp = e[WRAPPER_EDS_FRONT_FAIL];
+      sp->ds->front.passOp = e[WRAPPER_EDS_FRONT_PASS];
+      sp->ds->front.depthFailOp = e[WRAPPER_EDS_FRONT_DEPTH_FAIL];
+      sp->ds->front.compareOp = e[WRAPPER_EDS_FRONT_COMPARE];
+      sp->ds->back.failOp = e[WRAPPER_EDS_BACK_FAIL];
+      sp->ds->back.passOp = e[WRAPPER_EDS_BACK_PASS];
+      sp->ds->back.depthFailOp = e[WRAPPER_EDS_BACK_DEPTH_FAIL];
+      sp->ds->back.compareOp = e[WRAPPER_EDS_BACK_COMPARE];
+   }
+   if (sp->vp && (sp->eds_dynamic & BITFIELD_BIT(WRAPPER_EDS_VIEWPORTS))) {
+      sp->vp->viewportCount = e[WRAPPER_EDS_VIEWPORTS];
+      sp->vp->pViewports = NULL;
+   }
+   if (sp->vp && (sp->eds_dynamic & BITFIELD_BIT(WRAPPER_EDS_SCISSORS))) {
+      sp->vp->scissorCount = e[WRAPPER_EDS_SCISSORS];
+      sp->vp->pScissors = NULL;
+   }
 }
 
 static void
@@ -297,14 +475,13 @@ free_record(struct wrapper_device *device, struct wrapper_stride_pipeline *sp)
 
 static VkPipeline
 create_variant(struct wrapper_device *device, struct wrapper_stride_pipeline *sp,
-               const uint32_t *strides)
+               const struct wrapper_variant_key *key)
 {
    for (uint32_t i = 0; i < sp->variant_count; i++)
-      if (!memcmp(sp->variants[i].strides, strides, sizeof(sp->variants[i].strides)))
+      if (!memcmp(&sp->variants[i].key, key, sizeof(*key)))
          return sp->variants[i].pipeline;
 
-   for (uint32_t b = 0; b < sp->vi.vertexBindingDescriptionCount; b++)
-      sp->bindings[b].stride = strides[sp->bindings[b].binding % WRAPPER_STRIDE_MAX_BINDINGS];
+   apply_key(sp, key);
 
    VkPipeline pipeline = VK_NULL_HANDLE;
    if (device->dispatch_table.CreateGraphicsPipelines(device->dispatch_handle, sp->cache, 1,
@@ -320,7 +497,7 @@ create_variant(struct wrapper_device *device, struct wrapper_stride_pipeline *sp
       sp->variants = v;
       sp->variant_capacity = cap;
    }
-   memcpy(sp->variants[sp->variant_count].strides, strides, sizeof(sp->variants[0].strides));
+   sp->variants[sp->variant_count].key = *key;
    sp->variants[sp->variant_count++].pipeline = pipeline;
    return pipeline;
 }
@@ -335,6 +512,8 @@ wrapper_stride_create(struct wrapper_device *device, VkPipelineCache cache,
       return VK_ERROR_OUT_OF_HOST_MEMORY;
    sp->mem = ralloc_context(NULL);
    sp->cache = cache;
+   sp->stride_dynamic = device->emulate_dynamic_stride && has_dynamic_stride(info->pDynamicState);
+   sp->eds_dynamic = eds_dynamic_mask(device, info->pDynamicState);
    simple_mtx_init(&sp->mtx, mtx_plain);
 
    if (!copy_create_info(device, sp, info)) {
@@ -343,11 +522,10 @@ wrapper_stride_create(struct wrapper_device *device, VkPipelineCache cache,
                                                             info, alloc, pipeline);
    }
 
-   uint32_t strides[WRAPPER_STRIDE_MAX_BINDINGS] = { 0 };
-   for (uint32_t b = 0; b < sp->vi.vertexBindingDescriptionCount; b++)
-      strides[sp->bindings[b].binding % WRAPPER_STRIDE_MAX_BINDINGS] = sp->bindings[b].stride;
-
-   *pipeline = create_variant(device, sp, strides);
+   struct wrapper_variant_key key;
+   base_key(sp, &key);
+   *pipeline = create_variant(device, sp, &key);
+   sp->cache = VK_NULL_HANDLE;
    if (*pipeline == VK_NULL_HANDLE) {
       free_record(device, sp);
       return VK_ERROR_UNKNOWN;
@@ -406,14 +584,18 @@ wrapper_stride_flush(struct wrapper_command_buffer *wcb)
    if (!sp)
       return;
 
-   uint32_t strides[WRAPPER_STRIDE_MAX_BINDINGS] = { 0 };
    simple_mtx_lock(&sp->mtx);
-   for (uint32_t b = 0; b < sp->vi.vertexBindingDescriptionCount; b++) {
-      uint32_t n = sp->bindings[b].binding % WRAPPER_STRIDE_MAX_BINDINGS;
-      strides[n] = (wcb->vertex_strides_valid & (1u << n)) ? wcb->vertex_strides[n]
-                                                           : sp->variants[0].strides[n];
+   struct wrapper_variant_key key = sp->variants[0].key;
+   if (sp->stride_dynamic) {
+      for (uint32_t b = 0; b < sp->vi.vertexBindingDescriptionCount; b++) {
+         uint32_t n = sp->bindings[b].binding % WRAPPER_STRIDE_MAX_BINDINGS;
+         if (wcb->vertex_strides_valid & (1u << n))
+            key.strides[n] = wcb->vertex_strides[n];
+      }
    }
-   VkPipeline pipeline = create_variant(wcb->device, sp, strides);
+   u_foreach_bit(f, sp->eds_dynamic & wcb->eds_valid)
+      key.eds[f] = wcb->eds[f];
+   VkPipeline pipeline = create_variant(wcb->device, sp, &key);
    simple_mtx_unlock(&sp->mtx);
 
    if (pipeline != VK_NULL_HANDLE && pipeline != wcb->stride_bound) {
@@ -429,6 +611,15 @@ wrapper_stride_reset(struct wrapper_command_buffer *wcb)
    wcb->stride_pipeline = NULL;
    wcb->stride_bound = VK_NULL_HANDLE;
    wcb->vertex_strides_valid = 0;
+   wcb->eds_valid = 0;
+}
+
+void
+wrapper_eds_set(struct wrapper_command_buffer *wcb, enum wrapper_eds_field field,
+                uint32_t value)
+{
+   wcb->eds[field] = value;
+   wcb->eds_valid |= BITFIELD_BIT(field);
 }
 
 void

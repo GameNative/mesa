@@ -2,6 +2,7 @@
 #include <fcntl.h>
 
 #include "wrapper_private.h"
+#include "wrapper_bcdec.h"
 #include "wrapper_log.h"
 #include "wrapper_entrypoints.h"
 #include "wrapper_trampolines.h"
@@ -209,6 +210,46 @@ wrapper_setup_coherent_memory_types(struct wrapper_physical_device *pdevice)
    }
 }
 
+/* Auto mode: a BC format the base driver can sample and copy into in optimal
+ * tiling is used natively even without textureCompressionBC (PowerVR exposes
+ * BC1-BC5 that way); the rest are emulated, on every driver alike. */
+static void
+wrapper_probe_native_bcn(struct wrapper_physical_device *pdevice)
+{
+   const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+      VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
+      VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+   char native[160] = "", emulated[160] = "", features[400] = "";
+
+   pdevice->native_bcn_mask = 0;
+   bcn_set_vendor(pdevice->properties2.properties.vendorID);
+   for (VkFormat f = VK_FORMAT_BC1_RGB_UNORM_BLOCK; f <= VK_FORMAT_BC7_SRGB_BLOCK; f++) {
+      uint32_t bit = 1u << (f - VK_FORMAT_BC1_RGB_UNORM_BLOCK);
+      VkFormatProperties props = { 0 };
+      VkImageFormatProperties ifp;
+      pdevice->dispatch_table.GetPhysicalDeviceFormatProperties(
+         pdevice->dispatch_handle, f, &props);
+      bool ok = (props.optimalTilingFeatures & need) == need &&
+         pdevice->dispatch_table.GetPhysicalDeviceImageFormatProperties(
+            pdevice->dispatch_handle, f, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
+            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, 0,
+            &ifp) == VK_SUCCESS;
+      if (ok)
+         pdevice->native_bcn_mask |= bit;
+      char *list = ok ? native : emulated;
+      size_t len = strlen(list);
+      snprintf(list + len, sizeof(native) - len, "%s%d", len ? "," : "", f);
+      len = strlen(features);
+      snprintf(features + len, sizeof(features) - len, "%s%d=0x%x", len ? " " : "", f,
+               props.optimalTilingFeatures);
+   }
+
+   WRAPPER_LOG(info, "BCn auto: native formats [%s], emulated [%s]", native, emulated);
+   wrapper_diag_append("[BCN] auto: native formats [%s], emulated [%s]\n",
+                       native, emulated);
+   wrapper_diag_append("[BCN] optimal tiling features: %s\n", features);
+}
+
 VkResult enumerate_physical_device(struct vk_instance *_instance)
 {
    struct wrapper_instance *instance = (struct wrapper_instance *)_instance;
@@ -368,15 +409,18 @@ VkResult enumerate_physical_device(struct vk_instance *_instance)
        * substantial lowering. Keep it opt-in and select it from the actual API
        * gap, not from a vendor ID. */
       pdevice->emulate_vulkan13 =
-         getenv("WRAPPER_EMULATE_VULKAN_1_3") &&
-         atoi(getenv("WRAPPER_EMULATE_VULKAN_1_3")) &&
-         pdevice->properties2.properties.apiVersion < VK_API_VERSION_1_3;
+         wrapper_core13_wanted(pdevice, instance->vk.app_info.engine_name);
       if (pdevice->emulate_vulkan13)
-         WRAPPER_LOG(info, "Lowering Vulkan 1.3 core calls for a %u.%u base driver "
-                           "(WRAPPER_EMULATE_VULKAN_1_3)",
-                     VK_API_VERSION_MAJOR(pdevice->properties2.properties.apiVersion),
-                     VK_API_VERSION_MINOR(pdevice->properties2.properties.apiVersion));
-         
+         wrapper_core13_init_physical_device(pdevice);
+      pdevice->fold_sets = pdevice->emulate_vulkan13 &&
+         instance->vk.app_info.engine_name &&
+         strstr(instance->vk.app_info.engine_name, "vkd3d") &&
+         pdevice->properties2.properties.limits.maxBoundDescriptorSets < 8 &&
+         debug_get_bool_option("WRAPPER_FOLD_DESCRIPTOR_SETS", true);
+      if (pdevice->fold_sets)
+         WRAPPER_LOG(info, "Reporting 8 descriptor sets (driver has %u); bindless sets are folded",
+                     pdevice->properties2.properties.limits.maxBoundDescriptorSets);
+
       pdevice->dispatch_table.GetPhysicalDeviceMemoryProperties(
          pdevice->dispatch_handle, &pdevice->memory_properties);
       wrapper_setup_coherent_memory_types(pdevice);
@@ -406,7 +450,7 @@ VkResult enumerate_physical_device(struct vk_instance *_instance)
 
       if (!pdevice->base_supported_features.hostQueryReset &&
           debug_get_bool_option("WRAPPER_EMULATE_HOST_QUERY_RESET",
-                                nvidia_proprietary)) {
+                                nvidia_proprietary || pdevice->emulate_vulkan13)) {
          WRAPPER_LOG(info, "Emulating VK_EXT_host_query_reset "
                            "(base driver lacks it; resets go through a command buffer)");
          pdevice->vk.supported_extensions.EXT_host_query_reset = true;
@@ -468,6 +512,10 @@ VkResult enumerate_physical_device(struct vk_instance *_instance)
             !pdevice->base_supported_features.vertexAttributeInstanceRateZeroDivisor;
          pdevice->vk.supported_extensions.EXT_vertex_attribute_divisor = true;
          pdevice->vk.supported_extensions.KHR_vertex_attribute_divisor = true;
+         if (pdevice->emulate_vertex_divisor) {
+            supported_features->vertexAttributeInstanceRateDivisor = true;
+            supported_features->vertexAttributeInstanceRateZeroDivisor = true;
+         }
          WRAPPER_LOG(info, "Disabling VK_EXT_calibrated_timestamps");
          pdevice->vk.supported_extensions.EXT_calibrated_timestamps = false;
          if (!is_d3d) {
@@ -530,6 +578,15 @@ VkResult enumerate_physical_device(struct vk_instance *_instance)
          }
       }
 
+      if (strstr(engine_name, "vkd3d") && pdevice->emulate_vulkan13 &&
+          !pdevice->base_supported_features.shaderInt64 &&
+          debug_get_bool_option("WRAPPER_FAKE_SHADER_INT64", false)) {
+         WRAPPER_LOG(info, "Faking shaderInt64 for vkd3d; 64-bit widening before a float "
+                     "conversion is lowered, other 64-bit integer shaders are refused");
+         supported_features->shaderInt64 = true;
+         pdevice->lower_int64 = true;
+      }
+
       /* VK_KHR_push_descriptor: vkd3d/DXVK effectively require it, but some
        * drivers (e.g. Mali r44) don't expose it. Advertise + emulate it for D3D
        * clients whose base driver lacks it. maxPushDescriptors is reported in
@@ -569,6 +626,8 @@ VkResult enumerate_physical_device(struct vk_instance *_instance)
       }
 
       pdevice->emulate_bcn = wrapper_emulate_bcn;
+      if (wrapper_emulate_bcn == 3)
+         wrapper_probe_native_bcn(pdevice);
 
       if (wrapper_dmaheap_cached == -1)
          wrapper_dmaheap_cached = getenv("WRAPPER_DMAHEAP_CACHED") && atoi(getenv("WRAPPER_DMAHEAP_CACHED"));
@@ -727,6 +786,8 @@ wrapper_GetPhysicalDeviceProperties(VkPhysicalDevice physicalDevice,
 
    if (api_version > 0)
       pProperties->apiVersion = api_version;
+   if (pdevice->fold_sets)
+      pProperties->limits.maxBoundDescriptorSets = 8;
 
    /* See wrapper_GetPhysicalDeviceProperties2: bump push constant size to the
     * DXVK-required minimum on Xclipse. */
@@ -758,6 +819,23 @@ wrapper_GetPhysicalDeviceProperties(VkPhysicalDevice physicalDevice,
    if ((p)->maxDescriptorSetUpdateAfterBindSampledImages < _t)     (p)->maxDescriptorSetUpdateAfterBindSampledImages = _t; \
    if ((p)->maxDescriptorSetUpdateAfterBindStorageImages < _t)     (p)->maxDescriptorSetUpdateAfterBindStorageImages = _t; \
 } while (0)
+
+static void
+wrapper_keep_real_ubo_limits(struct wrapper_physical_device *pdevice,
+                             uint32_t *per_stage, uint32_t *per_set)
+{
+   static bool logged;
+   if (!pdevice->fold_sets)
+      return;
+   *per_stage = pdevice->vk.properties.maxPerStageDescriptorUpdateAfterBindUniformBuffers;
+   *per_set = pdevice->vk.properties.maxDescriptorSetUpdateAfterBindUniformBuffers;
+   if (!logged) {
+      logged = true;
+      WRAPPER_LOG(info, "Reporting the driver's update-after-bind uniform buffer limits "
+                  "(%u per stage, %u per set) so heap CBVs go to storage buffers",
+                  *per_stage, *per_set);
+   }
+}
 
 VKAPI_ATTR void VKAPI_CALL
 wrapper_GetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice,
@@ -794,6 +872,8 @@ wrapper_GetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice,
 
    if (api_version > 0)
       pProperties->properties.apiVersion = api_version;
+   if (pdevice->fold_sets)
+      pProperties->properties.limits.maxBoundDescriptorSets = 8;
 
    /* DXVK 2.6+ requires maxPushConstantsSize >= 256 (its unified "push data"
     * model) and skips the adapter otherwise. Xclipse reports less; the RDNA
@@ -803,6 +883,9 @@ wrapper_GetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice,
     * vkCreatePipelineLayout this will surface as pipeline-creation failures. */
    if (pdevice->raises_push_constant_limit)
       pProperties->properties.limits.maxPushConstantsSize = 256;
+
+   if (pdevice->emulate_vulkan13)
+      wrapper_core13_fill_properties(pdevice, pProperties);
 
    vk_foreach_struct(prop, pProperties->pNext) {
       switch (prop->sType) {
@@ -920,15 +1003,24 @@ wrapper_GetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice,
          strcpy(vk12_prop->driverName, "Wrapper driver");
 
          /* Vulkan12Properties folds in the descriptor-indexing limits. */
-         if (is_d3d)
+         if (is_d3d) {
             BUMP_UAB(vk12_prop, WRAPPER_D3D_BINDLESS_LIMIT);
+            wrapper_keep_real_ubo_limits(pdevice,
+               &vk12_prop->maxPerStageDescriptorUpdateAfterBindUniformBuffers,
+               &vk12_prop->maxDescriptorSetUpdateAfterBindUniformBuffers);
+         }
          break;
       }
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_PROPERTIES:
       {
-         if (is_d3d)
-            BUMP_UAB((VkPhysicalDeviceDescriptorIndexingProperties *)prop,
-                     WRAPPER_D3D_BINDLESS_LIMIT);
+         if (is_d3d) {
+            VkPhysicalDeviceDescriptorIndexingProperties *di =
+               (VkPhysicalDeviceDescriptorIndexingProperties *)prop;
+            BUMP_UAB(di, WRAPPER_D3D_BINDLESS_LIMIT);
+            wrapper_keep_real_ubo_limits(pdevice,
+               &di->maxPerStageDescriptorUpdateAfterBindUniformBuffers,
+               &di->maxDescriptorSetUpdateAfterBindUniformBuffers);
+         }
          break;
       }
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES:
@@ -994,12 +1086,14 @@ wrapper_GetPhysicalDeviceImageFormatProperties(VkPhysicalDevice physicalDevice,
    case VK_FORMAT_BC6H_SFLOAT_BLOCK:
    case VK_FORMAT_BC7_UNORM_BLOCK:
    case VK_FORMAT_BC7_SRGB_BLOCK:
-      if (pdevice->driver_properties.driverID == VK_DRIVER_ID_SAMSUNG_PROPRIETARY &&
-          format <= 138 && pdevice->emulate_bcn == 3)
+      if (bcn_is_native(pdevice, format))
          break;
              
       if (pdevice->emulate_bcn < 1)
          break;
+
+      if (pdevice->emulate_bcn > 1 && tiling != VK_IMAGE_TILING_OPTIMAL)
+         return VK_ERROR_FORMAT_NOT_SUPPORTED;
       
       if (type & VK_IMAGE_TYPE_1D) {
          pImageFormatProperties->maxExtent.width = pdevice->properties2.properties.limits.maxImageDimension1D;
@@ -1073,12 +1167,14 @@ wrapper_GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice physicalDevice,
    case VK_FORMAT_BC6H_SFLOAT_BLOCK:
    case VK_FORMAT_BC7_UNORM_BLOCK:
    case VK_FORMAT_BC7_SRGB_BLOCK:
-      if (pdevice->driver_properties.driverID == VK_DRIVER_ID_SAMSUNG_PROPRIETARY &&
-          pImageFormatInfo->format <= 138 && pdevice->emulate_bcn == 3)
+      if (bcn_is_native(pdevice, pImageFormatInfo->format))
          break;
          
       if (pdevice->emulate_bcn < 1)
          break;
+
+      if (pdevice->emulate_bcn > 1 && pImageFormatInfo->tiling != VK_IMAGE_TILING_OPTIMAL)
+         return VK_ERROR_FORMAT_NOT_SUPPORTED;
       
       if (pImageFormatInfo->type & VK_IMAGE_TYPE_1D) {
          pImageFormatProperties->imageFormatProperties.maxExtent.width = pdevice->properties2.properties.limits.maxImageDimension1D;
@@ -1154,11 +1250,11 @@ wrapper_GetPhysicalDeviceFormatProperties(VkPhysicalDevice physicalDevice,
    case VK_FORMAT_BC6H_SFLOAT_BLOCK:
    case VK_FORMAT_BC7_UNORM_BLOCK:
    case VK_FORMAT_BC7_SRGB_BLOCK:
-      if (pdevice->driver_properties.driverID == VK_DRIVER_ID_SAMSUNG_PROPRIETARY &&
-          format <= 138 && pdevice->emulate_bcn == 3)
+      if (bcn_is_native(pdevice, format))
          break;
          
       if (pdevice->emulate_bcn > 0) {
+         memset(pFormatProperties, 0, sizeof(*pFormatProperties));
          pFormatProperties->optimalTilingFeatures |= VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
          wrapper_diag_bcn_answer(2, "FormatProperties", format);
          return;
@@ -1181,6 +1277,9 @@ wrapper_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice,
 
    pdevice->dispatch_table.GetPhysicalDeviceFormatProperties2(pdevice->dispatch_handle,
       format, pFormatProperties);
+   if (pdevice->properties2.properties.apiVersion < VK_API_VERSION_1_3 &&
+       !pdevice->base_supported_extensions.KHR_format_feature_flags2)
+      wrapper_format_properties3_from_legacy(pdevice, format, pFormatProperties);
 
    switch (format) {
    case VK_FORMAT_BC1_RGB_UNORM_BLOCK:
@@ -1199,8 +1298,7 @@ wrapper_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice,
    case VK_FORMAT_BC6H_SFLOAT_BLOCK:
    case VK_FORMAT_BC7_UNORM_BLOCK:
    case VK_FORMAT_BC7_SRGB_BLOCK:
-      if (pdevice->driver_properties.driverID == VK_DRIVER_ID_SAMSUNG_PROPRIETARY &&
-          format <= 138 && pdevice->emulate_bcn == 3)
+      if (bcn_is_native(pdevice, format))
          break;
 
       if (pdevice->emulate_bcn > 0) {
