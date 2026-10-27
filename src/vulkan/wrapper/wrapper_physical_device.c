@@ -88,6 +88,30 @@ get_driver_version(const uint32_t driverVersion)
 	return driver_version;
 }
 
+/* DXVK 2.5+ uploads textures on a family without graphics when one exists;
+ * Xclipse 960 loses those uploads. Keep DXVK on the graphics queue. */
+static void
+wrapper_hide_compute_queue_families(struct wrapper_physical_device *pdevice)
+{
+   uint32_t count = 0;
+   pdevice->dispatch_table.GetPhysicalDeviceQueueFamilyProperties(
+      pdevice->dispatch_handle, &count, NULL);
+   VkQueueFamilyProperties *families = calloc(count, sizeof(*families));
+   if (!families)
+      return;
+   pdevice->dispatch_table.GetPhysicalDeviceQueueFamilyProperties(
+      pdevice->dispatch_handle, &count, families);
+   uint32_t visible = count;
+   while (visible && !(families[visible - 1].queueFlags & VK_QUEUE_GRAPHICS_BIT))
+      visible--;
+   free(families);
+   if (!visible || visible == count)
+      return;
+   WRAPPER_LOG(info, "Reporting %u of %u queue families: DXVK uploads on the graphics queue",
+               visible, count);
+   pdevice->queue_family_count = visible;
+}
+
 static VkResult
 wrapper_setup_device_extensions(struct wrapper_physical_device *pdevice) {
    struct vk_device_extension_table *exts = &pdevice->vk.supported_extensions;
@@ -461,6 +485,10 @@ VkResult enumerate_physical_device(struct vk_instance *_instance)
          }
       }
 
+      if (strstr(engine_name, "DXVK") &&
+          debug_get_bool_option("WRAPPER_GRAPHICS_QUEUE_FAMILY_ONLY", true))
+         wrapper_hide_compute_queue_families(pdevice);
+
       /* DXVK > 2.4.1 requires VK_KHR_maintenance5. Some drivers (e.g. Xclipse)
        * don't expose it. Emulate it for any D3D client whose base driver lacks
        * it (NOT Samsung-gated -- the base-lacks guard limits it to drivers that
@@ -570,6 +598,36 @@ wrapper_EnumerateDeviceExtensionProperties(VkPhysicalDevice physicalDevice,
                                                        pLayerName,
                                                        pPropertyCount,
                                                        pProperties);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wrapper_GetPhysicalDeviceQueueFamilyProperties(VkPhysicalDevice physicalDevice,
+                                               uint32_t *pQueueFamilyPropertyCount,
+                                               VkQueueFamilyProperties *pQueueFamilyProperties)
+{
+   VK_FROM_HANDLE(wrapper_physical_device, pdevice, physicalDevice);
+   uint32_t limit = pdevice->queue_family_count;
+   if (limit && pQueueFamilyProperties && *pQueueFamilyPropertyCount > limit)
+      *pQueueFamilyPropertyCount = limit;
+   pdevice->dispatch_table.GetPhysicalDeviceQueueFamilyProperties(
+      pdevice->dispatch_handle, pQueueFamilyPropertyCount, pQueueFamilyProperties);
+   if (limit && *pQueueFamilyPropertyCount > limit)
+      *pQueueFamilyPropertyCount = limit;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wrapper_GetPhysicalDeviceQueueFamilyProperties2(VkPhysicalDevice physicalDevice,
+                                                uint32_t *pQueueFamilyPropertyCount,
+                                                VkQueueFamilyProperties2 *pQueueFamilyProperties)
+{
+   VK_FROM_HANDLE(wrapper_physical_device, pdevice, physicalDevice);
+   uint32_t limit = pdevice->queue_family_count;
+   if (limit && pQueueFamilyProperties && *pQueueFamilyPropertyCount > limit)
+      *pQueueFamilyPropertyCount = limit;
+   pdevice->dispatch_table.GetPhysicalDeviceQueueFamilyProperties2(
+      pdevice->dispatch_handle, pQueueFamilyPropertyCount, pQueueFamilyProperties);
+   if (limit && *pQueueFamilyPropertyCount > limit)
+      *pQueueFamilyPropertyCount = limit;
 }
 
 VKAPI_ATTR void VKAPI_CALL
