@@ -93,6 +93,10 @@ wrapper_bcn_bc7_mse(const uint8_t blk[16], const uint8_t rgba[64]);
 int
 wrapper_bcn_astc4_direct(VkFormat format, const uint8_t *blk, uint8_t out[16]);
 
+void
+wrapper_bcn_decode_for_astc(const void *blocks, int w, int h, int block_x_src, VkFormat format,
+                            void *out);
+
 int
 wrapper_bcn_astc_encode_cpu(const void *blocks, int w, int h, VkFormat format, uint8_t *out,
                             size_t len, unsigned threads, float quality);

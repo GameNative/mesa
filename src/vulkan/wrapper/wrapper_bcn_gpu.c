@@ -467,9 +467,7 @@ bcn_create_pipeline_specs(struct wrapper_device *device, const uint32_t *code, s
    return r;
 }
 
-/* the pipeline cache the worker builds into: the device's, or with no saved
- * data a fresh one per build, merged into the device's when the build works,
- * so that a build the driver rejects leaves nothing in the cache saved */
+/* the pipeline cache the worker builds into */
 static __thread VkPipelineCache bcn_build_cache;
 
 static VkResult
@@ -554,6 +552,9 @@ bcn_build_slot(struct wrapper_device *device, int slot, VkPipeline *out)
    }
 }
 
+static void
+bcn_split_mask_add(struct wrapper_device *device, uint32_t slots, uint32_t decode_bad);
+
 /* Drivers that reject the full decoder or the ASTC 4x4 encoder (the PowerVR
  * 24.3 compiler returns VK_ERROR_UNKNOWN for both) get smaller variants: one
  * decoder per format, and the 4x4 encoder without the direct BC2/BC3/BC5 step.
@@ -569,14 +570,23 @@ bcn_build_split(struct wrapper_device *device, int slot, VkPipeline *out)
    }
    if (slot != BCN_SLOT_DECODE)
       return VK_ERROR_UNKNOWN;
-   uint32_t built = 0;
+   uint32_t built = 0, failed = 0;
+   uint32_t skip = __atomic_load_n(&device->bcn_split_decode_bad, __ATOMIC_RELAXED);
    for (uint32_t f = 0; f < ARRAY_SIZE(device->bcn_decode_fmt); f++) {
+      if ((skip >> f) & 1u)
+         continue;
       VkResult r = bcn_create_pipeline_specs(device, wrapper_bcn_decode_spv,
          sizeof(wrapper_bcn_decode_spv), &device->bcn_split_modules[0],
          &device->bcn_decode_fmt[f], bcn_build_cache, &f, 1);
       built |= (r == VK_SUCCESS) << f;
+      failed |= (r != VK_SUCCESS) << f;
    }
-   wrapper_diag_append("[BCN] GPU shader decode per format: built mask 0x%03x\n", built);
+   if (failed) {
+      device->bcn_cache_tainted = true;
+      bcn_split_mask_add(device, 0, failed);
+   }
+   wrapper_diag_append("[BCN] GPU shader decode per format: built mask 0x%03x, known to fail 0x%03x\n",
+                       built, skip);
    device->bcn_decode_split = true;
    *out = device->bcn_decode_fmt[0];
    device->bcn_decode_fmt[0] = VK_NULL_HANDLE;
@@ -634,36 +644,42 @@ bcn_cache_save(struct wrapper_device *device)
    pthread_mutex_unlock(&bcn_save_lock);
 }
 
-/* Slots whose full shader the driver rejected once: later launches build
- * their split variants at once. Kept next to the pipeline cache. */
-static uint32_t
+/* Shaders the driver rejected once, kept next to the pipeline cache: the
+ * slots whose full shader failed (their split variants are built at once)
+ * and the per-format decoders that failed (not built again). A launch
+ * without a rejected build saves the pipeline cache. */
+static void
 bcn_split_mask_read(struct wrapper_device *device)
 {
    char path[272];
    bcn_cache_path(device, path, sizeof(path) - 6);
    strcat(path, ".split");
-   uint32_t mask = 0;
+   uint32_t mask[2] = { 0, 0 };
    FILE *f = fopen(path, "rb");
    if (f) {
-      if (fread(&mask, sizeof(mask), 1, f) != 1)
-         mask = 0;
+      if (fread(mask, sizeof(uint32_t), 2, f) < 1)
+         mask[0] = 0;
       fclose(f);
    }
-   return mask;
+   device->bcn_split_slots = mask[0];
+   device->bcn_split_decode_bad = mask[1];
 }
 
 static void
-bcn_split_mask_add(struct wrapper_device *device, int slot)
+bcn_split_mask_add(struct wrapper_device *device, uint32_t slots, uint32_t decode_bad)
 {
    char path[272];
    bcn_cache_path(device, path, sizeof(path) - 6);
    strcat(path, ".split");
    pthread_mutex_lock(&bcn_save_lock);
-   uint32_t mask = __atomic_or_fetch(&device->bcn_split_slots, 1u << slot, __ATOMIC_RELAXED);
+   uint32_t mask[2] = {
+      __atomic_or_fetch(&device->bcn_split_slots, slots, __ATOMIC_RELAXED),
+      __atomic_or_fetch(&device->bcn_split_decode_bad, decode_bad, __ATOMIC_RELAXED),
+   };
    mkdir(BCN_CACHE_DIR, 0755);
    FILE *f = fopen(path, "wb");
    if (f) {
-      fwrite(&mask, sizeof(mask), 1, f);
+      fwrite(mask, sizeof(uint32_t), 2, f);
       fclose(f);
    }
    pthread_mutex_unlock(&bcn_save_lock);
@@ -696,13 +712,7 @@ bcn_tools_worker(void *arg)
       struct timespec t0, t1;
       clock_gettime(CLOCK_MONOTONIC, &t0);
       VkPipeline p = VK_NULL_HANDLE;
-      VkPipelineCache temp = VK_NULL_HANDLE;
-      VkPipelineCacheCreateInfo pcci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO };
       bcn_build_cache = device->bcn_pipeline_cache;
-      if (bcn_build_cache && !device->bcn_cache_warm &&
-          device->dispatch_table.CreatePipelineCache(device->dispatch_handle, &pcci, NULL,
-                                                     &temp) == VK_SUCCESS)
-         bcn_build_cache = temp;
       bool known_split = (__atomic_load_n(&device->bcn_split_slots, __ATOMIC_RELAXED) >> slot) & 1u;
       VkResult r = VK_ERROR_UNKNOWN;
       if (known_split && slot == BCN_SLOT_ASTC4)
@@ -711,35 +721,17 @@ bcn_tools_worker(void *arg)
          r = bcn_build_slot(device, slot, &p);
       if (r != VK_SUCCESS) {
          VkResult first = r;
-         if (temp) {
-            device->dispatch_table.DestroyPipelineCache(device->dispatch_handle, temp, NULL);
-            temp = VK_NULL_HANDLE;
-            if (device->dispatch_table.CreatePipelineCache(device->dispatch_handle, &pcci, NULL,
-                                                           &temp) == VK_SUCCESS)
-               bcn_build_cache = temp;
-            else
-               bcn_build_cache = VK_NULL_HANDLE;
-         } else if (!known_split) {
+         if (!known_split)
             device->bcn_cache_tainted = true;
-         }
          r = bcn_build_split(device, slot, &p);
-         if (r != VK_SUCCESS && bcn_build_cache && bcn_build_cache == device->bcn_pipeline_cache)
+         if (r != VK_SUCCESS)
             device->bcn_cache_tainted = true;
-         if (!known_split && r == VK_SUCCESS)
-            bcn_split_mask_add(device, slot);
+         else if (!known_split)
+            bcn_split_mask_add(device, 1u << slot, 0);
          if (slot == BCN_SLOT_DECODE || slot == BCN_SLOT_ASTC4)
             wrapper_diag_append("[BCN] GPU shader %s %s (VkResult %d), split variant VkResult %d\n",
                                 bcn_slot_names[slot], known_split ? "known to fail" : "failed",
                                 first, r);
-      }
-      if (temp) {
-         if (r == VK_SUCCESS) {
-            pthread_mutex_lock(&bcn_save_lock);
-            device->dispatch_table.MergePipelineCaches(device->dispatch_handle,
-                                                       device->bcn_pipeline_cache, 1, &temp);
-            pthread_mutex_unlock(&bcn_save_lock);
-         }
-         device->dispatch_table.DestroyPipelineCache(device->dispatch_handle, temp, NULL);
       }
       bcn_build_cache = VK_NULL_HANDLE;
       clock_gettime(CLOCK_MONOTONIC, &t1);
@@ -869,7 +861,7 @@ bcn_tools_start(struct wrapper_device *device)
          fclose(f);
       }
       device->bcn_cache_warm = data != NULL;
-      device->bcn_split_slots = bcn_split_mask_read(device);
+      bcn_split_mask_read(device);
       VkPipelineCacheCreateInfo pcci = {
          .sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,
          .initialDataSize = data ? (size_t)len : 0,
@@ -2047,9 +2039,13 @@ bcn_gpu_upload_region(struct wrapper_command_buffer *wcb, struct wrapper_image *
                         astc ? bcn_pipe(device, astc == 4 ? BCN_SLOT_ASTC4 :
                                         astc == 6 ? BCN_SLOT_ASTC6 : BCN_SLOT_ASTC8, wait) :
                         VK_NULL_HANDLE;
-   if (!decoder || (astc && !encoder))
-      return false;
    bool merge = astc && wrapper_bcn_gpu_misaligned(wi, c);
+   /* BC6H with no GPU decoder (a driver that rejects that variant): the
+    * blocks are decoded on the CPU and the GPU encodes them */
+   bool cpu_decode = !decoder && hdr && encoder && !merge && wb && !wb->device_only &&
+                     bcn_layers(wi, &c->imageSubresource) == 1;
+   if ((!decoder && !cpu_decode) || (astc && !encoder))
+      return false;
    /* the rectangle written: the region, or the ASTC blocks covering it */
    uint32_t x0 = c->imageOffset.x, y0 = c->imageOffset.y, ew = w, eh = h;
    if (merge) {
@@ -2088,8 +2084,35 @@ bcn_gpu_upload_region(struct wrapper_command_buffer *wcb, struct wrapper_image *
          return false;
    }
 
+   if (cpu_decode) {
+      void *map = NULL;
+      VkDeviceSize len = (VkDeviceSize)w * h * 8;
+      struct wrapper_buffer *host = bcn_transient_host_buffer(wcb, len, &map);
+      if (!host)
+         return false;
+      simple_mtx_lock(&device->resource_mutex);
+      if (!wb->is_mapped) {
+         if (device->dispatch_table.MapMemory(device->dispatch_handle, wb->memory, wb->offset,
+                                              wb->size, 0, &wb->mapped_address) != VK_SUCCESS) {
+            simple_mtx_unlock(&device->resource_mutex);
+            return false;
+         }
+         wb->is_mapped = 1;
+      }
+      if (c->bufferOffset + src_row * (nby - 1) + tight > wb->size) {
+         simple_mtx_unlock(&device->resource_mutex);
+         return false;
+      }
+      wrapper_bcn_decode_for_astc((const uint8_t *)wb->mapped_address + c->bufferOffset, w, h,
+                                  (row_len + 3) / 4, format, map);
+      simple_mtx_unlock(&device->resource_mutex);
+      bcn_barrier(wcb);
+      VkBufferCopy bc = { 0, 0, len };
+      device->dispatch_table.CmdCopyBuffer(wcb->dispatch_handle, host->dispatch_handle,
+                                           texels->dispatch_handle, 1, &bc);
+   }
    bcn_barrier(wcb);
-   for (uint32_t l = 0; l < layers; l++) {
+   for (uint32_t l = 0; l < layers && !cpu_decode; l++) {
       if (src_row == tight) {
          VkBufferCopy bc = { c->bufferOffset + l * src_slice, (VkDeviceSize)l * tight * nby,
                              tight * nby };
@@ -2117,7 +2140,8 @@ bcn_gpu_upload_region(struct wrapper_command_buffer *wcb, struct wrapper_image *
       .format = (uint32_t)id,
       .flags = (astc && !hdr) ? 1 : packed ? 2 : 0,
    };
-   bcn_dispatch(wcb, decoder, &pc, layers);
+   if (!cpu_decode)
+      bcn_dispatch(wcb, decoder, &pc, layers);
 
    VkBufferImageCopy copy = {
       .bufferRowLength = nbx * 4,
@@ -2128,7 +2152,8 @@ bcn_gpu_upload_region(struct wrapper_command_buffer *wcb, struct wrapper_image *
    };
    VkBuffer from = texels->dispatch_handle;
    VkDeviceAddress enc_addr = texels_addr;
-   uint32_t enc_row = nbx * 4 * ts, enc_slice = nbx * 4 * nby * 4 * ts;
+   uint32_t enc_row = cpu_decode ? w * 8 : nbx * 4 * ts;
+   uint32_t enc_slice = cpu_decode ? w * h * 8 : nbx * 4 * nby * 4 * ts;
    if (merge) {
       /* unpack the covering blocks, then lay the new texels over them */
       VkImage t = bcn_transient_image(wcb, bcn_unpacked_format(format), ew, eh, layers);
