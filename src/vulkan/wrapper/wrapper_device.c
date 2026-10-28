@@ -1141,6 +1141,26 @@ wrapper_driver_id_str(VkDriverId id)
  * failing game on any device can be diagnosed from the report alone. Pair it
  * with app-side VKD3D_DEBUG=warn / DXVK_LOG_LEVEL=info / WINEDEBUG=+vulkan. */
 static int wrapper_diag_stderr = -1;
+static bool wrapper_diag_capture;
+
+static void
+wrapper_diag_autostart(struct wrapper_physical_device *pdev)
+{
+   const char *app = pdev->instance->vk.app_info.app_name;
+   if (!app || strcmp(app, "Wheel World.exe") ||
+       pdev->driver_properties.driverID != VK_DRIVER_ID_IMAGINATION_PROPRIETARY)
+      return;
+
+   /* This diagnostic package must work without a launcher environment change.
+    * Keep stderr connected to the launcher: component runs may not request the
+    * separate wrapper diagnostic attachment. No rendering options change. */
+   wrapper_diag_capture = true;
+   setenv("WRAPPER_DIAG", "1", 1);
+   fprintf(stderr, "[WRAPPER_DIAG] wheel-world-wrapper-diag-v1: "
+                   "device creation entered; driver=%s\n",
+           pdev->properties2.properties.deviceName);
+   fflush(stderr);
+}
 
 static void
 wrapper_emit_diag(struct wrapper_physical_device *pdev,
@@ -1188,7 +1208,8 @@ wrapper_emit_diag(struct wrapper_physical_device *pdev,
    {
       const char *e = pdev->instance->vk.app_info.engine_name;
       static int redirected = 0;
-      if (!redirected && e && (strstr(e, "DXVK") || strstr(e, "vkd3d"))) {
+      if (!wrapper_diag_capture && !redirected && e &&
+          (strstr(e, "DXVK") || strstr(e, "vkd3d"))) {
          redirected = 1;
          int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
          if (fd >= 0) {
@@ -1202,7 +1223,12 @@ wrapper_emit_diag(struct wrapper_physical_device *pdev,
       }
    }
 
-#define D(...) fprintf(stderr, "[WRAPPER_DIAG] " __VA_ARGS__)
+#define D(...) do { \
+   if (wrapper_diag_capture) \
+      wrapper_diag_append("[WRAPPER_DIAG] " __VA_ARGS__); \
+   else \
+      fprintf(stderr, "[WRAPPER_DIAG] " __VA_ARGS__); \
+} while (0)
 
    const VkPhysicalDeviceProperties *p = &pdev->properties2.properties;
    const char *eng = pdev->instance->vk.app_info.engine_name
@@ -1293,6 +1319,7 @@ wrapper_CreateDevice(VkPhysicalDevice physicalDevice,
                      VkDevice* pDevice)
 {
    VK_FROM_HANDLE(wrapper_physical_device, physical_device, physicalDevice);
+   wrapper_diag_autostart(physical_device);
    const char *wrapper_enable_extensions[VK_DEVICE_EXTENSION_COUNT];
    uint32_t wrapper_enable_extension_count = 0;
    VkDeviceCreateInfo wrapper_create_info = *pCreateInfo;
@@ -1565,6 +1592,10 @@ if (pdf2 && pdf2->features.f) { \
    result = physical_device->dispatch_table.CreateDevice(
       physical_device->dispatch_handle, &wrapper_create_info,
          pAllocator, &device->dispatch_handle);
+   if (wrapper_diag_capture)
+      wrapper_diag_append("[WRAPPER_DIAG] primary vkCreateDevice result=%d "
+                          "featureChain=%d safeCreate=%d\n", result,
+                          wrapper_create_info.pNext != NULL, wrapper_safe_create_device);
    wrapper_core13_free_device_create(core13_storage);
 
    if (result != VK_SUCCESS) {
@@ -1580,6 +1611,8 @@ if (pdf2 && pdf2->features.f) { \
          result = physical_device->dispatch_table.CreateDevice(
             physical_device->dispatch_handle, &wrapper_create_info,
                pAllocator, &device->dispatch_handle);
+         if (wrapper_diag_capture)
+            wrapper_diag_append("[WRAPPER_DIAG] NULL-chain retry result=%d\n", result);
       }
       
       if (result != VK_SUCCESS) {
@@ -5511,8 +5544,8 @@ wrapper_bcn_cpu_copy_regions(struct wrapper_command_buffer *wcb,
          static int tex_diag = -1;
          if (tex_diag == -1)
             tex_diag = getenv("WRAPPER_DIAG") ? atoi(getenv("WRAPPER_DIAG")) : 0;
-         if (tex_diag) {
-            static int tex_n = 0;
+         static int tex_n = 0;
+         if (tex_diag && (!wrapper_diag_capture || tex_n < 128)) {
             struct wrapper_image *twi = get_wrapper_image_from_handle_locked(device, dstImage);
             VkFormat tgt = get_format_for_bcn(format);
             /* Write to stderr, which for a D3D process is redirected into the
@@ -5529,7 +5562,7 @@ wrapper_bcn_cpu_copy_regions(struct wrapper_command_buffer *wcb,
                   twi->info.extent.depth, twi->info.mipLevels, twi->info.tiling,
                   twi->info.usage, twi->info.flags);
             fprintf(stderr, "\n");
-            if (tex_n < 4) {
+            if (tex_n < 4 && !wrapper_diag_capture) {
                unsigned char *src = (unsigned char *)wb->mapped_address + offset;
                unsigned char *out = (unsigned char *)staging_wb->mapped_address;
                int ns = 96, no = (upload_size < 256) ? (int)upload_size : 256;
@@ -5540,6 +5573,8 @@ wrapper_bcn_cpu_copy_regions(struct wrapper_command_buffer *wcb,
                fprintf(stderr, "\n");
             }
             tex_n++;
+            if (wrapper_diag_capture && tex_n == 128)
+               fprintf(stderr, "[WRAPPER_DIAG] CPU texture record limit reached\n");
          }
       }
 
@@ -5617,6 +5652,8 @@ wrapper_bcn_do_copy(struct wrapper_command_buffer *wcb,
 int
 wrapper_diag_on(void)
 {
+   if (wrapper_diag_capture)
+      return 1;
    static int on = -1;
    if (on == -1)
       on = getenv("WRAPPER_DIAG") ? atoi(getenv("WRAPPER_DIAG")) : 0;
@@ -5628,6 +5665,18 @@ wrapper_diag_append(const char *fmt, ...)
 {
    if (!wrapper_diag_on())
       return;
+   /* Bound high-volume resource records, retaining capability/fault/status
+    * messages even after the texture budget is exhausted. */
+   if (wrapper_diag_capture &&
+       (!strncmp(fmt, "[COPY]", 6) || !strncmp(fmt, "[FMT]", 5))) {
+      static unsigned records;
+      unsigned n = __atomic_fetch_add(&records, 1, __ATOMIC_RELAXED);
+      if (n >= 512) {
+         if (n == 512)
+            fprintf(stderr, "[WRAPPER_DIAG] format/copy record limit reached\n");
+         return;
+      }
+   }
    /* BCn status lines also go to the stderr the process had before it was
     * redirected into the diag file, where the launcher log sees them */
    if (wrapper_diag_stderr >= 0 && !strncmp(fmt, "[BCN]", 5)) {
