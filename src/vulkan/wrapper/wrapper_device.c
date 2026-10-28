@@ -1604,6 +1604,19 @@ if (pdf2 && pdf2->features.f) { \
       physical_device->instance->dispatch_handle, "vkGetDeviceProcAddr");
    vk_device_dispatch_table_load(&device->dispatch_table, gdpa,
                                  device->dispatch_handle);
+
+   /* Android's loader can return non-NULL core command trampolines even when
+    * the base ICD does not implement maintenance4. Do not call those stubs
+    * merely because we expose Vulkan 1.3: select the existing memory-query
+    * fallbacks using the base feature snapshot, before wrapper emulation.
+    */
+   if (!physical_device->base_supported_features.maintenance4) {
+      device->dispatch_table.GetDeviceBufferMemoryRequirements = NULL;
+      device->dispatch_table.GetDeviceImageMemoryRequirements = NULL;
+      device->dispatch_table.GetDeviceImageSparseMemoryRequirements = NULL;
+      WRAPPER_LOG(info, "Using maintenance4 memory-query fallbacks: base feature unavailable");
+   }
+
    if (physical_device->emulate_vulkan13)
       wrapper_lower_missing_commands(device);
 
