@@ -279,6 +279,13 @@ zink_label_cmd_buffer(struct zink_context *ctx, VkDevice device, VkCommandBuffer
 {
    struct zink_screen *screen = zink_screen(ctx->base.screen);
 
+   bool wanted = zink_tracing;
+#if HAVE_RENDERDOC_INTEGRATION
+   wanted |= screen->renderdoc_api != NULL;
+#endif
+   if (!wanted)
+      return;
+
    VkDebugUtilsObjectNameInfoEXT name_info = {
       .sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT,
       .pNext = NULL,
