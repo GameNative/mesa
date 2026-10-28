@@ -2147,7 +2147,18 @@ wrapper_GetDeviceBufferMemoryRequirements(VkDevice _device,
 {
    VK_FROM_HANDLE(wrapper_device, device, _device);
 
-   if (device->dispatch_table.GetDeviceBufferMemoryRequirements) {
+   /* Order of the Sinking Star faults in the Mali driver's maintenance4
+    * buffer query during D3D device initialization. Use the existing
+    * create/query/destroy lowering for this application, even when the
+    * driver exports the direct entry point. No memory is bound or allocated.
+    */
+   const char *app_name = device->physical->instance->vk.app_info.app_name;
+   const bool mali_sinking_star =
+      device->physical->driver_properties.driverID == VK_DRIVER_ID_ARM_PROPRIETARY &&
+      app_name && !strcmp(app_name, "sinking_star.exe");
+
+   if (device->dispatch_table.GetDeviceBufferMemoryRequirements &&
+       !mali_sinking_star) {
       device->dispatch_table.GetDeviceBufferMemoryRequirements(device->dispatch_handle,
          pInfo, pMemoryRequirements);
       return;
