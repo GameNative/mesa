@@ -43,13 +43,21 @@ NDK="${GN_MESA_NDK:-$HOME/Android/Sdk/ndk/27.3.13750724}"
 # android/cross/aarch64-linux-android.txt is generated from the committed .txt.in
 # template and the settings above, so no absolute path is stored in the tree.
 # Regenerated on every run; meson reads it at every setup/reconfigure.
+case "$(uname -s)" in
+    Darwin) NDK_HOST=darwin-x86_64 ;;
+    *)      NDK_HOST=linux-x86_64 ;;
+esac
+BISON="$(command -v bison)"
+FLEX="$(command -v flex)"
 CROSS_IN="$MESA_DIR/android/cross/aarch64-linux-android.txt.in"
 CROSS_OUT="$MESA_DIR/android/cross/aarch64-linux-android.txt"
-sed -e "s|@NDK_BIN@|$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin|g" \
+sed -e "s|@NDK_BIN@|$NDK/toolchains/llvm/prebuilt/$NDK_HOST/bin|g" \
+    -e "s|@BISON@|$BISON|g" \
+    -e "s|@FLEX@|$FLEX|g" \
     -e "s|@DEPS@|$DEPS|g" \
     -e "s|@REPO_DIR@|$MESA_DIR|g" \
     "$CROSS_IN" > "$CROSS_OUT"
-if grep -q '@NDK_BIN@\|@DEPS@\|@REPO_DIR@' "$CROSS_OUT"; then
+if grep -q '@NDK_BIN@\|@DEPS@\|@REPO_DIR@\|@BISON@\|@FLEX@' "$CROSS_OUT"; then
     echo "cross file still has unsubstituted placeholders: $CROSS_OUT" >&2
     exit 1
 fi
@@ -91,13 +99,12 @@ meson setup "$BUILD_DIR" \
     -Dvalgrind=disabled \
     -Dzstd=disabled \
     -Dxmlconfig=disabled -Dexpat=disabled \
-    -Dgallium-va=disabled -Dgallium-vdpau=disabled -Dgallium-xa=disabled \
-    -Dgallium-opencl=disabled -Dgallium-rusticl=false \
-    -Dgallium-d3d10umd=false -Dgallium-nine=false \
-    -Dosmesa=false -Dtools= \
+    -Dgallium-va=disabled \
+    -Dgallium-rusticl=false \
+    -Dgallium-d3d10umd=false \
+    -Dtools= \
     -Dbuild-tests=false -Dlmsensors=disabled -Dperfetto=false \
     -Dandroid-libbacktrace=disabled \
-    -Dinstall-intel-clc=false \
     $RECONF
 
 ninja -C "$BUILD_DIR"
@@ -112,7 +119,7 @@ find "$STAGE" -type f -o -type l | sort
 echo
 echo "=== sizes ==="
 du -sh "$STAGE"
-find "$STAGE" -type f -name '*.so*' -exec du -b {} + | sort -n
+find "$STAGE" -type f -name '*.so*' -exec wc -c {} + | sort -n
 echo
 echo "Note for the packager: GBM backend and gallium pipe directories are"
 echo "resolved at runtime as siblings of the library that loads them"

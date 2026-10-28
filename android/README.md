@@ -4,7 +4,9 @@ Two independent Android builds live here; neither disturbs the other.
 
 ## `build-mesa-glamor.sh` — minimal Unix GL/EGL stack for Xwayland glamor
 
-Run as `cd <mesa> && bash android/build-mesa-glamor.sh`.
+Run as `cd <mesa> && bash android/build-mesa-glamor.sh`. Works on a Linux or
+macOS host (the NDK prebuilt directory is picked from `uname -s`; `bison` and
+`flex` are taken from `PATH`, so on macOS put Homebrew's bison first).
 
 Produces a **dedicated staging prefix** (default
 `<mesa>/build-android-glamor/stage`, override `GN_MESA_GLAMOR_STAGE`), leaving
@@ -21,9 +23,8 @@ Layout (mirrors the shipped termux-prefix Mesa):
 | path | what |
 |---|---|
 | `lib/libEGL_mesa.so.0.0.0` | EGL vendor library (glvnd) |
-| `lib/libgallium-25.0.0-devel.so` | gallium megadriver (zink + softpipe) |
+| `lib/libgallium-<version>.so` | gallium megadriver (zink + softpipe, with glapi built in) |
 | `lib/libgbm.so.1.0.0` | GBM |
-| `lib/libglapi.so.0.0.0` | shared glapi |
 | `lib/gbm/dri_gbm.so` | GBM "dri" backend |
 | `lib/dri/libdril_dri.so` (+ `zink_dri.so`, `swrast_dri.so`, `kms_swrast_dri.so` symlinks) | DRI/GLX compat megadriver |
 | `share/glvnd/egl_vendor.d/50_mesa.json` | glvnd EGL vendor descriptor |
@@ -37,9 +38,9 @@ shipped Mesa.
 Runtime notes for the packager:
 * `libgbm.so` resolves the GBM backend directory at runtime, as its own
   sibling `gbm/` directory, so it works wherever `<prefix>/lib` is unpacked —
-  no `GBM_BACKENDS_PATH` needed. Likewise the gallium pipe directory is
-  resolved as the sibling `gallium-pipe/` (that directory is not shipped, so
-  the software pipe fallback stays absent, as before).
+  no `GBM_BACKENDS_PATH` needed.
+* There is no separate `libglapi.so.0` any more: since Mesa 25.1 glapi lives
+  in libgallium.
 * glvnd needs the vendor dir: point the loader at
   `<prefix>/share/glvnd/egl_vendor.d` (e.g. `__EGL_VENDOR_LIBRARY_DIRS`).
 * Android-provided dependencies: `libc`, `libdl`, `libm`, `libz`, `liblog`,

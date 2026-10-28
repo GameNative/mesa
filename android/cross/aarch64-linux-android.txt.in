@@ -24,8 +24,8 @@ strip      = '@NDK_BIN@/llvm-strip'
 nm         = '@NDK_BIN@/llvm-nm'
 pkg-config = 'pkg-config'
 # host (build-machine) tools — never the aarch64 ones from the prefix
-bison      = '/usr/bin/bison'
-flex       = '/usr/bin/flex'
+bison      = '@BISON@'
+flex       = '@FLEX@'
 
 [host_machine]
 system     = 'linux'
