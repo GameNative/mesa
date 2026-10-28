@@ -967,6 +967,10 @@ wrapper_GetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice,
       }
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES:
       {
+         /* Keep Mali's native subgroup capabilities. Clearing these masks
+          * prevents vkd3d from exposing WaveOps and shader model 6.0+. */
+         if (pdevice->driver_properties.driverID == VK_DRIVER_ID_ARM_PROPRIETARY)
+            break;
          VkPhysicalDeviceVulkan11Properties *vk11_prop =
               (VkPhysicalDeviceVulkan11Properties *)prop;
          vk11_prop->subgroupSupportedOperations = 0;
@@ -1033,6 +1037,10 @@ wrapper_GetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice,
       }
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES:
       {
+         /* Match the Vulkan 1.1 aggregate query: preserve the driver's
+          * supported operations and stages, without inventing capabilities. */
+         if (pdevice->driver_properties.driverID == VK_DRIVER_ID_ARM_PROPRIETARY)
+            break;
          VkPhysicalDeviceSubgroupProperties *subgroup_prop =
               (VkPhysicalDeviceSubgroupProperties *)prop;
          subgroup_prop->supportedOperations = 0;
