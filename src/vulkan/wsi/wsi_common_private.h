@@ -463,7 +463,8 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(wsi_swapchain, base, VkSwapchainKHR,
 enum wsi_swapchain_blit_type
 wsi_get_android_blit_type(const struct wsi_device *wsi,
                       const struct wsi_base_image_params *params,
-                                   VkDevice device);
+                                   VkDevice device,
+                                   VkFormat image_format);
 
 VkResult wsi_configure_android_image(
    const struct wsi_swapchain *chain,
