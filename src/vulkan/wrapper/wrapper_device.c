@@ -595,12 +595,38 @@ wrapper_create_device_queue(struct wrapper_device *device,
    return VK_SUCCESS;
 }
 
+/* Temporary startup diagnostic: emit before potentially blocking driver calls,
+ * without requiring WRAPPER_DIAG or changing the requested features. */
+static void
+wrapper_startup_diag(const char *fmt, ...)
+{
+   va_list args;
+   fprintf(stderr, "[WRAPPER_STARTUP] pid=%ld ", (long)getpid());
+   va_start(args, fmt);
+   vfprintf(stderr, fmt, args);
+   va_end(args);
+   fputc('\n', stderr);
+   fflush(stderr);
+}
+
 static void
 wrapper_create_null_resources(struct wrapper_device *device)
 {
    const struct vk_device_dispatch_table *dt = &device->dispatch_table;
    VkDevice dev = device->dispatch_handle;
    VkPhysicalDeviceMemoryProperties *mp = &device->physical->memory_properties;
+   VkResult result;
+
+#define NULL_RESULT_CALL(name, ...) do { \
+   wrapper_startup_diag("null." #name " begin"); \
+   result = dt->name(dev, __VA_ARGS__); \
+   wrapper_startup_diag("null." #name " result=%d", result); \
+} while (0)
+#define NULL_VOID_CALL(name, ...) do { \
+   wrapper_startup_diag("null." #name " begin"); \
+   dt->name(dev, __VA_ARGS__); \
+   wrapper_startup_diag("null." #name " end"); \
+} while (0)
 
    VkBufferCreateInfo bci = {
       .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
@@ -610,26 +636,32 @@ wrapper_create_null_resources(struct wrapper_device *device)
                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
       .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
    };
-   if (dt->CreateBuffer(dev, &bci, NULL, &device->null_buffer) != VK_SUCCESS)
+   NULL_RESULT_CALL(CreateBuffer, &bci, NULL, &device->null_buffer);
+   if (result != VK_SUCCESS)
       return;
    VkMemoryRequirements mr;
-   dt->GetBufferMemoryRequirements(dev, device->null_buffer, &mr);
+   NULL_VOID_CALL(GetBufferMemoryRequirements, device->null_buffer, &mr);
    uint32_t mt = UINT32_MAX;
    for (uint32_t i = 0; i < mp->memoryTypeCount; i++)
       if ((mr.memoryTypeBits & (1u << i)) &&
           (mp->memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) { mt = i; break; }
+   wrapper_startup_diag("null.buffer memoryType=%u", mt);
    if (mt == UINT32_MAX) return;
    VkMemoryAllocateInfo mai = {
       .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
       .allocationSize = mr.size, .memoryTypeIndex = mt,
    };
-   if (dt->AllocateMemory(dev, &mai, NULL, &device->null_buffer_memory) != VK_SUCCESS)
+   NULL_RESULT_CALL(AllocateMemory, &mai, NULL, &device->null_buffer_memory);
+   if (result != VK_SUCCESS)
       return;
-   dt->BindBufferMemory(dev, device->null_buffer, device->null_buffer_memory, 0);
+   NULL_RESULT_CALL(BindBufferMemory, device->null_buffer, device->null_buffer_memory, 0);
    void *ptr = NULL;
-   if (dt->MapMemory(dev, device->null_buffer_memory, 0, VK_WHOLE_SIZE, 0, &ptr) == VK_SUCCESS) {
+   NULL_RESULT_CALL(MapMemory, device->null_buffer_memory, 0, VK_WHOLE_SIZE, 0, &ptr);
+   if (result == VK_SUCCESS) {
+      wrapper_startup_diag("null.buffer zero begin size=%llu", (unsigned long long)mr.size);
       memset(ptr, 0, mr.size);
-      dt->UnmapMemory(dev, device->null_buffer_memory);
+      wrapper_startup_diag("null.buffer zero end");
+      NULL_VOID_CALL(UnmapMemory, device->null_buffer_memory);
    }
 
    VkImageCreateInfo ici = {
@@ -640,9 +672,10 @@ wrapper_create_null_resources(struct wrapper_device *device)
       .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT,
       .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
    };
-   if (dt->CreateImage(dev, &ici, NULL, &device->null_image) == VK_SUCCESS) {
+   NULL_RESULT_CALL(CreateImage, &ici, NULL, &device->null_image);
+   if (result == VK_SUCCESS) {
       VkMemoryRequirements imr;
-      dt->GetImageMemoryRequirements(dev, device->null_image, &imr);
+      NULL_VOID_CALL(GetImageMemoryRequirements, device->null_image, &imr);
       uint32_t imt = UINT32_MAX;
       for (uint32_t i = 0; i < mp->memoryTypeCount; i++)
          if (imr.memoryTypeBits & (1u << i)) { imt = i; break; }
@@ -650,20 +683,25 @@ wrapper_create_null_resources(struct wrapper_device *device)
          .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
          .allocationSize = imr.size, .memoryTypeIndex = imt,
       };
-      if (imt != UINT32_MAX &&
-          dt->AllocateMemory(dev, &imai, NULL, &device->null_image_memory) == VK_SUCCESS) {
-         dt->BindImageMemory(dev, device->null_image, device->null_image_memory, 0);
+      wrapper_startup_diag("null.image memoryType=%u", imt);
+      if (imt != UINT32_MAX) {
+         NULL_RESULT_CALL(AllocateMemory, &imai, NULL, &device->null_image_memory);
+      }
+      if (imt != UINT32_MAX && result == VK_SUCCESS) {
+         NULL_RESULT_CALL(BindImageMemory, device->null_image, device->null_image_memory, 0);
          VkImageViewCreateInfo vci = {
             .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
             .image = device->null_image, .viewType = VK_IMAGE_VIEW_TYPE_2D,
             .format = VK_FORMAT_R8G8B8A8_UNORM,
             .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
          };
-         dt->CreateImageView(dev, &vci, NULL, &device->null_image_view);
+         NULL_RESULT_CALL(CreateImageView, &vci, NULL, &device->null_image_view);
       }
    }
    VkSamplerCreateInfo sci = { .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
-   dt->CreateSampler(dev, &sci, NULL, &device->null_sampler);
+   NULL_RESULT_CALL(CreateSampler, &sci, NULL, &device->null_sampler);
+#undef NULL_RESULT_CALL
+#undef NULL_VOID_CALL
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -1312,6 +1350,12 @@ wrapper_CreateDevice(VkPhysicalDevice physicalDevice,
    VkDeviceQueueCreateInfo *bcn_queues = NULL;
    float *bcn_priorities = NULL;
 
+   wrapper_startup_diag("CreateDevice begin app=%s engine=%s",
+      physical_device->instance->vk.app_info.app_name ?
+         physical_device->instance->vk.app_info.app_name : "",
+      physical_device->instance->vk.app_info.engine_name ?
+         physical_device->instance->vk.app_info.engine_name : "");
+
    device = vk_zalloc2(&physical_device->instance->vk.alloc, pAllocator,
                        sizeof(*device), 8, VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
    if (!device)
@@ -1562,9 +1606,11 @@ if (pdf2 && pdf2->features.f) { \
        !(emulate_query_reset && !device->query_reset_shared_queue))
       wrapper_bcn_reserve_queue(device, &wrapper_create_info, &bcn_queues, &bcn_priorities);
 
+   wrapper_startup_diag("driver.CreateDevice begin");
    result = physical_device->dispatch_table.CreateDevice(
       physical_device->dispatch_handle, &wrapper_create_info,
          pAllocator, &device->dispatch_handle);
+   wrapper_startup_diag("driver.CreateDevice result=%d", result);
    wrapper_core13_free_device_create(core13_storage);
 
    if (result != VK_SUCCESS) {
@@ -1577,9 +1623,11 @@ if (pdf2 && pdf2->features.f) { \
                              "feature chain\n", result);
          wrapper_create_info.pNext = NULL;
          used_fallback_create = true;
+         wrapper_startup_diag("driver.CreateDevice fallback begin");
          result = physical_device->dispatch_table.CreateDevice(
             physical_device->dispatch_handle, &wrapper_create_info,
                pAllocator, &device->dispatch_handle);
+         wrapper_startup_diag("driver.CreateDevice fallback result=%d", result);
       }
       
       if (result != VK_SUCCESS) {
@@ -1600,15 +1648,19 @@ if (pdf2 && pdf2->features.f) { \
    free(bcn_queues);
    free(bcn_priorities);
 
+   wrapper_startup_diag("dispatch load begin");
    void *gdpa = physical_device->instance->dispatch_table.GetInstanceProcAddr(
       physical_device->instance->dispatch_handle, "vkGetDeviceProcAddr");
    vk_device_dispatch_table_load(&device->dispatch_table, gdpa,
                                  device->dispatch_handle);
    if (physical_device->emulate_vulkan13)
       wrapper_lower_missing_commands(device);
+   wrapper_startup_diag("dispatch load end");
 
    if (emulate_query_reset) {
+      wrapper_startup_diag("query reset init begin");
       result = wrapper_query_reset_init(device);
+      wrapper_startup_diag("query reset init result=%d", result);
       if (result != VK_SUCCESS) {
          wrapper_DestroyDevice(wrapper_device_to_handle(device), &device->vk.alloc);
          return vk_error(physical_device, result);
@@ -1625,6 +1677,7 @@ if (pdf2 && pdf2->features.f) { \
    if (device->emulate_null_descriptor) {
       WRAPPER_LOG(info, "Emulating nullDescriptor with canonical zero resources");
       wrapper_create_null_resources(device);
+      wrapper_startup_diag("null resources end");
    }
 
    device->emulate_imageless_framebuffer =
@@ -1655,7 +1708,9 @@ if (pdf2 && pdf2->features.f) { \
       }
    }
 
+   wrapper_startup_diag("wrapper queues begin");
    result = wrapper_create_device_queue(device, pCreateInfo);
+   wrapper_startup_diag("wrapper queues result=%d", result);
    if (result != VK_SUCCESS) {
       wrapper_DestroyDevice(wrapper_device_to_handle(device),
                             &device->vk.alloc);
@@ -1690,13 +1745,18 @@ if (pdf2 && pdf2->features.f) { \
                           VK_API_VERSION_MAJOR(physical_device->instance->vk.app_info.api_version),
                           VK_API_VERSION_MINOR(physical_device->instance->vk.app_info.api_version),
                           bcn_bda, used_fallback_create);
+      wrapper_startup_diag("BCn GPU init begin");
       wrapper_bcn_gpu_init(device, pCreateInfo->queueCreateInfoCount ?
          pCreateInfo->pQueueCreateInfos[0].queueFamilyIndex : UINT32_MAX);
+      wrapper_startup_diag("BCn GPU init end; prebuild begin");
       wrapper_bcn_gpu_prebuild(device);
+      wrapper_startup_diag("BCn GPU prebuild end");
    }
    if (bc6h_hdr && !used_fallback_create)
       WRAPPER_LOG(info, "BCn policy: BC6H stored as ASTC 4x4 HDR");
+   wrapper_startup_diag("capability report begin");
    wrapper_emit_diag(physical_device, pCreateInfo, VK_SUCCESS);
+   wrapper_startup_diag("CreateDevice returning VK_SUCCESS");
 
    *pDevice = wrapper_device_to_handle(device);
 
