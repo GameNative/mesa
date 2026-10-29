@@ -1675,6 +1675,11 @@ if (pdf2 && pdf2->features.f) { \
       return vk_error(physical_device, result);
    }
 
+   fprintf(stderr, "[wrapper-alloc] dispatch=%s placed-enabled=%u extension-enabled=%u\n",
+           physical_device->vk.supported_features.memoryMapPlaced ? "wrapper" : "native-trampoline",
+           device->vk.enabled_features.memoryMapPlaced,
+           device->vk.enabled_extensions.EXT_map_memory_placed);
+   fflush(stderr);
    if (!physical_device->vk.supported_features.memoryMapPlaced) {
       device->vk.dispatch_table.AllocateMemory =
          wrapper_device_trampolines.AllocateMemory;
