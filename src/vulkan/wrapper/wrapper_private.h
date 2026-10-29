@@ -359,6 +359,7 @@ struct wrapper_device_memory {
    struct list_head link;
    int fd;
    void *map_address;
+   bool driver_mapped;
    size_t map_size;
    size_t alloc_size;
    VkDeviceMemory dispatch_handle;
