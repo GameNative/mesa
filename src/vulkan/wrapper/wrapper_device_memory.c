@@ -13,6 +13,9 @@
 #include <linux/dma-heap.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <stdio.h>
+#include <inttypes.h>
+#include "util/u_atomic.h"
 
 static int
 safe_ioctl(int fd, unsigned long request, void *arg)
@@ -513,10 +516,45 @@ wrapper_AllocateMemory(VkDevice _device,
                        const VkMemoryAllocateInfo* pAllocateInfo,
                        const VkAllocationCallbacks* pAllocator,
                        VkDeviceMemory* pMemory) {
+   /* Bounded, flushed diagnostics: the existing backend logs do not cover
+    * failures before backend selection or in the native fallback. */
+   static int allocation_sequence;
+   const int sequence = p_atomic_inc_return(&allocation_sequence);
+   const bool trace_allocation = sequence > 0 && sequence <= 32;
+#define ALLOC_TRACE(...) do { \
+   if (trace_allocation) { \
+      fprintf(stderr, "[wrapper-alloc:%d] ", sequence); \
+      fprintf(stderr, __VA_ARGS__); \
+      fprintf(stderr, "\n"); \
+      fflush(stderr); \
+   } \
+} while (0)
+   ALLOC_TRACE("entry device=%p info=%p allocator=%p output=%p",
+               (void *)_device, (const void *)pAllocateInfo,
+               (const void *)pAllocator, (void *)pMemory);
    VK_FROM_HANDLE(wrapper_device, device, _device);
    struct wrapper_device_memory *mem;
    VkResult result;
    VkMemoryAllocateInfo coherent_allocate_info;
+
+   ALLOC_TRACE("request size=%" PRIu64 " type=%u count=%u placed=%u extension=%u",
+               (uint64_t)pAllocateInfo->allocationSize,
+               pAllocateInfo->memoryTypeIndex,
+               device->physical->memory_properties.memoryTypeCount,
+               device->vk.enabled_features.memoryMapPlaced,
+               device->vk.enabled_extensions.EXT_map_memory_placed);
+   if (trace_allocation) {
+      const VkBaseInStructure *next = pAllocateInfo->pNext;
+      for (unsigned i = 0; next && i < 16; i++, next = next->pNext) {
+         ALLOC_TRACE("pNext[%u] address=%p", i, (const void *)next);
+         ALLOC_TRACE("pNext[%u] sType=%u", i, (unsigned)next->sType);
+         if (next->sType == VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO) {
+            const VkMemoryDedicatedAllocateInfo *dedicated = (const void *)next;
+            ALLOC_TRACE("dedicated image=%" PRIx64 " buffer=%" PRIx64,
+                        (uint64_t)dedicated->image, (uint64_t)dedicated->buffer);
+         }
+      }
+   }
 
    if (device->physical->coherent_memory_type[pAllocateInfo->memoryTypeIndex] !=
        pAllocateInfo->memoryTypeIndex) {
@@ -529,6 +567,8 @@ wrapper_AllocateMemory(VkDevice _device,
    VkMemoryPropertyFlags property_flags =
       device->physical->memory_properties.memoryTypes[
          pAllocateInfo->memoryTypeIndex].propertyFlags;
+   ALLOC_TRACE("mapped type=%u flags=0x%x", pAllocateInfo->memoryTypeIndex,
+               property_flags);
    
    if (!(property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))
       goto fallback;
@@ -563,6 +603,7 @@ wrapper_AllocateMemory(VkDevice _device,
    }
    
    WRAPPER_LOG(info, "Emulating vkAllocateMemory");
+   ALLOC_TRACE("emulation backend=%s", device->physical->resource_type);
 
    simple_mtx_lock(&device->resource_mutex);
 
@@ -661,16 +702,22 @@ wrapper_AllocateMemory(VkDevice _device,
 
 out:
    simple_mtx_unlock(&device->resource_mutex);
+   ALLOC_TRACE("emulation return result=%d", result);
    return result;
 
 fallback:
+   ALLOC_TRACE("native call size=%" PRIu64 " type=%u",
+               (uint64_t)pAllocateInfo->allocationSize, pAllocateInfo->memoryTypeIndex);
    result = device->dispatch_table.AllocateMemory(device->dispatch_handle,
       pAllocateInfo, pAllocator, pMemory);
+   ALLOC_TRACE("native return result=%d", result);
    if (result == VK_SUCCESS && !(property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
       simple_mtx_lock(&device->resource_mutex);
       _mesa_hash_table_u64_insert(device->device_only_memory, (uint64_t)*pMemory, device);
       simple_mtx_unlock(&device->resource_mutex);
    }
+   ALLOC_TRACE("complete result=%d", result);
+#undef ALLOC_TRACE
    return result;
 }
 
