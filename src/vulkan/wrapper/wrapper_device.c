@@ -2023,8 +2023,10 @@ wrapper_CreateImage(VkDevice _device,
    if (is_emulated_bcn(device->physical, pCreateInfo->format)) {
       wrapper_bcn_gpu_storage_check(device, pCreateInfo->format);
       create_info.format = get_format_for_bcn(pCreateInfo->format);
-      if (create_info.flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT)
-         create_info.flags &= ~VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+      /* Typeless BC textures need both UNORM and SRGB views. Their backing
+       * formats remain a compatible pair after decoding or ASTC transcoding,
+       * so retain MUTABLE_FORMAT along with the translated view format list.
+       * Clearing it makes the alternate view invalid on the host driver. */
 
       if (wrapper_diag_on())
          wrapper_diag_append(
