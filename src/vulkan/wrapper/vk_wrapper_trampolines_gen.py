@@ -127,6 +127,9 @@ ${e.prefixed_name('wrapper_tramp')}(${e.decl_params()})
     % endif
   % elif e.params[0].type == 'VkCommandBuffer':
     VK_FROM_HANDLE(wrapper_command_buffer, wcb, ${e.params[0].name});
+    % if e.name.startswith('Cmd'):
+    wrapper_loss_diag_command(wcb, "${e.name}");
+    % endif
     % if e.return_type == 'void':
       % if len(e.params) > 1:
     wcb->device->dispatch_table.${e.name}(wcb->dispatch_handle, ${e.call_params(1)});
