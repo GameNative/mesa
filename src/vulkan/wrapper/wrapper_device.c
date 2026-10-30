@@ -759,6 +759,7 @@ wrapper_CmdBindVertexBuffers2(VkCommandBuffer commandBuffer, uint32_t firstBindi
                              const VkDeviceSize *pStrides)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   wrapper_loss_diag_command(wcb, "CmdBindVertexBuffers2");
    struct wrapper_device *device = wcb->device;
    VkBuffer *bufs = NULL;
    VkDeviceSize *offsets = NULL, *sizes = NULL;
@@ -807,6 +808,7 @@ VKAPI_ATTR void VKAPI_CALL
 wrapper_CmdSetCullMode(VkCommandBuffer commandBuffer, VkCullModeFlags cullMode)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   wrapper_loss_diag_command(wcb, "CmdSetCullMode");
    if (wcb->device->dispatch_table.CmdSetCullMode)
       wcb->device->dispatch_table.CmdSetCullMode(wcb->dispatch_handle, cullMode);
    else if (wrapper_lowers_core13(wcb->device) &&
@@ -820,6 +822,7 @@ VKAPI_ATTR void VKAPI_CALL
 wrapper_CmdSetFrontFace(VkCommandBuffer commandBuffer, VkFrontFace frontFace)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   wrapper_loss_diag_command(wcb, "CmdSetFrontFace");
    if (wcb->device->dispatch_table.CmdSetFrontFace)
       wcb->device->dispatch_table.CmdSetFrontFace(wcb->dispatch_handle, frontFace);
    else if (wrapper_lowers_core13(wcb->device) &&
@@ -834,6 +837,7 @@ wrapper_CmdSetPrimitiveTopology(VkCommandBuffer commandBuffer,
                                 VkPrimitiveTopology primitiveTopology)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   wrapper_loss_diag_command(wcb, "CmdSetPrimitiveTopology");
    if (wcb->device->dispatch_table.CmdSetPrimitiveTopology)
       wcb->device->dispatch_table.CmdSetPrimitiveTopology(
          wcb->dispatch_handle, primitiveTopology);
@@ -851,6 +855,7 @@ wrapper_CmdSetViewportWithCount(VkCommandBuffer commandBuffer,
                                 const VkViewport *pViewports)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   wrapper_loss_diag_command(wcb, "CmdSetViewportWithCount");
    if (wcb->device->dispatch_table.CmdSetViewportWithCount)
       wcb->device->dispatch_table.CmdSetViewportWithCount(
          wcb->dispatch_handle, viewportCount, pViewports);
@@ -871,6 +876,7 @@ wrapper_CmdSetScissorWithCount(VkCommandBuffer commandBuffer,
                                const VkRect2D *pScissors)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   wrapper_loss_diag_command(wcb, "CmdSetScissorWithCount");
    if (wcb->device->dispatch_table.CmdSetScissorWithCount)
       wcb->device->dispatch_table.CmdSetScissorWithCount(
          wcb->dispatch_handle, scissorCount, pScissors);
@@ -890,6 +896,7 @@ wrapper_CmdSetDepthTestEnable(VkCommandBuffer commandBuffer,
                               VkBool32 depthTestEnable)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   wrapper_loss_diag_command(wcb, "CmdSetDepthTestEnable");
    if (wcb->device->dispatch_table.CmdSetDepthTestEnable)
       wcb->device->dispatch_table.CmdSetDepthTestEnable(
          wcb->dispatch_handle, depthTestEnable);
@@ -906,6 +913,7 @@ wrapper_CmdSetDepthWriteEnable(VkCommandBuffer commandBuffer,
                                VkBool32 depthWriteEnable)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   wrapper_loss_diag_command(wcb, "CmdSetDepthWriteEnable");
    if (wcb->device->dispatch_table.CmdSetDepthWriteEnable)
       wcb->device->dispatch_table.CmdSetDepthWriteEnable(
          wcb->dispatch_handle, depthWriteEnable);
@@ -922,6 +930,7 @@ wrapper_CmdSetDepthCompareOp(VkCommandBuffer commandBuffer,
                              VkCompareOp depthCompareOp)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   wrapper_loss_diag_command(wcb, "CmdSetDepthCompareOp");
    if (wcb->device->dispatch_table.CmdSetDepthCompareOp)
       wcb->device->dispatch_table.CmdSetDepthCompareOp(
          wcb->dispatch_handle, depthCompareOp);
@@ -938,6 +947,7 @@ wrapper_CmdSetStencilTestEnable(VkCommandBuffer commandBuffer,
                                 VkBool32 stencilTestEnable)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   wrapper_loss_diag_command(wcb, "CmdSetStencilTestEnable");
    if (wcb->device->dispatch_table.CmdSetStencilTestEnable)
       wcb->device->dispatch_table.CmdSetStencilTestEnable(
          wcb->dispatch_handle, stencilTestEnable);
@@ -956,6 +966,7 @@ wrapper_CmdSetStencilOp(VkCommandBuffer commandBuffer,
                         VkCompareOp compareOp)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   wrapper_loss_diag_command(wcb, "CmdSetStencilOp");
    if (wcb->device->dispatch_table.CmdSetStencilOp)
       wcb->device->dispatch_table.CmdSetStencilOp(
          wcb->dispatch_handle, faceMask, failOp, passOp, depthFailOp, compareOp);
@@ -984,6 +995,7 @@ wrapper_CmdSetRasterizerDiscardEnable(VkCommandBuffer commandBuffer,
                                       VkBool32 rasterizerDiscardEnable)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   wrapper_loss_diag_command(wcb, "CmdSetRasterizerDiscardEnable");
    if (wcb->device->dispatch_table.CmdSetRasterizerDiscardEnable)
       wcb->device->dispatch_table.CmdSetRasterizerDiscardEnable(
          wcb->dispatch_handle, rasterizerDiscardEnable);
@@ -1000,6 +1012,7 @@ wrapper_CmdSetDepthBiasEnable(VkCommandBuffer commandBuffer,
                               VkBool32 depthBiasEnable)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   wrapper_loss_diag_command(wcb, "CmdSetDepthBiasEnable");
    if (wcb->device->dispatch_table.CmdSetDepthBiasEnable)
       wcb->device->dispatch_table.CmdSetDepthBiasEnable(
          wcb->dispatch_handle, depthBiasEnable);
@@ -1016,6 +1029,7 @@ wrapper_CmdSetPrimitiveRestartEnable(VkCommandBuffer commandBuffer,
                                      VkBool32 primitiveRestartEnable)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   wrapper_loss_diag_command(wcb, "CmdSetPrimitiveRestartEnable");
    if (wcb->device->dispatch_table.CmdSetPrimitiveRestartEnable)
       wcb->device->dispatch_table.CmdSetPrimitiveRestartEnable(
          wcb->dispatch_handle, primitiveRestartEnable);
@@ -1033,6 +1047,7 @@ wrapper_CmdBindVertexBuffers(VkCommandBuffer commandBuffer, uint32_t firstBindin
                             const VkDeviceSize *pOffsets)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   wrapper_loss_diag_command(wcb, "CmdBindVertexBuffers");
    struct wrapper_device *device = wcb->device;
    VkBuffer *bufs = NULL;
    VkDeviceSize *offsets = NULL;
@@ -1622,7 +1637,7 @@ if (pdf2 && pdf2->features.f) { \
    const char *loss_app = physical_device->instance->vk.app_info.app_name;
    device->loss_diag = loss_app && !strcmp(loss_app, "Content Warning.exe");
    if (device->loss_diag)
-      fprintf(stderr, "[GN-WRAPPER-LOSS-v1] enabled native=%s api=%u "
+      fprintf(stderr, "[GN-WRAPPER-LOSS-v2] enabled native=%s api=%u "
               "device_fault=%u timeline=%u\n",
               physical_device->properties2.properties.deviceName,
               physical_device->properties2.properties.apiVersion,
@@ -2463,6 +2478,7 @@ wrapper_CmdBeginRenderPass(VkCommandBuffer commandBuffer,
                            VkSubpassContents contents)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   wrapper_loss_diag_command(wcb, "CmdBeginRenderPass");
    VkRenderPassBeginInfo begin = *pRenderPassBegin;
    VkFramebuffer real;
 
@@ -2482,6 +2498,7 @@ wrapper_CmdBeginRenderPass2(VkCommandBuffer commandBuffer,
                             const VkSubpassBeginInfo *pSubpassBeginInfo)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   wrapper_loss_diag_command(wcb, "CmdBeginRenderPass2");
    struct wrapper_device *device = wcb->device;
    VkRenderPassBeginInfo begin = *pRenderPassBegin;
    VkFramebuffer real;
@@ -2814,6 +2831,7 @@ wrapper_CmdPushDescriptorSetKHR(VkCommandBuffer commandBuffer,
                                const VkWriteDescriptorSet *pDescriptorWrites)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   wrapper_loss_diag_command(wcb, "CmdPushDescriptorSetKHR");
    if (!wcb->device->emulate_push_descriptor) {
       wcb->device->dispatch_table.CmdPushDescriptorSetKHR(wcb->dispatch_handle,
          pipelineBindPoint, layout, set, descriptorWriteCount, pDescriptorWrites);
@@ -2871,6 +2889,7 @@ wrapper_CmdPushDescriptorSetWithTemplateKHR(VkCommandBuffer commandBuffer,
                                            const void *pData)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   wrapper_loss_diag_command(wcb, "CmdPushDescriptorSetWithTemplateKHR");
    if (!wcb->device->emulate_push_descriptor) {
       wcb->device->dispatch_table.CmdPushDescriptorSetWithTemplateKHR(
          wcb->dispatch_handle, descriptorUpdateTemplate, layout, set, pData);
@@ -2978,6 +2997,7 @@ wrapper_CmdPushConstants(VkCommandBuffer commandBuffer, VkPipelineLayout layout,
                          uint32_t size, const void *pValues)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   wrapper_loss_diag_command(wcb, "CmdPushConstants");
    const struct wrapper_physical_device *pdev = wcb->device->physical;
 
    if (pdev->raises_push_constant_limit) {
@@ -3120,6 +3140,7 @@ wrapper_CmdBindDescriptorSets(VkCommandBuffer commandBuffer, VkPipelineBindPoint
                               uint32_t dynamicOffsetCount, const uint32_t *pDynamicOffsets)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   wrapper_loss_diag_command(wcb, "CmdBindDescriptorSets");
    if (wcb->device->fold_sets &&
        wrapper_fold_bind(wcb, pipelineBindPoint, layout, firstSet, descriptorSetCount,
                          pDescriptorSets, dynamicOffsetCount, pDynamicOffsets))
@@ -3507,6 +3528,7 @@ wrapper_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
                             const VkDependencyInfo *pDependencyInfo)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   wrapper_loss_diag_command(wcb, "CmdPipelineBarrier2");
    uint32_t count = pDependencyInfo->imageMemoryBarrierCount;
    VkImageMemoryBarrier2 stack[WRAPPER_CAP_STACK_ENTRIES];
    VkImageMemoryBarrier2 *capped = NULL;
@@ -3671,6 +3693,7 @@ wrapper_CmdBeginRendering(VkCommandBuffer commandBuffer,
                           const VkRenderingInfo *pRenderingInfo)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   wrapper_loss_diag_command(wcb, "CmdBeginRendering");
    struct wrapper_device *device = wcb->device;
 
 
@@ -3890,6 +3913,7 @@ VKAPI_ATTR void VKAPI_CALL
 wrapper_CmdEndRendering(VkCommandBuffer commandBuffer)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   wrapper_loss_diag_command(wcb, "CmdEndRendering");
    if (wcb->device->dispatch_table.CmdEndRendering)
       wcb->device->dispatch_table.CmdEndRendering(wcb->dispatch_handle);
    else if (wcb->dynamic_rendering_active)
@@ -4375,6 +4399,7 @@ wrapper_CmdDraw(VkCommandBuffer commandBuffer, uint32_t vertexCount,
                 uint32_t firstInstance)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   wrapper_loss_diag_command(wcb, "CmdDraw");
    if (wcb->divisor_pipeline &&
        wrapper_divisor_draw(wcb, false, vertexCount, instanceCount, firstVertex, 0,
                             firstInstance))
@@ -4391,6 +4416,7 @@ wrapper_CmdDrawIndexed(VkCommandBuffer commandBuffer, uint32_t indexCount,
                        int32_t vertexOffset, uint32_t firstInstance)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   wrapper_loss_diag_command(wcb, "CmdDrawIndexed");
    if (wcb->divisor_pipeline &&
        wrapper_divisor_draw(wcb, true, indexCount, instanceCount, firstIndex, vertexOffset,
                             firstInstance))
@@ -4407,6 +4433,7 @@ wrapper_CmdDrawIndirect(VkCommandBuffer commandBuffer, VkBuffer buffer,
                         VkDeviceSize offset, uint32_t drawCount, uint32_t stride)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   wrapper_loss_diag_command(wcb, "CmdDrawIndirect");
    bool divisor = wcb->divisor_pipeline && wrapper_divisor_begin_indirect(wcb);
    if (wcb->stride_pipeline && !divisor)
       wrapper_stride_flush(wcb);
@@ -4421,6 +4448,7 @@ wrapper_CmdDrawIndexedIndirect(VkCommandBuffer commandBuffer, VkBuffer buffer,
                                VkDeviceSize offset, uint32_t drawCount, uint32_t stride)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   wrapper_loss_diag_command(wcb, "CmdDrawIndexedIndirect");
    bool divisor = wcb->divisor_pipeline && wrapper_divisor_begin_indirect(wcb);
    if (wcb->stride_pipeline && !divisor)
       wrapper_stride_flush(wcb);
@@ -4437,6 +4465,7 @@ wrapper_CmdDrawIndirectCount(VkCommandBuffer commandBuffer, VkBuffer buffer,
                              uint32_t stride)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   wrapper_loss_diag_command(wcb, "CmdDrawIndirectCount");
    bool divisor = wcb->divisor_pipeline && wrapper_divisor_begin_indirect(wcb);
    if (wcb->stride_pipeline && !divisor)
       wrapper_stride_flush(wcb);
@@ -4453,6 +4482,7 @@ wrapper_CmdDrawIndexedIndirectCount(VkCommandBuffer commandBuffer, VkBuffer buff
                                     uint32_t stride)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   wrapper_loss_diag_command(wcb, "CmdDrawIndexedIndirectCount");
    bool divisor = wcb->divisor_pipeline && wrapper_divisor_begin_indirect(wcb);
    if (wcb->stride_pipeline && !divisor)
       wrapper_stride_flush(wcb);
@@ -4468,6 +4498,7 @@ wrapper_CmdDrawMultiEXT(VkCommandBuffer commandBuffer, uint32_t drawCount,
                         uint32_t firstInstance, uint32_t stride)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   wrapper_loss_diag_command(wcb, "CmdDrawMultiEXT");
    if (wcb->divisor_pipeline && drawCount) {
       const uint8_t *info = (const uint8_t *)pVertexInfo;
       bool handled = true;
@@ -4492,6 +4523,7 @@ wrapper_CmdDrawMultiIndexedEXT(VkCommandBuffer commandBuffer, uint32_t drawCount
                                uint32_t stride, const int32_t *pVertexOffset)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   wrapper_loss_diag_command(wcb, "CmdDrawMultiIndexedEXT");
    if (wcb->divisor_pipeline && drawCount) {
       const uint8_t *info = (const uint8_t *)pIndexInfo;
       bool handled = true;
@@ -4517,6 +4549,7 @@ wrapper_CmdDrawIndirectByteCountEXT(VkCommandBuffer commandBuffer, uint32_t inst
                                     uint32_t counterOffset, uint32_t vertexStride)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   wrapper_loss_diag_command(wcb, "CmdDrawIndirectByteCountEXT");
    if (wcb->stride_pipeline)
       wrapper_stride_flush(wcb);
    wcb->device->dispatch_table.CmdDrawIndirectByteCountEXT(wcb->dispatch_handle,
@@ -4676,6 +4709,47 @@ wrapper_loss_diag_first(struct wrapper_device *device, VkResult result)
           p_atomic_cmpxchg(&device->loss_diag_reported, 0, 1) == 0;
 }
 
+/* Bounded startup recording, correlated with the native command-buffer
+ * handles printed at submit. No extra Vulkan calls or synchronization. */
+void
+wrapper_loss_diag_command(struct wrapper_command_buffer *wcb,
+                          const char *operation)
+{
+   struct wrapper_device *device = wcb->device;
+   if (!device->loss_diag || p_atomic_read(&device->loss_diag_submits) > 1)
+      return;
+   uint32_t seq = p_atomic_inc_return(&device->loss_diag_commands);
+   if (seq <= 128)
+      fprintf(stderr, "[GN-WRAPPER-LOSS-v2] record device=%p cb=%p n=%u op=%s\n",
+              (void *)device->dispatch_handle, (void *)wcb->dispatch_handle,
+              seq, operation);
+   else if (seq == 129)
+      fprintf(stderr, "[GN-WRAPPER-LOSS-v2] record device=%p limit=128\n",
+              (void *)device->dispatch_handle);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+wrapper_GetSemaphoreCounterValue(VkDevice _device, VkSemaphore semaphore,
+                                 uint64_t *value)
+{
+   VK_FROM_HANDLE(wrapper_device, device, _device);
+   VkResult result = device->dispatch_table.GetSemaphoreCounterValue(
+      device->dispatch_handle, semaphore, value);
+   uint32_t seq = device->loss_diag ?
+      p_atomic_inc_return(&device->loss_diag_counters) : 0;
+   bool first_loss = wrapper_loss_diag_first(device, result);
+   if ((seq && seq <= 8) || first_loss)
+      fprintf(stderr, "[GN-WRAPPER-LOSS-v2] counter device=%p seq=%u "
+              "semaphore=0x%llx result=%d value_valid=%u value=%llu\n",
+              (void *)device->dispatch_handle, seq,
+              (unsigned long long)(uintptr_t)semaphore, result,
+              result == VK_SUCCESS,
+              result == VK_SUCCESS ? (unsigned long long)*value : 0ull);
+   if (first_loss)
+      wrapper_log_device_fault(device);
+   return result;
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 wrapper_WaitSemaphores(VkDevice _device, const VkSemaphoreWaitInfo *info,
                        uint64_t timeout)
@@ -4752,6 +4826,15 @@ wrapper_QueueSubmit(VkQueue _queue, uint32_t submitCount,
          wcb->fence = wf;
          command_buffers[j] = wcb->dispatch_handle;
          wrapper_bcn_hq_submitted(queue, wcb);
+         if (seq && seq <= 2 && i < 4 && j < 8)
+            fprintf(stderr, "[GN-WRAPPER-LOSS-v2] submit-cb device=%p "
+                    "seq=%u batch=%u index=%u cb=%p fence=0x%llx "
+                    "waits=%u signals=%u\n",
+                    (void *)queue->device->dispatch_handle, seq, i, j,
+                    (void *)wcb->dispatch_handle,
+                    (unsigned long long)(uintptr_t)fence,
+                    submit_info->waitSemaphoreCount,
+                    submit_info->signalSemaphoreCount);
       }
       wrapper_submits[i] = pSubmits[i];
       wrapper_submits[i].pCommandBuffers = command_buffers;
@@ -5042,9 +5125,30 @@ wrapper_WaitForFences(VkDevice _device,
    VK_FROM_HANDLE(wrapper_device, device, _device);
    VkResult res;
 
+   uint32_t seq = device->loss_diag ?
+      p_atomic_inc_return(&device->loss_diag_fence_waits) : 0;
+   if (seq && seq <= 8)
+      fprintf(stderr, "[GN-WRAPPER-LOSS-v2] WaitForFences-enter device=%p "
+              "seq=%u count=%u all=%u timeout=%llu\n",
+              (void *)device->dispatch_handle, seq, fenceCount, waitAll,
+              (unsigned long long)timeout);
    res = device->dispatch_table.WaitForFences(device->dispatch_handle,
      fenceCount, pFences, waitAll, timeout);
 
+   bool first_loss = wrapper_loss_diag_first(device, res);
+   if ((seq && seq <= 8) || first_loss) {
+      fprintf(stderr, "[GN-WRAPPER-LOSS-v2] WaitForFences device=%p seq=%u "
+              "count=%u all=%u timeout=%llu result=%d\n",
+              (void *)device->dispatch_handle, seq, fenceCount, waitAll,
+              (unsigned long long)timeout, res);
+      for (uint32_t i = 0; i < MIN2(fenceCount, 4); i++)
+         fprintf(stderr, "[GN-WRAPPER-LOSS-v2] fence device=%p "
+                 "seq=%u index=%u handle=0x%llx\n",
+                 (void *)device->dispatch_handle, seq, i,
+                 (unsigned long long)(uintptr_t)pFences[i]);
+   }
+   if (first_loss)
+      wrapper_log_device_fault(device);
    return res;
 }
 
@@ -5065,6 +5169,7 @@ wrapper_CmdExecuteCommands(VkCommandBuffer commandBuffer,
                            const VkCommandBuffer* pCommandBuffers)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   wrapper_loss_diag_command(wcb, "CmdExecuteCommands");
    VkCommandBuffer command_buffers[commandBufferCount];
 
    for (int i = 0; i < commandBufferCount; i++) {
@@ -5289,6 +5394,7 @@ wrapper_CmdBindPipeline(VkCommandBuffer commandBuffer,
                         VkPipelineBindPoint pipelineBindPoint, VkPipeline pipeline)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   wrapper_loss_diag_command(wcb, "CmdBindPipeline");
    if (wcb->device->bcn_bda)
       wrapper_cmd_track_pipeline(wcb, pipelineBindPoint, pipeline);
    if (wrapper_uses_variants(wcb->device) &&
@@ -5764,6 +5870,7 @@ wrapper_CmdCopyBufferToImage(VkCommandBuffer commandBuffer,
 							 const VkBufferImageCopy *pRegions)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   wrapper_loss_diag_command(wcb, "CmdCopyBufferToImage");
    struct wrapper_device *device = wcb->device;
    struct wrapper_image *wi = get_wrapper_image_from_handle(device, dstImage);
    struct wrapper_buffer *wb = get_wrapper_buffer_from_handle(device, srcBuffer);
@@ -5789,6 +5896,7 @@ wrapper_CmdCopyBufferToImage2(VkCommandBuffer commandBuffer,
                              const VkCopyBufferToImageInfo2 *pInfo)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   wrapper_loss_diag_command(wcb, "CmdCopyBufferToImage2");
    struct wrapper_device *device = wcb->device;
    struct wrapper_image *wi = get_wrapper_image_from_handle(device, pInfo->dstImage);
    struct wrapper_buffer *wb = get_wrapper_buffer_from_handle(device, pInfo->srcBuffer);
@@ -5831,6 +5939,7 @@ wrapper_CmdBlitImage(
     VkFilter filter)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   wrapper_loss_diag_command(wcb, "CmdBlitImage");
    struct wrapper_device *device = wcb->device;
    struct wrapper_image *dst_img = get_wrapper_image_from_handle(device, dstImage);
    const VkImageBlit *regions = (const VkImageBlit *)pRegions;
@@ -5874,6 +5983,7 @@ wrapper_CmdBlitImage2(
     const VkBlitImageInfo2 *pBlitImageInfo)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   wrapper_loss_diag_command(wcb, "CmdBlitImage2");
    struct wrapper_device *device = wcb->device;
    struct wrapper_image *dst_img = get_wrapper_image_from_handle(device, pBlitImageInfo->dstImage);
 
@@ -5924,6 +6034,7 @@ wrapper_CmdPipelineBarrier(VkCommandBuffer commandBuffer,
                            const VkImageMemoryBarrier *pImageMemoryBarriers)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   wrapper_loss_diag_command(wcb, "CmdPipelineBarrier");
    struct wrapper_device *device = wcb->device;
    VkImageMemoryBarrier stack[WRAPPER_CAP_STACK_ENTRIES];
    VkImageMemoryBarrier *capped = NULL;
@@ -5956,6 +6067,7 @@ wrapper_CmdWaitEvents(VkCommandBuffer commandBuffer, uint32_t eventCount,
                       const VkImageMemoryBarrier *pImageMemoryBarriers)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   wrapper_loss_diag_command(wcb, "CmdWaitEvents");
    struct wrapper_device *device = wcb->device;
    VkImageMemoryBarrier stack[WRAPPER_CAP_STACK_ENTRIES];
    VkImageMemoryBarrier *capped = NULL;
@@ -5982,6 +6094,7 @@ wrapper_CmdWaitEvents2(VkCommandBuffer commandBuffer, uint32_t eventCount,
                        const VkDependencyInfo *pDependencyInfos)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   wrapper_loss_diag_command(wcb, "CmdWaitEvents2");
    struct wrapper_device *device = wcb->device;
    VkDependencyInfo *deps = NULL;
    VkImageMemoryBarrier2 *capped = NULL;
@@ -6050,6 +6163,7 @@ wrapper_CmdCopyImage(VkCommandBuffer commandBuffer,
                      uint32_t regionCount, const VkImageCopy *pRegions)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   wrapper_loss_diag_command(wcb, "CmdCopyImage");
    struct wrapper_device *device = wcb->device;
    uint32_t src_drop = wrapper_image_mip_drop(device, srcImage);
    uint32_t dst_drop = wrapper_image_mip_drop(device, dstImage);
@@ -6100,6 +6214,7 @@ wrapper_CmdCopyImage2(VkCommandBuffer commandBuffer,
                       const VkCopyImageInfo2 *pCopyImageInfo)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   wrapper_loss_diag_command(wcb, "CmdCopyImage2");
    struct wrapper_device *device = wcb->device;
    uint32_t src_drop = wrapper_image_mip_drop(device, pCopyImageInfo->srcImage);
    uint32_t dst_drop = wrapper_image_mip_drop(device, pCopyImageInfo->dstImage);
@@ -6171,6 +6286,7 @@ wrapper_CmdClearColorImage(VkCommandBuffer commandBuffer, VkImage image,
                            const VkImageSubresourceRange *pRanges)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   wrapper_loss_diag_command(wcb, "CmdClearColorImage");
    struct wrapper_device *device = wcb->device;
    uint32_t mip_drop = wrapper_image_mip_drop(device, image);
    VkImageSubresourceRange stack[WRAPPER_CAP_STACK_ENTRIES];
@@ -6222,6 +6338,7 @@ wrapper_CmdCopyImageToBuffer(VkCommandBuffer commandBuffer, VkImage srcImage,
                              const VkBufferImageCopy *pRegions)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   wrapper_loss_diag_command(wcb, "CmdCopyImageToBuffer");
    struct wrapper_device *device = wcb->device;
    uint32_t mip_drop = wrapper_image_mip_drop(device, srcImage);
    VkBufferImageCopy stack[WRAPPER_CAP_STACK_ENTRIES];
@@ -6254,6 +6371,7 @@ wrapper_CmdCopyImageToBuffer2(VkCommandBuffer commandBuffer,
                               const VkCopyImageToBufferInfo2 *pInfo)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   wrapper_loss_diag_command(wcb, "CmdCopyImageToBuffer2");
    struct wrapper_device *device = wcb->device;
    uint32_t mip_drop = wrapper_image_mip_drop(device, pInfo->srcImage);
    VkCopyImageToBufferInfo2 capped_info;
