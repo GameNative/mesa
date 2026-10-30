@@ -22,6 +22,7 @@
 #include "vk_util.h"
 #include "util/list.h"
 #include "util/simple_mtx.h"
+#include "util/u_atomic.h"
 
 const struct vk_device_extension_table wrapper_device_extensions =
 {
@@ -1618,6 +1619,15 @@ if (pdf2 && pdf2->features.f) { \
    /* The fallback create with a NULL pNext drops the deviceFault feature, so
     * only treat fault reporting as usable when the primary create succeeded. */
    device->device_fault_enabled = enable_device_fault && !used_fallback_create;
+   const char *loss_app = physical_device->instance->vk.app_info.app_name;
+   device->loss_diag = loss_app && !strcmp(loss_app, "Content Warning.exe");
+   if (device->loss_diag)
+      fprintf(stderr, "[GN-WRAPPER-LOSS-v1] enabled native=%s api=%u "
+              "device_fault=%u timeline=%u\n",
+              physical_device->properties2.properties.deviceName,
+              physical_device->properties2.properties.apiVersion,
+              device->device_fault_enabled,
+              physical_device->base_supported_features.timelineSemaphore);
 
    device->emulate_null_descriptor =
       physical_device->vk.supported_extensions.EXT_robustness2 &&
@@ -4585,20 +4595,27 @@ wrapper_log_device_fault(struct wrapper_device *device)
    PFN_vkGetDeviceFaultInfoEXT get_fault_info =
       device->dispatch_table.GetDeviceFaultInfoEXT;
 
-   if (!device->device_fault_enabled || !get_fault_info)
+   if (!device->device_fault_enabled || !get_fault_info) {
+      if (device->loss_diag)
+         fprintf(stderr, "[GN-WRAPPER-LOSS-v1] native fault report unavailable\n");
       return;
+   }
 
    static int diag = -1;
    if (diag == -1)
       diag = getenv("WRAPPER_DIAG") ? atoi(getenv("WRAPPER_DIAG")) : 0;
-   if (!diag)
+   if (!diag && !device->loss_diag)
       return;
 
    VkDeviceFaultCountsEXT counts = {
       .sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT,
    };
-   if (get_fault_info(device->dispatch_handle, &counts, NULL) != VK_SUCCESS)
+   VkResult fault_result = get_fault_info(device->dispatch_handle, &counts, NULL);
+   if (fault_result != VK_SUCCESS) {
+      if (device->loss_diag)
+         fprintf(stderr, "[GN-WRAPPER-LOSS-v1] fault counts result=%d\n", fault_result);
       return;
+   }
 
    VkDeviceFaultInfoEXT info = {
       .sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT,
@@ -4609,11 +4626,18 @@ wrapper_log_device_fault(struct wrapper_device *device)
    if (counts.vendorInfoCount)
       info.pVendorInfos =
          calloc(counts.vendorInfoCount, sizeof(VkDeviceFaultVendorInfoEXT));
+   if ((counts.addressInfoCount && !info.pAddressInfos) ||
+       (counts.vendorInfoCount && !info.pVendorInfos)) {
+      free(info.pAddressInfos);
+      free(info.pVendorInfos);
+      return;
+   }
    /* We don't consume the opaque vendor crash dump. */
    counts.vendorBinarySize = 0;
 
 #define DF(...) fprintf(stderr, "[WRAPPER_DIAG] " __VA_ARGS__)
-   if (get_fault_info(device->dispatch_handle, &counts, &info) == VK_SUCCESS) {
+   fault_result = get_fault_info(device->dispatch_handle, &counts, &info);
+   if (fault_result == VK_SUCCESS) {
       DF("==== VK_ERROR_DEVICE_LOST: GPU fault report ====\n");
       DF("  description: %s\n", info.description);
 
@@ -4634,11 +4658,64 @@ wrapper_log_device_fault(struct wrapper_device *device)
             (unsigned long long)v->vendorFaultData);
       }
       DF("================================================\n");
+   } else if (device->loss_diag) {
+      fprintf(stderr, "[GN-WRAPPER-LOSS-v1] fault info result=%d\n", fault_result);
    }
 #undef DF
 
    free(info.pAddressInfos);
    free(info.pVendorInfos);
+}
+
+/* The base ICD may first report asynchronous loss from a host wait, after a
+ * successful submit. Do not change timeouts, queue ordering or return values. */
+static bool
+wrapper_loss_diag_first(struct wrapper_device *device, VkResult result)
+{
+   return device->loss_diag && result == VK_ERROR_DEVICE_LOST &&
+          p_atomic_cmpxchg(&device->loss_diag_reported, 0, 1) == 0;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+wrapper_WaitSemaphores(VkDevice _device, const VkSemaphoreWaitInfo *info,
+                       uint64_t timeout)
+{
+   VK_FROM_HANDLE(wrapper_device, device, _device);
+   uint32_t seq = device->loss_diag ?
+      p_atomic_inc_return(&device->loss_diag_waits) : 0;
+   VkResult result = device->dispatch_table.WaitSemaphores(
+      device->dispatch_handle, info, timeout);
+   bool first_loss = wrapper_loss_diag_first(device, result);
+   if ((seq && seq <= 8) || first_loss) {
+      fprintf(stderr, "[GN-WRAPPER-LOSS-v1] WaitSemaphores device=%p seq=%u "
+              "submits_entered=%u count=%u flags=%u timeout=%llu result=%d\n",
+              (void *)device->dispatch_handle, seq,
+              p_atomic_read(&device->loss_diag_submits), info->semaphoreCount,
+              info->flags, (unsigned long long)timeout, result);
+      for (uint32_t i = 0; i < MIN2(info->semaphoreCount, 4); i++)
+         fprintf(stderr, "[GN-WRAPPER-LOSS-v1] wait[%u] semaphore=0x%llx value=%llu\n",
+                 i, (unsigned long long)(uintptr_t)info->pSemaphores[i],
+                 (unsigned long long)info->pValues[i]);
+   }
+   if (first_loss)
+      wrapper_log_device_fault(device);
+   return result;
+}
+
+static void
+wrapper_loss_diag_submit(struct wrapper_queue *queue, const char *op,
+                         uint32_t seq, uint32_t batches, uint32_t commands,
+                         VkResult result)
+{
+   struct wrapper_device *device = queue->device;
+   bool first_loss = wrapper_loss_diag_first(device, result);
+   if ((seq && seq <= 8) || first_loss)
+      fprintf(stderr, "[GN-WRAPPER-LOSS-v1] %s device=%p queue=%p seq=%u "
+              "batches=%u commands=%u result=%d\n", op,
+              (void *)device->dispatch_handle, (void *)queue->dispatch_handle,
+              seq, batches, commands, result);
+   if (first_loss || (!device->loss_diag && result == VK_ERROR_DEVICE_LOST))
+      wrapper_log_device_fault(device);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -4652,6 +4729,12 @@ wrapper_QueueSubmit(VkQueue _queue, uint32_t submitCount,
    VkSubmitInfo wrapper_submits[submitCount];
    VkCommandBuffer *command_buffers;
    VkResult result;
+
+   uint32_t seq = queue->device->loss_diag ?
+      p_atomic_inc_return(&queue->device->loss_diag_submits) : 0;
+   uint32_t commands = 0;
+   for (uint32_t i = 0; i < submitCount; i++)
+      commands += pSubmits[i].commandBufferCount;
 
    struct wrapper_fence *wf = get_wrapper_fence_from_handle(queue->device, fence);
 
@@ -4679,8 +4762,7 @@ wrapper_QueueSubmit(VkQueue _queue, uint32_t submitCount,
    if (serialise)
       simple_mtx_unlock(&queue->device->query_reset_mutex);
 
-   if (result == VK_ERROR_DEVICE_LOST)
-      wrapper_log_device_fault(queue->device);
+   wrapper_loss_diag_submit(queue, "QueueSubmit", seq, submitCount, commands, result);
 
    for (int i = 0; i < submitCount; i++)
       free((void *)wrapper_submits[i].pCommandBuffers);
@@ -4699,6 +4781,12 @@ wrapper_QueueSubmit2(VkQueue _queue, uint32_t submitCount,
    VkSubmitInfo2 wrapper_submits[submitCount];
    VkCommandBufferSubmitInfo *command_buffers;
    VkResult result;
+
+   uint32_t seq = queue->device->loss_diag ?
+      p_atomic_inc_return(&queue->device->loss_diag_submits) : 0;
+   uint32_t commands = 0;
+   for (uint32_t i = 0; i < submitCount; i++)
+      commands += pSubmits[i].commandBufferInfoCount;
 
    struct wrapper_fence *wf = get_wrapper_fence_from_handle(queue->device, fence);
 
@@ -4878,8 +4966,7 @@ legacy_submit_cleanup:
    if (serialise)
       simple_mtx_unlock(&queue->device->query_reset_mutex);
 
-   if (result == VK_ERROR_DEVICE_LOST)
-      wrapper_log_device_fault(queue->device);
+   wrapper_loss_diag_submit(queue, "QueueSubmit2", seq, submitCount, commands, result);
 
    for (int i = 0; i < submitCount; i++)
       free((void *)wrapper_submits[i].pCommandBufferInfos);
