@@ -5403,6 +5403,8 @@ wrapper_bcn_staging_create(struct wrapper_device *device, VkDeviceSize upload_si
    VkResult res;
    struct wrapper_buffer *staging_wb = vk_object_zalloc(&device->vk,
       &device->vk.alloc, sizeof(struct wrapper_buffer), VK_OBJECT_TYPE_BUFFER);
+   if (!staging_wb)
+      return NULL;
 
    VkBufferCreateInfo buffer_create_info = {
       .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
@@ -5417,14 +5419,41 @@ wrapper_bcn_staging_create(struct wrapper_device *device, VkDeviceSize upload_si
 
    if (res != VK_SUCCESS) {
       WRAPPER_LOG(error, "Failed to create staging buffer, res %d", res);
-      return NULL;
+      goto fail;
+   }
+
+   VkMemoryRequirements requirements;
+   device->dispatch_table.GetBufferMemoryRequirements(device->dispatch_handle,
+      staging_wb->dispatch_handle, &requirements);
+
+   /* Even a one-texel mip must use the driver's allocation size and a
+    * memory type supported by this buffer. Prefer coherent host memory. */
+   const VkPhysicalDeviceMemoryProperties *props = &device->physical->memory_properties;
+   uint32_t memory_type = UINT32_MAX;
+   for (uint32_t i = 0; i < props->memoryTypeCount; i++) {
+      VkMemoryPropertyFlags flags = props->memoryTypes[i].propertyFlags;
+      if (!(requirements.memoryTypeBits & (1u << i)) ||
+          !(flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) ||
+          (flags & (VK_MEMORY_PROPERTY_PROTECTED_BIT |
+                    VK_MEMORY_PROPERTY_DEVICE_COHERENT_BIT_AMD |
+                    VK_MEMORY_PROPERTY_DEVICE_UNCACHED_BIT_AMD)))
+         continue;
+      if (memory_type == UINT32_MAX)
+         memory_type = i;
+      if (flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) {
+         memory_type = i;
+         break;
+      }
+   }
+   if (memory_type == UINT32_MAX) {
+      WRAPPER_LOG(error, "No compatible host-visible staging buffer memory");
+      goto fail;
    }
 
    VkMemoryAllocateInfo allocate_info = {
       .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-      .allocationSize = upload_size,
-      .memoryTypeIndex = wrapper_select_device_memory_type(device,
-         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT),
+      .allocationSize = requirements.size,
+      .memoryTypeIndex = memory_type,
    };
 
    res = device->dispatch_table.AllocateMemory(device->dispatch_handle,
@@ -5432,7 +5461,7 @@ wrapper_bcn_staging_create(struct wrapper_device *device, VkDeviceSize upload_si
 
    if (res != VK_SUCCESS) {
       WRAPPER_LOG(error, "Failed to allocate staging buffer memory, res %d", res);
-      return NULL;
+      goto fail;
    }
 
    res = device->dispatch_table.BindBufferMemory(device->dispatch_handle,
@@ -5440,18 +5469,28 @@ wrapper_bcn_staging_create(struct wrapper_device *device, VkDeviceSize upload_si
 
    if (res != VK_SUCCESS) {
       WRAPPER_LOG(error, "Failed to bind staging buffer memory, res %d", res);
-      return NULL;
+      goto fail;
    }
 
    res = device->dispatch_table.MapMemory(device->dispatch_handle,
-      staging_wb->memory, 0, upload_size, 0, &staging_wb->mapped_address);
+      staging_wb->memory, 0, VK_WHOLE_SIZE, 0, &staging_wb->mapped_address);
 
    if (res != VK_SUCCESS) {
       WRAPPER_LOG(error, "Failed to map staging buffer memory, res %d", res);
-      return NULL;
+      goto fail;
    }
 
    return staging_wb;
+
+fail:
+   if (staging_wb->dispatch_handle)
+      device->dispatch_table.DestroyBuffer(device->dispatch_handle,
+         staging_wb->dispatch_handle, NULL);
+   if (staging_wb->memory)
+      device->dispatch_table.FreeMemory(device->dispatch_handle,
+         staging_wb->memory, NULL);
+   vk_object_free(&device->vk, &device->vk.alloc, staging_wb);
+   return NULL;
 }
 
 /* Copy a tightly packed staging upload into the image; freed with the command
@@ -5462,12 +5501,29 @@ wrapper_bcn_staging_submit(struct wrapper_command_buffer *wcb,
                            struct wrapper_buffer *staging_wb, VkImage dstImage,
                            VkImageLayout dstLayout, VkBufferImageCopy copy_region)
 {
+   /* VK_WHOLE_SIZE covers the allocation's final non-coherent atom. Flushing
+    * coherent memory is also valid; unmapping alone does not flush writes. */
+   VkMappedMemoryRange range = {
+      .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+      .memory = staging_wb->memory,
+      .offset = 0,
+      .size = VK_WHOLE_SIZE,
+   };
+   VkResult res = device->dispatch_table.FlushMappedMemoryRanges(
+      device->dispatch_handle, 1, &range);
+   device->dispatch_table.UnmapMemory(device->dispatch_handle, staging_wb->memory);
+   staging_wb->mapped_address = NULL;
+   if (res != VK_SUCCESS) {
+      WRAPPER_LOG(error, "Failed to flush staging buffer memory, res %d", res);
+   }
+
    copy_region.bufferOffset = 0;
    copy_region.bufferRowLength = 0;
    copy_region.bufferImageHeight = 0;
 
-   device->dispatch_table.CmdCopyBufferToImage(wcb->dispatch_handle,
-      staging_wb->dispatch_handle, dstImage, dstLayout, 1, &copy_region);
+   if (res == VK_SUCCESS)
+      device->dispatch_table.CmdCopyBufferToImage(wcb->dispatch_handle,
+         staging_wb->dispatch_handle, dstImage, dstLayout, 1, &copy_region);
 
    staging_wb->wcb = wcb;
    staging_wb->device = device;
