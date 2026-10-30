@@ -84,6 +84,10 @@ enum { BCN_NONE, BCN_QUEUED, BCN_BUILDING, BCN_BUILT, BCN_TESTED, BCN_FAILED };
 struct wrapper_device {
    struct vk_device vk;
 
+   /* Bounded startup capture for the Neon Inferno Tegra SIGKILL report. */
+   bool startup_diag;
+   unsigned startup_diag_calls[5];
+
    VkDevice dispatch_handle;
    simple_mtx_t resource_mutex;
    struct list_head command_buffer_list;

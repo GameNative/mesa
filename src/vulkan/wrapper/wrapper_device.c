@@ -2,6 +2,7 @@
 #include <stdarg.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <strings.h>
 
 #include "wrapper_private.h"
 #include "wrapper_log.h"
@@ -22,6 +23,42 @@
 #include "vk_util.h"
 #include "util/list.h"
 #include "util/simple_mtx.h"
+#include "util/u_atomic.h"
+#include "util/os_time.h"
+
+/* The existing WRAPPER_DIAG capability dump runs only at the end of device
+ * creation and can redirect the very log the app recovers after SIGKILL.
+ * Keep this capture on the normal log, with no environment setup, and leave
+ * every Vulkan argument, result and wait unchanged. */
+static void
+wrapper_startup_log(struct wrapper_device *device, const char *fmt, ...)
+{
+   if (!device->startup_diag)
+      return;
+   char line[512];
+   va_list ap;
+   va_start(ap, fmt);
+   vsnprintf(line, sizeof(line), fmt, ap);
+   va_end(ap);
+   dprintf(STDERR_FILENO, "[GN-WRAPPER-STARTUP-v1] pid=%d dev=%p t=%llu %s\n",
+           (int)getpid(), (void *)device,
+           (unsigned long long)os_time_get_nano(), line);
+}
+
+enum {
+   STARTUP_RESET, STARTUP_SUBMIT, STARTUP_SWAPCHAIN, STARTUP_ACQUIRE,
+   STARTUP_PRESENT,
+};
+
+static unsigned
+wrapper_startup_call(struct wrapper_device *device, unsigned slot)
+{
+   if (!device->startup_diag ||
+       p_atomic_read(&device->startup_diag_calls[slot]) >= 4)
+      return 0;
+   unsigned id = p_atomic_inc_return(&device->startup_diag_calls[slot]);
+   return id <= 4 ? id : 0;
+}
 
 const struct vk_device_extension_table wrapper_device_extensions =
 {
@@ -496,6 +533,9 @@ wrapper_ResetQueryPool(VkDevice _device, VkQueryPool queryPool,
    if (!queryCount || !device->query_reset_queue)
       return;
 
+   unsigned diag = wrapper_startup_call(device, STARTUP_RESET);
+   if (diag)
+      wrapper_startup_log(device, "reset #%u enter count=%u", diag, queryCount);
    simple_mtx_lock(&device->query_reset_mutex);
    if (vk_device_is_lost(&device->vk)) {
       simple_mtx_unlock(&device->query_reset_mutex);
@@ -518,21 +558,31 @@ wrapper_ResetQueryPool(VkDevice _device, VkQueryPool queryPool,
    result = dt->ResetFences(device->dispatch_handle, 1, &device->query_reset_fence);
    if (result != VK_SUCCESS)
       goto fail;
+   if (diag)
+      wrapper_startup_log(device, "reset #%u native-submit enter", diag);
    result = dt->QueueSubmit(device->query_reset_queue, 1, &(VkSubmitInfo) {
       .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
       .commandBufferCount = 1,
       .pCommandBuffers = &device->query_reset_cmd,
    }, device->query_reset_fence);
+   if (diag)
+      wrapper_startup_log(device, "reset #%u native-submit leave result=%d", diag, result);
    if (result != VK_SUCCESS)
       goto fail;
+   if (diag)
+      wrapper_startup_log(device, "reset #%u fence-wait enter", diag);
    result = dt->WaitForFences(device->dispatch_handle, 1,
                               &device->query_reset_fence, VK_TRUE, UINT64_MAX);
+   if (diag)
+      wrapper_startup_log(device, "reset #%u fence-wait leave result=%d", diag, result);
    if (result != VK_SUCCESS)
       goto fail;
    simple_mtx_unlock(&device->query_reset_mutex);
    return;
 
 fail:
+   if (diag)
+      wrapper_startup_log(device, "reset #%u failed result=%d", diag, result);
    vk_device_set_lost(&device->vk, "Host query reset emulation failed: %d", result);
    simple_mtx_unlock(&device->query_reset_mutex);
 }
@@ -1317,6 +1367,19 @@ wrapper_CreateDevice(VkPhysicalDevice physicalDevice,
    if (!device)
       return vk_error(physical_device, VK_ERROR_OUT_OF_HOST_MEMORY);
 
+   const char *app = physical_device->instance->vk.app_info.app_name;
+   if (app) {
+      const char *base = strrchr(app, '\\');
+      if (base) app = base + 1;
+      base = strrchr(app, '/');
+      if (base) app = base + 1;
+      device->startup_diag = !strcasecmp(app, "NEON INFERNO.exe") &&
+         physical_device->properties2.properties.vendorID == 0x10de;
+   }
+   wrapper_startup_log(device, "create enter base-api=%u driver=%u",
+                       physical_device->properties2.properties.apiVersion,
+                       physical_device->properties2.properties.driverVersion);
+
    list_inithead(&device->command_buffer_list);
    list_inithead(&device->device_memory_list);
    list_inithead(&device->image_list);
@@ -1562,9 +1625,13 @@ if (pdf2 && pdf2->features.f) { \
        !(emulate_query_reset && !device->query_reset_shared_queue))
       wrapper_bcn_reserve_queue(device, &wrapper_create_info, &bcn_queues, &bcn_priorities);
 
+   wrapper_startup_log(device, "create native enter queues=%u extensions=%u",
+                       wrapper_create_info.queueCreateInfoCount,
+                       wrapper_create_info.enabledExtensionCount);
    result = physical_device->dispatch_table.CreateDevice(
       physical_device->dispatch_handle, &wrapper_create_info,
          pAllocator, &device->dispatch_handle);
+   wrapper_startup_log(device, "create native leave result=%d", result);
    wrapper_core13_free_device_create(core13_storage);
 
    if (result != VK_SUCCESS) {
@@ -1608,7 +1675,9 @@ if (pdf2 && pdf2->features.f) { \
       wrapper_lower_missing_commands(device);
 
    if (emulate_query_reset) {
+      wrapper_startup_log(device, "create query-reset-init enter");
       result = wrapper_query_reset_init(device);
+      wrapper_startup_log(device, "create query-reset-init leave result=%d", result);
       if (result != VK_SUCCESS) {
          wrapper_DestroyDevice(wrapper_device_to_handle(device), &device->vk.alloc);
          return vk_error(physical_device, result);
@@ -1624,7 +1693,9 @@ if (pdf2 && pdf2->features.f) { \
       !physical_device->base_supported_features.nullDescriptor;
    if (device->emulate_null_descriptor) {
       WRAPPER_LOG(info, "Emulating nullDescriptor with canonical zero resources");
+      wrapper_startup_log(device, "create null-resources enter");
       wrapper_create_null_resources(device);
+      wrapper_startup_log(device, "create null-resources leave");
    }
 
    device->emulate_imageless_framebuffer =
@@ -1655,7 +1726,9 @@ if (pdf2 && pdf2->features.f) { \
       }
    }
 
+   wrapper_startup_log(device, "create app-queues enter");
    result = wrapper_create_device_queue(device, pCreateInfo);
+   wrapper_startup_log(device, "create app-queues leave result=%d", result);
    if (result != VK_SUCCESS) {
       wrapper_DestroyDevice(wrapper_device_to_handle(device),
                             &device->vk.alloc);
@@ -1679,6 +1752,7 @@ if (pdf2 && pdf2->features.f) { \
                      device->dispatch_table.GetBufferDeviceAddress;
    bcn_set_astc_hdr(bc6h_hdr && !used_fallback_create);
    if (physical_device->emulate_bcn > 1) {
+      wrapper_startup_log(device, "create bcn-init enter");
       char storage[512];
       bcn_describe_storage(storage, sizeof(storage));
       wrapper_diag_append("[BCN] storage %s\n", storage);
@@ -1693,14 +1767,69 @@ if (pdf2 && pdf2->features.f) { \
       wrapper_bcn_gpu_init(device, pCreateInfo->queueCreateInfoCount ?
          pCreateInfo->pQueueCreateInfos[0].queueFamilyIndex : UINT32_MAX);
       wrapper_bcn_gpu_prebuild(device);
+      wrapper_startup_log(device, "create bcn-init leave");
    }
    if (bc6h_hdr && !used_fallback_create)
       WRAPPER_LOG(info, "BCn policy: BC6H stored as ASTC 4x4 HDR");
+   wrapper_startup_log(device, "create capability-report enter");
    wrapper_emit_diag(physical_device, pCreateInfo, VK_SUCCESS);
+   wrapper_startup_log(device, "create leave result=%d", VK_SUCCESS);
 
    *pDevice = wrapper_device_to_handle(device);
 
    return VK_SUCCESS;
+}
+
+/* Call the same WSI entrypoints directly, not the wrapper dispatch table
+ * (which now points at these capture functions). */
+VKAPI_ATTR VkResult VKAPI_CALL
+wrapper_CreateSwapchainKHR(VkDevice _device,
+                          const VkSwapchainCreateInfoKHR *info,
+                          const VkAllocationCallbacks *alloc,
+                          VkSwapchainKHR *swapchain)
+{
+   VK_FROM_HANDLE(wrapper_device, device, _device);
+   unsigned diag = wrapper_startup_call(device, STARTUP_SWAPCHAIN);
+   if (diag)
+      wrapper_startup_log(device, "swapchain #%u enter size=%ux%u images=%u format=%u mode=%u",
+                          diag, info->imageExtent.width, info->imageExtent.height,
+                          info->minImageCount, info->imageFormat, info->presentMode);
+   VkResult result = wsi_device_entrypoints.CreateSwapchainKHR(
+      _device, info, alloc, swapchain);
+   if (diag)
+      wrapper_startup_log(device, "swapchain #%u leave result=%d", diag, result);
+   return result;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+wrapper_AcquireNextImage2KHR(VkDevice _device,
+                           const VkAcquireNextImageInfoKHR *info,
+                           uint32_t *image_index)
+{
+   VK_FROM_HANDLE(wrapper_device, device, _device);
+   unsigned diag = wrapper_startup_call(device, STARTUP_ACQUIRE);
+   if (diag)
+      wrapper_startup_log(device, "acquire #%u enter timeout=%llu", diag,
+                          (unsigned long long)info->timeout);
+   VkResult result = wsi_device_entrypoints.AcquireNextImage2KHR(
+      _device, info, image_index);
+   if (diag)
+      wrapper_startup_log(device, "acquire #%u leave result=%d", diag, result);
+   return result;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+wrapper_QueuePresentKHR(VkQueue _queue, const VkPresentInfoKHR *info)
+{
+   VK_FROM_HANDLE(wrapper_queue, queue, _queue);
+   unsigned diag = wrapper_startup_call(queue->device, STARTUP_PRESENT);
+   if (diag)
+      wrapper_startup_log(queue->device, "present #%u enter swapchains=%u waits=%u",
+                          diag, info->swapchainCount, info->waitSemaphoreCount);
+   VkResult result = wsi_device_entrypoints.QueuePresentKHR(_queue, info);
+   if (diag)
+      wrapper_startup_log(queue->device, "present #%u leave result=%d", diag, result);
+   return result;
 }
 
 static void 
@@ -4646,6 +4775,9 @@ wrapper_QueueSubmit(VkQueue _queue, uint32_t submitCount,
                     const VkSubmitInfo* pSubmits, VkFence fence)
 {
    VK_FROM_HANDLE(wrapper_queue, queue, _queue);
+   unsigned diag = wrapper_startup_call(queue->device, STARTUP_SUBMIT);
+   if (diag)
+      wrapper_startup_log(queue->device, "submit #%u enter batches=%u", diag, submitCount);
    if (queue->device->query_reset_queue && vk_device_is_lost(&queue->device->vk))
       return VK_ERROR_DEVICE_LOST;
    const bool serialise = wrapper_query_reset_owns_queue(queue);
@@ -4674,8 +4806,12 @@ wrapper_QueueSubmit(VkQueue _queue, uint32_t submitCount,
       wrapper_submits[i].pCommandBuffers = command_buffers;
    }
 
+   if (diag)
+      wrapper_startup_log(queue->device, "submit #%u native enter", diag);
    result = queue->device->dispatch_table.QueueSubmit(
       queue->dispatch_handle, submitCount, wrapper_submits, fence);
+   if (diag)
+      wrapper_startup_log(queue->device, "submit #%u native leave result=%d", diag, result);
    if (serialise)
       simple_mtx_unlock(&queue->device->query_reset_mutex);
 
