@@ -1141,6 +1141,26 @@ wrapper_driver_id_str(VkDriverId id)
  * failing game on any device can be diagnosed from the report alone. Pair it
  * with app-side VKD3D_DEBUG=warn / DXVK_LOG_LEVEL=info / WINEDEBUG=+vulkan. */
 static int wrapper_diag_stderr = -1;
+static bool wrapper_diag_capture;
+
+static void
+wrapper_diag_autostart(struct wrapper_physical_device *pdev)
+{
+   const char *app = pdev->instance->vk.app_info.app_name;
+   if (!app || strcmp(app, "Wheel World.exe") ||
+       pdev->driver_properties.driverID != VK_DRIVER_ID_IMAGINATION_PROPRIETARY)
+      return;
+
+   /* This diagnostic package must work without a launcher environment change.
+    * Keep stderr connected to the launcher: component runs may not request the
+    * separate wrapper diagnostic attachment. No rendering options change. */
+   wrapper_diag_capture = true;
+   setenv("WRAPPER_DIAG", "1", 1);
+   fprintf(stderr, "[WRAPPER_DIAG] wheel-world-wrapper-diag-v1: "
+                   "device creation entered; driver=%s\n",
+           pdev->properties2.properties.deviceName);
+   fflush(stderr);
+}
 
 static void
 wrapper_emit_diag(struct wrapper_physical_device *pdev,
@@ -1188,7 +1208,8 @@ wrapper_emit_diag(struct wrapper_physical_device *pdev,
    {
       const char *e = pdev->instance->vk.app_info.engine_name;
       static int redirected = 0;
-      if (!redirected && e && (strstr(e, "DXVK") || strstr(e, "vkd3d"))) {
+      if (!wrapper_diag_capture && !redirected && e &&
+          (strstr(e, "DXVK") || strstr(e, "vkd3d"))) {
          redirected = 1;
          int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
          if (fd >= 0) {
@@ -1202,7 +1223,12 @@ wrapper_emit_diag(struct wrapper_physical_device *pdev,
       }
    }
 
-#define D(...) fprintf(stderr, "[WRAPPER_DIAG] " __VA_ARGS__)
+#define D(...) do { \
+   if (wrapper_diag_capture) \
+      wrapper_diag_append("[WRAPPER_DIAG] " __VA_ARGS__); \
+   else \
+      fprintf(stderr, "[WRAPPER_DIAG] " __VA_ARGS__); \
+} while (0)
 
    const VkPhysicalDeviceProperties *p = &pdev->properties2.properties;
    const char *eng = pdev->instance->vk.app_info.engine_name
@@ -1293,6 +1319,7 @@ wrapper_CreateDevice(VkPhysicalDevice physicalDevice,
                      VkDevice* pDevice)
 {
    VK_FROM_HANDLE(wrapper_physical_device, physical_device, physicalDevice);
+   wrapper_diag_autostart(physical_device);
    const char *wrapper_enable_extensions[VK_DEVICE_EXTENSION_COUNT];
    uint32_t wrapper_enable_extension_count = 0;
    VkDeviceCreateInfo wrapper_create_info = *pCreateInfo;
@@ -1565,6 +1592,10 @@ if (pdf2 && pdf2->features.f) { \
    result = physical_device->dispatch_table.CreateDevice(
       physical_device->dispatch_handle, &wrapper_create_info,
          pAllocator, &device->dispatch_handle);
+   if (wrapper_diag_capture)
+      wrapper_diag_append("[WRAPPER_DIAG] primary vkCreateDevice result=%d "
+                          "featureChain=%d safeCreate=%d\n", result,
+                          wrapper_create_info.pNext != NULL, wrapper_safe_create_device);
    wrapper_core13_free_device_create(core13_storage);
 
    if (result != VK_SUCCESS) {
@@ -1580,6 +1611,8 @@ if (pdf2 && pdf2->features.f) { \
          result = physical_device->dispatch_table.CreateDevice(
             physical_device->dispatch_handle, &wrapper_create_info,
                pAllocator, &device->dispatch_handle);
+         if (wrapper_diag_capture)
+            wrapper_diag_append("[WRAPPER_DIAG] NULL-chain retry result=%d\n", result);
       }
       
       if (result != VK_SUCCESS) {
@@ -5370,6 +5403,8 @@ wrapper_bcn_staging_create(struct wrapper_device *device, VkDeviceSize upload_si
    VkResult res;
    struct wrapper_buffer *staging_wb = vk_object_zalloc(&device->vk,
       &device->vk.alloc, sizeof(struct wrapper_buffer), VK_OBJECT_TYPE_BUFFER);
+   if (!staging_wb)
+      return NULL;
 
    VkBufferCreateInfo buffer_create_info = {
       .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
@@ -5384,14 +5419,41 @@ wrapper_bcn_staging_create(struct wrapper_device *device, VkDeviceSize upload_si
 
    if (res != VK_SUCCESS) {
       WRAPPER_LOG(error, "Failed to create staging buffer, res %d", res);
-      return NULL;
+      goto fail;
+   }
+
+   VkMemoryRequirements requirements;
+   device->dispatch_table.GetBufferMemoryRequirements(device->dispatch_handle,
+      staging_wb->dispatch_handle, &requirements);
+
+   /* Even a one-texel mip must use the driver's allocation size and a
+    * memory type supported by this buffer. Prefer coherent host memory. */
+   const VkPhysicalDeviceMemoryProperties *props = &device->physical->memory_properties;
+   uint32_t memory_type = UINT32_MAX;
+   for (uint32_t i = 0; i < props->memoryTypeCount; i++) {
+      VkMemoryPropertyFlags flags = props->memoryTypes[i].propertyFlags;
+      if (!(requirements.memoryTypeBits & (1u << i)) ||
+          !(flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) ||
+          (flags & (VK_MEMORY_PROPERTY_PROTECTED_BIT |
+                    VK_MEMORY_PROPERTY_DEVICE_COHERENT_BIT_AMD |
+                    VK_MEMORY_PROPERTY_DEVICE_UNCACHED_BIT_AMD)))
+         continue;
+      if (memory_type == UINT32_MAX)
+         memory_type = i;
+      if (flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) {
+         memory_type = i;
+         break;
+      }
+   }
+   if (memory_type == UINT32_MAX) {
+      WRAPPER_LOG(error, "No compatible host-visible staging buffer memory");
+      goto fail;
    }
 
    VkMemoryAllocateInfo allocate_info = {
       .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-      .allocationSize = upload_size,
-      .memoryTypeIndex = wrapper_select_device_memory_type(device,
-         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT),
+      .allocationSize = requirements.size,
+      .memoryTypeIndex = memory_type,
    };
 
    res = device->dispatch_table.AllocateMemory(device->dispatch_handle,
@@ -5399,7 +5461,7 @@ wrapper_bcn_staging_create(struct wrapper_device *device, VkDeviceSize upload_si
 
    if (res != VK_SUCCESS) {
       WRAPPER_LOG(error, "Failed to allocate staging buffer memory, res %d", res);
-      return NULL;
+      goto fail;
    }
 
    res = device->dispatch_table.BindBufferMemory(device->dispatch_handle,
@@ -5407,18 +5469,28 @@ wrapper_bcn_staging_create(struct wrapper_device *device, VkDeviceSize upload_si
 
    if (res != VK_SUCCESS) {
       WRAPPER_LOG(error, "Failed to bind staging buffer memory, res %d", res);
-      return NULL;
+      goto fail;
    }
 
    res = device->dispatch_table.MapMemory(device->dispatch_handle,
-      staging_wb->memory, 0, upload_size, 0, &staging_wb->mapped_address);
+      staging_wb->memory, 0, VK_WHOLE_SIZE, 0, &staging_wb->mapped_address);
 
    if (res != VK_SUCCESS) {
       WRAPPER_LOG(error, "Failed to map staging buffer memory, res %d", res);
-      return NULL;
+      goto fail;
    }
 
    return staging_wb;
+
+fail:
+   if (staging_wb->dispatch_handle)
+      device->dispatch_table.DestroyBuffer(device->dispatch_handle,
+         staging_wb->dispatch_handle, NULL);
+   if (staging_wb->memory)
+      device->dispatch_table.FreeMemory(device->dispatch_handle,
+         staging_wb->memory, NULL);
+   vk_object_free(&device->vk, &device->vk.alloc, staging_wb);
+   return NULL;
 }
 
 /* Copy a tightly packed staging upload into the image; freed with the command
@@ -5429,12 +5501,29 @@ wrapper_bcn_staging_submit(struct wrapper_command_buffer *wcb,
                            struct wrapper_buffer *staging_wb, VkImage dstImage,
                            VkImageLayout dstLayout, VkBufferImageCopy copy_region)
 {
+   /* VK_WHOLE_SIZE covers the allocation's final non-coherent atom. Flushing
+    * coherent memory is also valid; unmapping alone does not flush writes. */
+   VkMappedMemoryRange range = {
+      .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+      .memory = staging_wb->memory,
+      .offset = 0,
+      .size = VK_WHOLE_SIZE,
+   };
+   VkResult res = device->dispatch_table.FlushMappedMemoryRanges(
+      device->dispatch_handle, 1, &range);
+   device->dispatch_table.UnmapMemory(device->dispatch_handle, staging_wb->memory);
+   staging_wb->mapped_address = NULL;
+   if (res != VK_SUCCESS) {
+      WRAPPER_LOG(error, "Failed to flush staging buffer memory, res %d", res);
+   }
+
    copy_region.bufferOffset = 0;
    copy_region.bufferRowLength = 0;
    copy_region.bufferImageHeight = 0;
 
-   device->dispatch_table.CmdCopyBufferToImage(wcb->dispatch_handle,
-      staging_wb->dispatch_handle, dstImage, dstLayout, 1, &copy_region);
+   if (res == VK_SUCCESS)
+      device->dispatch_table.CmdCopyBufferToImage(wcb->dispatch_handle,
+         staging_wb->dispatch_handle, dstImage, dstLayout, 1, &copy_region);
 
    staging_wb->wcb = wcb;
    staging_wb->device = device;
@@ -5511,8 +5600,8 @@ wrapper_bcn_cpu_copy_regions(struct wrapper_command_buffer *wcb,
          static int tex_diag = -1;
          if (tex_diag == -1)
             tex_diag = getenv("WRAPPER_DIAG") ? atoi(getenv("WRAPPER_DIAG")) : 0;
-         if (tex_diag) {
-            static int tex_n = 0;
+         static int tex_n = 0;
+         if (tex_diag && (!wrapper_diag_capture || tex_n < 128)) {
             struct wrapper_image *twi = get_wrapper_image_from_handle_locked(device, dstImage);
             VkFormat tgt = get_format_for_bcn(format);
             /* Write to stderr, which for a D3D process is redirected into the
@@ -5529,7 +5618,7 @@ wrapper_bcn_cpu_copy_regions(struct wrapper_command_buffer *wcb,
                   twi->info.extent.depth, twi->info.mipLevels, twi->info.tiling,
                   twi->info.usage, twi->info.flags);
             fprintf(stderr, "\n");
-            if (tex_n < 4) {
+            if (tex_n < 4 && !wrapper_diag_capture) {
                unsigned char *src = (unsigned char *)wb->mapped_address + offset;
                unsigned char *out = (unsigned char *)staging_wb->mapped_address;
                int ns = 96, no = (upload_size < 256) ? (int)upload_size : 256;
@@ -5540,6 +5629,8 @@ wrapper_bcn_cpu_copy_regions(struct wrapper_command_buffer *wcb,
                fprintf(stderr, "\n");
             }
             tex_n++;
+            if (wrapper_diag_capture && tex_n == 128)
+               fprintf(stderr, "[WRAPPER_DIAG] CPU texture record limit reached\n");
          }
       }
 
@@ -5617,6 +5708,8 @@ wrapper_bcn_do_copy(struct wrapper_command_buffer *wcb,
 int
 wrapper_diag_on(void)
 {
+   if (wrapper_diag_capture)
+      return 1;
    static int on = -1;
    if (on == -1)
       on = getenv("WRAPPER_DIAG") ? atoi(getenv("WRAPPER_DIAG")) : 0;
@@ -5628,6 +5721,18 @@ wrapper_diag_append(const char *fmt, ...)
 {
    if (!wrapper_diag_on())
       return;
+   /* Bound high-volume resource records, retaining capability/fault/status
+    * messages even after the texture budget is exhausted. */
+   if (wrapper_diag_capture &&
+       (!strncmp(fmt, "[COPY]", 6) || !strncmp(fmt, "[FMT]", 5))) {
+      static unsigned records;
+      unsigned n = __atomic_fetch_add(&records, 1, __ATOMIC_RELAXED);
+      if (n >= 512) {
+         if (n == 512)
+            fprintf(stderr, "[WRAPPER_DIAG] format/copy record limit reached\n");
+         return;
+      }
+   }
    /* BCn status lines also go to the stderr the process had before it was
     * redirected into the diag file, where the launcher log sees them */
    if (wrapper_diag_stderr >= 0 && !strncmp(fmt, "[BCN]", 5)) {
