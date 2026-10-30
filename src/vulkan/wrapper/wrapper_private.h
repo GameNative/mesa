@@ -121,6 +121,7 @@ struct wrapper_device {
    bool emulate_null_descriptor;
    bool device_fault_enabled;
    bool loss_diag;
+   bool poll_timeline_wait;
    uint32_t loss_diag_submits;
    uint32_t loss_diag_waits;
    uint32_t loss_diag_reported;

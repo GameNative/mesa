@@ -23,6 +23,7 @@
 #include "util/list.h"
 #include "util/simple_mtx.h"
 #include "util/u_atomic.h"
+#include "util/os_time.h"
 
 const struct vk_device_extension_table wrapper_device_extensions =
 {
@@ -1636,6 +1637,16 @@ if (pdf2 && pdf2->features.f) { \
    device->device_fault_enabled = enable_device_fault && !used_fallback_create;
    const char *loss_app = physical_device->instance->vk.app_info.app_name;
    device->loss_diag = loss_app && !strcmp(loss_app, "Content Warning.exe");
+   /* The legacy Mali host wait reports DEVICE_LOST on the first unsatisfied
+    * timeline wait, despite successful fence completion and counter queries.
+    * Keep the workaround limited to the observed app/driver generation. */
+   device->poll_timeline_wait = device->loss_diag &&
+      physical_device->driver_properties.driverID == VK_DRIVER_ID_ARM_PROPRIETARY &&
+      physical_device->properties2.properties.apiVersion < VK_API_VERSION_1_2 &&
+      physical_device->base_supported_features.timelineSemaphore &&
+      device->dispatch_table.GetSemaphoreCounterValue;
+   if (device->poll_timeline_wait)
+      fprintf(stderr, "[GN-WRAPPER-TIMELINE-v1] native counter polling enabled\n");
    if (device->loss_diag)
       fprintf(stderr, "[GN-WRAPPER-LOSS-v2] enabled native=%s api=%u "
               "device_fault=%u timeline=%u\n",
@@ -4750,6 +4761,42 @@ wrapper_GetSemaphoreCounterValue(VkDevice _device, VkSemaphore semaphore,
    return result;
 }
 
+/* Avoid the legacy host-wait entry point without inventing completion or
+ * swallowing device loss. Counters remain native, as do all signal/submit
+ * operations. A monotonic elapsed duration avoids deadline overflow for
+ * UINT64_MAX and very long finite waits. */
+static VkResult
+wrapper_poll_timeline_wait(struct wrapper_device *device,
+                           const VkSemaphoreWaitInfo *info, uint64_t timeout)
+{
+   const uint64_t start = os_time_get_nano();
+   const bool wait_any = info->flags & VK_SEMAPHORE_WAIT_ANY_BIT;
+
+   for (;;) {
+      bool all_ready = true;
+      for (uint32_t i = 0; i < info->semaphoreCount; i++) {
+         uint64_t value;
+         VkResult result = device->dispatch_table.GetSemaphoreCounterValue(
+            device->dispatch_handle, info->pSemaphores[i], &value);
+         if (result != VK_SUCCESS)
+            return result;
+         const bool ready = value >= info->pValues[i];
+         if (wait_any && ready)
+            return VK_SUCCESS;
+         all_ready &= ready;
+      }
+      if (all_ready)
+         return VK_SUCCESS;
+
+      const uint64_t elapsed = (uint64_t)os_time_get_nano() - start;
+      if (timeout != UINT64_MAX && elapsed >= timeout)
+         return VK_TIMEOUT;
+      const uint64_t remaining = timeout == UINT64_MAX ? UINT64_MAX : timeout - elapsed;
+      /* Yield between queries; round a sub-microsecond remainder up. */
+      os_time_sleep((MIN2(remaining, 1000000ull) + 999) / 1000);
+   }
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 wrapper_WaitSemaphores(VkDevice _device, const VkSemaphoreWaitInfo *info,
                        uint64_t timeout)
@@ -4757,8 +4804,9 @@ wrapper_WaitSemaphores(VkDevice _device, const VkSemaphoreWaitInfo *info,
    VK_FROM_HANDLE(wrapper_device, device, _device);
    uint32_t seq = device->loss_diag ?
       p_atomic_inc_return(&device->loss_diag_waits) : 0;
-   VkResult result = device->dispatch_table.WaitSemaphores(
-      device->dispatch_handle, info, timeout);
+   VkResult result = device->poll_timeline_wait ?
+      wrapper_poll_timeline_wait(device, info, timeout) :
+      device->dispatch_table.WaitSemaphores(device->dispatch_handle, info, timeout);
    bool first_loss = wrapper_loss_diag_first(device, result);
    if ((seq && seq <= 8) || first_loss) {
       fprintf(stderr, "[GN-WRAPPER-LOSS-v1] WaitSemaphores device=%p seq=%u "
