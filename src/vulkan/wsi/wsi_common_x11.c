@@ -1139,6 +1139,9 @@ struct x11_swapchain {
    uint32_t                                     sent_image_count;
 
    atomic_int                                   status;
+   bool                                         handoff_diag;
+   atomic_uint                                  diag_acquires;
+   atomic_uint                                  diag_queues;
    bool                                         copy_is_suboptimal;
    struct wsi_queue                             present_queue;
    struct wsi_queue                             acquire_queue;
@@ -1163,6 +1166,42 @@ struct x11_swapchain {
 };
 VK_DEFINE_NONDISP_HANDLE_CASTS(x11_swapchain, base.base, VkSwapchainKHR,
                                VK_OBJECT_TYPE_SWAPCHAIN_KHR)
+
+/* Bounded diagnostic for a black window despite continuing Vulkan presents.
+ * Sample the same X serial at send/complete/idle; do not change synchronization.
+ */
+static bool
+x11_handoff_sample(struct x11_swapchain *chain, uint64_t serial)
+{
+   return chain->handoff_diag && (serial <= 8 || serial % 60 == 0);
+}
+
+static void
+x11_handoff_window(struct x11_swapchain *chain)
+{
+   xcb_window_t window = chain->window;
+   for (unsigned level = 0; window && level < 4; level++) {
+      xcb_get_window_attributes_cookie_t ac = xcb_get_window_attributes(chain->conn, window);
+      xcb_get_geometry_cookie_t gc = xcb_get_geometry(chain->conn, window);
+      xcb_query_tree_cookie_t tc = xcb_query_tree(chain->conn, window);
+      xcb_get_window_attributes_reply_t *a = xcb_get_window_attributes_reply(chain->conn, ac, NULL);
+      xcb_get_geometry_reply_t *g = xcb_get_geometry_reply(chain->conn, gc, NULL);
+      xcb_query_tree_reply_t *t = xcb_query_tree_reply(chain->conn, tc, NULL);
+      fprintf(stderr, "[WSI_HANDOFF] window=%x level=%u map=%d override=%d xy=%d,%d size=%ux%u parent=%x children=%d\n",
+              window, level, a ? a->map_state : -1, a ? a->override_redirect : -1,
+              g ? g->x : 0, g ? g->y : 0, g ? g->width : 0, g ? g->height : 0,
+              t ? t->parent : 0, t ? xcb_query_tree_children_length(t) : -1);
+      if (t) {
+         xcb_window_t *children = xcb_query_tree_children(t);
+         for (int i = 0; i < MIN2(xcb_query_tree_children_length(t), 16); i++)
+            fprintf(stderr, "[WSI_HANDOFF] parent=%x child[%d]=%x\n", window, i, children[i]);
+      }
+      window = t ? t->parent : 0;
+      free(a);
+      free(g);
+      free(t);
+   }
+}
 
 static void x11_present_complete(struct x11_swapchain *swapchain,
                                  struct x11_image *image, uint32_t index)
@@ -1308,6 +1347,10 @@ x11_handle_dri3_present_event(struct x11_swapchain *chain,
    switch (event->evtype) {
    case XCB_PRESENT_CONFIGURE_NOTIFY: {
       xcb_present_configure_notify_event_t *config = (void *) event;
+      if (chain->handoff_diag)
+         fprintf(stderr, "[WSI_HANDOFF] configure t=%lld window=%x size=%ux%u flags=%x\n",
+                 (long long)os_time_get_nano(), chain->window,
+                 config->width, config->height, config->pixmap_flags);
       if (config->pixmap_flags & PresentWindowDestroyed)
          return VK_ERROR_SURFACE_LOST_KHR;
 
@@ -1323,6 +1366,9 @@ x11_handle_dri3_present_event(struct x11_swapchain *chain,
 
    case XCB_PRESENT_EVENT_IDLE_NOTIFY: {
       xcb_present_idle_notify_event_t *idle = (void *) event;
+      if (x11_handoff_sample(chain, idle->serial))
+         fprintf(stderr, "[WSI_HANDOFF] idle t=%lld window=%x serial=%u pixmap=%x\n",
+                 (long long)os_time_get_nano(), chain->window, idle->serial, idle->pixmap);
 
       assert(!chain->base.image_info.explicit_sync);
       for (unsigned i = 0; i < chain->base.image_count; i++) {
@@ -1339,6 +1385,11 @@ x11_handle_dri3_present_event(struct x11_swapchain *chain,
 
    case XCB_PRESENT_EVENT_COMPLETE_NOTIFY: {
       xcb_present_complete_notify_event_t *complete = (void *) event;
+      if (x11_handoff_sample(chain, complete->serial))
+         fprintf(stderr, "[WSI_HANDOFF] complete t=%lld window=%x serial=%u kind=%u mode=%u msc=%llu ust=%llu\n",
+                 (long long)os_time_get_nano(), chain->window, complete->serial,
+                 complete->kind, complete->mode, (unsigned long long)complete->msc,
+                 (unsigned long long)complete->ust);
       if (complete->kind == XCB_PRESENT_COMPLETE_KIND_PIXMAP) {
          unsigned i, j;
          for (i = 0; i < chain->base.image_count; i++) {
@@ -1442,6 +1493,10 @@ x11_present_to_x11_dri3(struct x11_swapchain *chain, uint32_t image_index,
 
    ++chain->send_sbc;
    uint32_t serial = (uint32_t)chain->send_sbc;
+   if (x11_handoff_sample(chain, serial))
+      fprintf(stderr, "[WSI_HANDOFF] send t=%lld window=%x serial=%u image=%u pixmap=%x mode=%d options=%x target_msc=%llu update=%x\n",
+              (long long)os_time_get_nano(), chain->window, serial, image_index,
+              image->pixmap, present_mode, options, (unsigned long long)target_msc, image->update_area);
 
    assert(image->present_queued_count < ARRAY_SIZE(image->pending_completions));
    image->pending_completions[image->present_queued_count++] =
@@ -1777,6 +1832,7 @@ x11_acquire_next_image(struct wsi_swapchain *anv_chain,
 {
    struct x11_swapchain *chain = (struct x11_swapchain *)anv_chain;
    uint64_t timeout = info->timeout;
+   int64_t diag_start = chain->handoff_diag ? os_time_get_nano() : 0;
 
    /* If the swapchain is in an error state, don't go any further. */
    VkResult result = x11_swapchain_read_status_atomic(chain);
@@ -1789,6 +1845,15 @@ x11_acquire_next_image(struct wsi_swapchain *anv_chain,
    } else {
       result = wsi_queue_pull(&chain->acquire_queue,
                               image_index, timeout);
+   }
+
+   if (chain->handoff_diag) {
+      unsigned n = atomic_fetch_add(&chain->diag_acquires, 1) + 1;
+      if (x11_handoff_sample(chain, n))
+         fprintf(stderr, "[WSI_HANDOFF] acquire t=%lld window=%x n=%u result=%d image=%u wait_ns=%lld\n",
+                 (long long)os_time_get_nano(), chain->window, n, result,
+                 result == VK_SUCCESS ? *image_index : UINT32_MAX,
+                 (long long)(os_time_get_nano() - diag_start));
    }
 
    if (result == VK_TIMEOUT)
@@ -1857,6 +1922,14 @@ x11_queue_present(struct wsi_swapchain *anv_chain,
    chain->images[image_index].present_id = present_id;
    /* With EXT_swapchain_maintenance1, the present mode can change per present. */
    chain->images[image_index].present_mode = chain->base.present_mode;
+
+   if (chain->handoff_diag) {
+      unsigned n = atomic_fetch_add(&chain->diag_queues, 1) + 1;
+      if (x11_handoff_sample(chain, n))
+         fprintf(stderr, "[WSI_HANDOFF] queue t=%lld window=%x n=%u image=%u mode=%d damage=%d\n",
+                 (long long)os_time_get_nano(), chain->window, n, image_index,
+                 chain->base.present_mode, chain->images[image_index].rectangle_count);
+   }
 
    wsi_queue_push(&chain->present_queue, image_index);
    return x11_swapchain_read_status_atomic(chain);
@@ -1998,6 +2071,7 @@ x11_manage_present_queue(void *state)
          break;
 
       VkPresentModeKHR present_mode = chain->images[image_index].present_mode;
+      int64_t diag_ready = chain->handoff_diag ? os_time_get_nano() : 0;
 
       if (x11_needs_wait_for_fences(chain->base.wsi, wsi_conn,
                                     present_mode) &&
@@ -2007,6 +2081,10 @@ x11_manage_present_queue(void *state)
          result = chain->base.wsi->WaitForFences(chain->base.device, 1,
                                                  &chain->base.fences[image_index],
                                                  true, UINT64_MAX);
+         if (x11_handoff_sample(chain, chain->send_sbc + 1))
+            fprintf(stderr, "[WSI_HANDOFF] render-ready t=%lld window=%x image=%u result=%d wait_ns=%lld\n",
+                    (long long)os_time_get_nano(), chain->window, image_index, result,
+                    (long long)(os_time_get_nano() - diag_ready));
          if (result != VK_SUCCESS) {
             result = VK_ERROR_OUT_OF_DATE_KHR;
             break;
@@ -2608,6 +2686,12 @@ x11_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
    if (chain == NULL)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
 
+   VK_FROM_HANDLE(vk_device, diag_device, device);
+   const char *diag_app = diag_device->physical->instance->app_info.app_name;
+   chain->handoff_diag = diag_app && !strcmp(diag_app, "AoK HD.exe");
+   atomic_init(&chain->diag_acquires, 0);
+   atomic_init(&chain->diag_queues, 0);
+
    int ret = mtx_init(&chain->present_progress_mutex, mtx_plain);
    if (ret != thrd_success) {
       vk_free(pAllocator, chain);
@@ -2643,7 +2727,13 @@ x11_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
    xcb_present_query_capabilities_cookie_t present_query_cookie;
    xcb_present_query_capabilities_reply_t *present_query_reply;
    present_query_cookie = xcb_present_query_capabilities(conn, window);
-   present_query_reply = xcb_present_query_capabilities_reply(conn, present_query_cookie, NULL);
+   xcb_generic_error_t *present_query_error = NULL;
+   present_query_reply = xcb_present_query_capabilities_reply(conn, present_query_cookie, &present_query_error);
+   if (chain->handoff_diag && present_query_error)
+      fprintf(stderr, "[WSI_HANDOFF] capabilities-error window=%x code=%u major=%u minor=%u\n",
+              window, present_query_error->error_code, present_query_error->major_code,
+              present_query_error->minor_code);
+   free(present_query_error);
    if (present_query_reply) {
       present_caps = present_query_reply->capabilities;
       free(present_query_reply);
@@ -2729,6 +2819,14 @@ x11_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
    chain->has_dri3_modifiers = wsi_conn->has_dri3_modifiers;
    chain->has_mit_shm = wsi_conn->has_mit_shm;
    chain->has_async_may_tear = present_caps & XCB_PRESENT_CAPABILITY_ASYNC_MAY_TEAR;
+
+   if (chain->handoff_diag) {
+      fprintf(stderr, "[WSI_HANDOFF] create t=%lld window=%x extent=%ux%u window_size=%ux%u images=%u requested_mode=%d mode=%d caps=%x explicit_sync=%d\n",
+              (long long)os_time_get_nano(), window, chain->extent.width, chain->extent.height,
+              cur_width, cur_height, num_images, pCreateInfo->presentMode, present_mode,
+              present_caps, chain->base.image_info.explicit_sync);
+      x11_handoff_window(chain);
+   }
 
    /* When images in the swapchain don't fit the window, X can still present them, but it won't
     * happen by flip, only by copy. So this is a suboptimal copy, because if the client would change
