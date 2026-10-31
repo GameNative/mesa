@@ -59,6 +59,107 @@ wrapper_startup_diag(struct wrapper_device *device, const char *fmt, ...)
    wrapper_startup_diag(device, "leave %s", #call); \
 } while (0)
 
+/* Second diagnostic: compare the actual application and driver inputs.
+ * The first breadcrumb's inline/divisor bits only meant storage was allocated,
+ * not that an inline module or a divisor was present.  Never alter the chains. */
+static void
+wrapper_pipeline_diag_chain(struct wrapper_device *device, const char *where,
+                            const void *pNext)
+{
+   const VkBaseInStructure *node = pNext;
+   for (unsigned i = 0; node && i < 16; i++, node = node->pNext) {
+      wrapper_startup_diag(device, "%s chain[%u] sType=%d", where, i, node->sType);
+      switch (node->sType) {
+      case VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO: {
+         const VkPipelineRenderingCreateInfo *r = (const void *)node;
+         wrapper_startup_diag(device, "%s rendering viewMask=%x colors=%u depth=%d stencil=%d",
+                              where, r->viewMask, r->colorAttachmentCount,
+                              r->depthAttachmentFormat, r->stencilAttachmentFormat);
+         for (unsigned c = 0; r->pColorAttachmentFormats &&
+              c < MIN2(r->colorAttachmentCount, 8); c++)
+            wrapper_startup_diag(device, "%s color[%u]=%d", where, c,
+                                 r->pColorAttachmentFormats[c]);
+         break;
+      }
+      case VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO: {
+         const VkPipelineCreateFlags2CreateInfo *f = (const void *)node;
+         wrapper_startup_diag(device, "%s flags2=%llx", where,
+                              (unsigned long long)f->flags);
+         break;
+      }
+      case VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO: {
+         const VkShaderModuleCreateInfo *m = (const void *)node;
+         wrapper_startup_diag(device, "%s inline codeSize=%zu code=%p", where,
+                              m->codeSize, (const void *)m->pCode);
+         break;
+      }
+      default:
+         break;
+      }
+   }
+   if (node)
+      wrapper_startup_diag(device, "%s chain truncated", where);
+}
+
+static void
+wrapper_pipeline_diag(struct wrapper_device *device, const char *where,
+                      const VkGraphicsPipelineCreateInfo *info)
+{
+   wrapper_startup_diag(device,
+      "%s pipeline flags=%x stages=%u layout=%p renderPass=%p subpass=%u base=%p baseIndex=%d",
+      where, info->flags, info->stageCount, (void *)(uintptr_t)info->layout,
+      (void *)(uintptr_t)info->renderPass, info->subpass,
+      (void *)(uintptr_t)info->basePipelineHandle, info->basePipelineIndex);
+   wrapper_pipeline_diag_chain(device, where, info->pNext);
+   for (unsigned s = 0; info->pStages && s < MIN2(info->stageCount, 8); s++) {
+      const VkPipelineShaderStageCreateInfo *stage = &info->pStages[s];
+      size_t size = 0;
+      uint32_t *code = stage->module
+         ? wrapper_stride_module_code(device, stage->module, &size) : NULL;
+      uint64_t hash = 0xcbf29ce484222325ull;
+      for (size_t b = 0; code && b < size; b++)
+         hash = (hash ^ ((const uint8_t *)code)[b]) * 0x100000001b3ull;
+      wrapper_startup_diag(device,
+         "%s stage[%u] kind=%x flags=%x module=%p entry=%.64s trackedBytes=%zu hash=%016llx spec=%d",
+         where, s, stage->stage, stage->flags, (void *)(uintptr_t)stage->module,
+         stage->pName ? stage->pName : "(null)", size,
+         (unsigned long long)(code ? hash : 0), stage->pSpecializationInfo != NULL);
+      free(code);
+      wrapper_pipeline_diag_chain(device, "stage", stage->pNext);
+   }
+   if (info->pVertexInputState) {
+      const VkPipelineVertexInputStateCreateInfo *vi = info->pVertexInputState;
+      wrapper_startup_diag(device, "%s vertex bindings=%u attributes=%u", where,
+                           vi->vertexBindingDescriptionCount, vi->vertexAttributeDescriptionCount);
+      wrapper_pipeline_diag_chain(device, "vertex", vi->pNext);
+      const VkPipelineVertexInputDivisorStateCreateInfoKHR *ds =
+         vk_find_struct_const(vi->pNext, PIPELINE_VERTEX_INPUT_DIVISOR_STATE_CREATE_INFO_KHR);
+      for (unsigned d = 0; ds && ds->pVertexBindingDivisors &&
+           d < MIN2(ds->vertexBindingDivisorCount, 32); d++)
+         wrapper_startup_diag(device, "%s divisor binding=%u value=%u", where,
+                              ds->pVertexBindingDivisors[d].binding,
+                              ds->pVertexBindingDivisors[d].divisor);
+   }
+   if (info->pDynamicState) {
+      const VkPipelineDynamicStateCreateInfo *dyn = info->pDynamicState;
+      for (unsigned d = 0; dyn->pDynamicStates && d < MIN2(dyn->dynamicStateCount, 32); d++)
+         wrapper_startup_diag(device, "%s dynamic[%u]=%d", where, d, dyn->pDynamicStates[d]);
+   }
+#define DIAG_STATE(member) do { \
+   wrapper_startup_diag(device, "%s " #member " present=%d", where, info->member != NULL); \
+   if (info->member) \
+      wrapper_pipeline_diag_chain(device, #member, info->member->pNext); \
+} while (0)
+   DIAG_STATE(pInputAssemblyState);
+   DIAG_STATE(pTessellationState);
+   DIAG_STATE(pViewportState);
+   DIAG_STATE(pRasterizationState);
+   DIAG_STATE(pMultisampleState);
+   DIAG_STATE(pDepthStencilState);
+   DIAG_STATE(pColorBlendState);
+#undef DIAG_STATE
+}
+
 const struct vk_device_extension_table wrapper_device_extensions =
 {
    .KHR_swapchain = true,
@@ -4129,6 +4230,23 @@ wrapper_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
                                 VkPipeline *pPipelines)
 {
    VK_FROM_HANDLE(wrapper_device, device, _device);
+   const char *app = device->physical->instance->vk.app_info.app_name;
+   static int diagnostic_calls;
+   const bool diagnostic = app && !strcmp(app, "Dishonored.exe") &&
+      p_atomic_inc_return(&diagnostic_calls) <= 2;
+   if (diagnostic) {
+      wrapper_startup_diag(device,
+         "pipeline capabilities driver=%d api=%x baseRendering=%d requestedRendering=%d baseM5=%d requestedM5=%d allocator=%d cache=%p",
+         device->physical->driver_properties.driverID,
+         device->physical->properties2.properties.apiVersion,
+         device->physical->base_supported_features.dynamicRendering,
+         device->vk.enabled_features.dynamicRendering,
+         device->physical->base_supported_extensions.KHR_maintenance5,
+         device->vk.enabled_extensions.KHR_maintenance5, pAllocator != NULL,
+         (void *)(uintptr_t)pipelineCache);
+      for (unsigned i = 0; i < MIN2(createInfoCount, 2); i++)
+         wrapper_pipeline_diag(device, "application", &pCreateInfos[i]);
+   }
    wrapper_startup_diag(device, "enter graphics infos=%p count=%u",
                         (const void *)pCreateInfos, createInfoCount);
    VkGraphicsPipelineCreateInfo *legacy = NULL;
@@ -4318,6 +4436,11 @@ wrapper_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
       "graphics lowered infos=%p driver_infos=%p stride=%d inline=%d fold=%d legacy=%d divisor=%d",
       (const void *)pCreateInfos, (const void *)driver_infos, stride_emulated,
       m5_infos != NULL, fold, legacy != NULL, div_infos != NULL);
+   if (diagnostic) {
+      wrapper_startup_diag(device, "actually materialized inline modules=%u", m5_module_count);
+      for (unsigned i = 0; i < MIN2(createInfoCount, 2); i++)
+         wrapper_pipeline_diag(device, "driver", &driver_infos[i]);
+   }
    if (stride_emulated) {
       for (uint32_t i = 0; i < createInfoCount; i++) {
          wrapper_startup_diag(device, "enter graphics dispatch infos=%p index=%u",
