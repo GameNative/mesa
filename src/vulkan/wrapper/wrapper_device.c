@@ -22,6 +22,42 @@
 #include "vk_util.h"
 #include "util/list.h"
 #include "util/simple_mtx.h"
+#include "util/u_atomic.h"
+
+/* Bounded startup breadcrumbs: unlike API-dump these need no external layer.
+ * Keep this diagnostic local to the reported application and flush before
+ * entering the base driver, so a native fault cannot hide the last boundary. */
+static void
+wrapper_startup_diag(struct wrapper_device *device, const char *fmt, ...)
+{
+   const char *app = device->physical->instance->vk.app_info.app_name;
+   static int lines;
+   if (!app || strcmp(app, "Dishonored.exe") ||
+       p_atomic_inc_return(&lines) > 256)
+      return;
+
+   char message[768];
+   va_list args;
+   va_start(args, fmt);
+   vsnprintf(message, sizeof(message), fmt, args);
+   va_end(args);
+   fprintf(stderr, "[WRAPPER_STARTUP] device=%p %s\n",
+           (void *)device, message);
+   fflush(stderr);
+}
+
+#define STARTUP_RESULT(call) ({ \
+   wrapper_startup_diag(device, "enter %s", #call); \
+   VkResult startup_result = (call); \
+   wrapper_startup_diag(device, "leave %s result=%d", #call, startup_result); \
+   startup_result; \
+})
+
+#define STARTUP_VOID(call) do { \
+   wrapper_startup_diag(device, "enter %s", #call); \
+   call; \
+   wrapper_startup_diag(device, "leave %s", #call); \
+} while (0)
 
 const struct vk_device_extension_table wrapper_device_extensions =
 {
@@ -610,10 +646,10 @@ wrapper_create_null_resources(struct wrapper_device *device)
                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
       .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
    };
-   if (dt->CreateBuffer(dev, &bci, NULL, &device->null_buffer) != VK_SUCCESS)
+   if (STARTUP_RESULT(dt->CreateBuffer(dev, &bci, NULL, &device->null_buffer)) != VK_SUCCESS)
       return;
    VkMemoryRequirements mr;
-   dt->GetBufferMemoryRequirements(dev, device->null_buffer, &mr);
+   STARTUP_VOID(dt->GetBufferMemoryRequirements(dev, device->null_buffer, &mr));
    uint32_t mt = UINT32_MAX;
    for (uint32_t i = 0; i < mp->memoryTypeCount; i++)
       if ((mr.memoryTypeBits & (1u << i)) &&
@@ -623,13 +659,13 @@ wrapper_create_null_resources(struct wrapper_device *device)
       .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
       .allocationSize = mr.size, .memoryTypeIndex = mt,
    };
-   if (dt->AllocateMemory(dev, &mai, NULL, &device->null_buffer_memory) != VK_SUCCESS)
+   if (STARTUP_RESULT(dt->AllocateMemory(dev, &mai, NULL, &device->null_buffer_memory)) != VK_SUCCESS)
       return;
-   dt->BindBufferMemory(dev, device->null_buffer, device->null_buffer_memory, 0);
+   STARTUP_RESULT(dt->BindBufferMemory(dev, device->null_buffer, device->null_buffer_memory, 0));
    void *ptr = NULL;
-   if (dt->MapMemory(dev, device->null_buffer_memory, 0, VK_WHOLE_SIZE, 0, &ptr) == VK_SUCCESS) {
-      memset(ptr, 0, mr.size);
-      dt->UnmapMemory(dev, device->null_buffer_memory);
+   if (STARTUP_RESULT(dt->MapMemory(dev, device->null_buffer_memory, 0, VK_WHOLE_SIZE, 0, &ptr)) == VK_SUCCESS) {
+      STARTUP_VOID(memset(ptr, 0, mr.size));
+      STARTUP_VOID(dt->UnmapMemory(dev, device->null_buffer_memory));
    }
 
    VkImageCreateInfo ici = {
@@ -640,9 +676,9 @@ wrapper_create_null_resources(struct wrapper_device *device)
       .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT,
       .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
    };
-   if (dt->CreateImage(dev, &ici, NULL, &device->null_image) == VK_SUCCESS) {
+   if (STARTUP_RESULT(dt->CreateImage(dev, &ici, NULL, &device->null_image)) == VK_SUCCESS) {
       VkMemoryRequirements imr;
-      dt->GetImageMemoryRequirements(dev, device->null_image, &imr);
+      STARTUP_VOID(dt->GetImageMemoryRequirements(dev, device->null_image, &imr));
       uint32_t imt = UINT32_MAX;
       for (uint32_t i = 0; i < mp->memoryTypeCount; i++)
          if (imr.memoryTypeBits & (1u << i)) { imt = i; break; }
@@ -651,19 +687,19 @@ wrapper_create_null_resources(struct wrapper_device *device)
          .allocationSize = imr.size, .memoryTypeIndex = imt,
       };
       if (imt != UINT32_MAX &&
-          dt->AllocateMemory(dev, &imai, NULL, &device->null_image_memory) == VK_SUCCESS) {
-         dt->BindImageMemory(dev, device->null_image, device->null_image_memory, 0);
+          STARTUP_RESULT(dt->AllocateMemory(dev, &imai, NULL, &device->null_image_memory)) == VK_SUCCESS) {
+         STARTUP_RESULT(dt->BindImageMemory(dev, device->null_image, device->null_image_memory, 0));
          VkImageViewCreateInfo vci = {
             .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
             .image = device->null_image, .viewType = VK_IMAGE_VIEW_TYPE_2D,
             .format = VK_FORMAT_R8G8B8A8_UNORM,
             .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
          };
-         dt->CreateImageView(dev, &vci, NULL, &device->null_image_view);
+         STARTUP_RESULT(dt->CreateImageView(dev, &vci, NULL, &device->null_image_view));
       }
    }
    VkSamplerCreateInfo sci = { .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
-   dt->CreateSampler(dev, &sci, NULL, &device->null_sampler);
+   STARTUP_RESULT(dt->CreateSampler(dev, &sci, NULL, &device->null_sampler));
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -1562,9 +1598,12 @@ if (pdf2 && pdf2->features.f) { \
        !(emulate_query_reset && !device->query_reset_shared_queue))
       wrapper_bcn_reserve_queue(device, &wrapper_create_info, &bcn_queues, &bcn_priorities);
 
+   wrapper_startup_diag(device, "enter base CreateDevice feature-chain=%d",
+                        wrapper_create_info.pNext != NULL);
    result = physical_device->dispatch_table.CreateDevice(
       physical_device->dispatch_handle, &wrapper_create_info,
          pAllocator, &device->dispatch_handle);
+   wrapper_startup_diag(device, "leave base CreateDevice result=%d", result);
    wrapper_core13_free_device_create(core13_storage);
 
    if (result != VK_SUCCESS) {
@@ -1577,9 +1616,11 @@ if (pdf2 && pdf2->features.f) { \
                              "feature chain\n", result);
          wrapper_create_info.pNext = NULL;
          used_fallback_create = true;
+         wrapper_startup_diag(device, "enter fallback CreateDevice");
          result = physical_device->dispatch_table.CreateDevice(
             physical_device->dispatch_handle, &wrapper_create_info,
                pAllocator, &device->dispatch_handle);
+         wrapper_startup_diag(device, "leave fallback CreateDevice result=%d", result);
       }
       
       if (result != VK_SUCCESS) {
@@ -1624,7 +1665,9 @@ if (pdf2 && pdf2->features.f) { \
       !physical_device->base_supported_features.nullDescriptor;
    if (device->emulate_null_descriptor) {
       WRAPPER_LOG(info, "Emulating nullDescriptor with canonical zero resources");
+      wrapper_startup_diag(device, "enter null resources");
       wrapper_create_null_resources(device);
+      wrapper_startup_diag(device, "leave null resources");
    }
 
    device->emulate_imageless_framebuffer =
@@ -4086,6 +4129,8 @@ wrapper_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
                                 VkPipeline *pPipelines)
 {
    VK_FROM_HANDLE(wrapper_device, device, _device);
+   wrapper_startup_diag(device, "enter graphics infos=%p count=%u",
+                        (const void *)pCreateInfos, createInfoCount);
    VkGraphicsPipelineCreateInfo *legacy = NULL;
    VkRenderPass *render_passes = NULL;
    void *chain_mem = NULL;
@@ -4094,6 +4139,13 @@ wrapper_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
    VkPipelineShaderStageCreateInfo *m5_stages = NULL;
    VkShaderModule *m5_modules = NULL;
    uint32_t m5_module_count = 0;
+
+   for (uint32_t i = 0; i < createInfoCount; i++)
+      wrapper_startup_diag(device,
+         "graphics infos=%p index=%u stages=%u flags=0x%x pNext=%d renderPass=%p",
+         (const void *)pCreateInfos, i, pCreateInfos[i].stageCount,
+         pCreateInfos[i].flags, pCreateInfos[i].pNext != NULL,
+         (void *)(uintptr_t)pCreateInfos[i].renderPass);
 
    for (uint32_t i = 0; i < createInfoCount; i++)
       for (uint32_t j = 0; j < pCreateInfos[i].stageCount; j++)
@@ -4262,13 +4314,21 @@ wrapper_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
    for (uint32_t i = 0; i < createInfoCount && !stride_emulated; i++)
       stride_emulated = wrapper_stride_wants(device, &driver_infos[i]);
 
+   wrapper_startup_diag(device,
+      "graphics lowered infos=%p driver_infos=%p stride=%d inline=%d fold=%d legacy=%d divisor=%d",
+      (const void *)pCreateInfos, (const void *)driver_infos, stride_emulated,
+      m5_infos != NULL, fold, legacy != NULL, div_infos != NULL);
    if (stride_emulated) {
       for (uint32_t i = 0; i < createInfoCount; i++) {
+         wrapper_startup_diag(device, "enter graphics dispatch infos=%p index=%u",
+                              (const void *)driver_infos, i);
          VkResult r = wrapper_stride_wants(device, &driver_infos[i])
             ? wrapper_stride_create(device, pipelineCache, &driver_infos[i], pAllocator,
                                     &pPipelines[i])
             : device->dispatch_table.CreateGraphicsPipelines(device->dispatch_handle,
                  pipelineCache, 1, &driver_infos[i], pAllocator, &pPipelines[i]);
+         wrapper_startup_diag(device, "leave graphics dispatch infos=%p index=%u result=%d",
+                              (const void *)driver_infos, i, r);
          if (r != VK_SUCCESS) {
             pPipelines[i] = VK_NULL_HANDLE;
             if (result == VK_SUCCESS)
@@ -4276,9 +4336,13 @@ wrapper_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
          }
       }
    } else {
+      wrapper_startup_diag(device, "enter base graphics infos=%p count=%u",
+                           (const void *)driver_infos, createInfoCount);
       result = device->dispatch_table.CreateGraphicsPipelines(
          device->dispatch_handle, pipelineCache, createInfoCount, driver_infos,
          pAllocator, pPipelines);
+      wrapper_startup_diag(device, "leave base graphics infos=%p result=%d",
+                           (const void *)driver_infos, result);
    }
 
    if (div_lowerings) {
