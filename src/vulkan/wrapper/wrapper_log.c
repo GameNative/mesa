@@ -136,6 +136,13 @@ void write_to_logfile(const char *fmt, const char *level, ...)  {
 
 void init_wrapper_logging()
 {
+   /* Diagnostic package: keep the existing capability/format/copy probes on
+    * even when the launcher does not pass the guest diagnostic environment
+    * through to the native OpenGL/Zink driver process. */
+   setenv("WRAPPER_DIAG", "1", 1);
+   fprintf(stderr, "[WRAPPER_DIAG] isaac-wrapper-diagnostic-1 loaded; automatic capability/format/copy capture enabled\n");
+   fflush(stderr);
+
    char *wrapper_log_level_env = getenv("WRAPPER_LOG_LEVEL");
    parse_wrapper_debug_str(wrapper_log_level_env);
 

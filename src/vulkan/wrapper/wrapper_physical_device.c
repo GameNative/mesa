@@ -16,6 +16,27 @@
 #include "util/os_misc.h"
 #include "util/u_debug.h"
 
+static bool
+wrapper_zink_discard_workaround(const struct wrapper_physical_device *pdevice)
+{
+   const char *engine = pdevice->instance->vk.app_info.engine_name;
+   return engine && !strcmp(engine, "mesa zink") &&
+      pdevice->driver_properties.driverID == VK_DRIVER_ID_ARM_PROPRIETARY &&
+      pdevice->properties2.properties.deviceID == 0xd8300010;
+}
+
+static void
+wrapper_zink_discard_cache_uuid(const struct wrapper_physical_device *pdevice,
+                                VkPhysicalDeviceProperties *properties)
+{
+   /* Zink keys both its NIR/SPIR-V and pipeline disk caches with this UUID.
+    * Separate the discard variant from shaders compiled with demote enabled.
+    * Native pipeline cache blobs still pass through to the same base driver.
+    */
+   if (wrapper_zink_discard_workaround(pdevice))
+      properties->pipelineCacheUUID[0] ^= 0xd1;
+}
+
 static uint32_t
 parse_vk_version_from_env_named(const char *name)
 {
@@ -438,6 +459,17 @@ VkResult enumerate_physical_device(struct vk_instance *_instance)
       const uint32_t engine_version = instance->vk.app_info.engine_version;
       const uint32_t driver_version = pdevice->properties2.properties.driverVersion;
 
+      /* Comparison build for RGB flicker with Zink fragment discard on G925.
+       * Mask the feature as well as the extension: it is promoted in Vulkan
+       * 1.3, so hiding only the extension can leave the core path available.
+       * Keep base capabilities intact; Zink generates the fallback itself.
+       */
+      if (wrapper_zink_discard_workaround(pdevice)) {
+         pdevice->vk.supported_extensions.EXT_shader_demote_to_helper_invocation = false;
+         supported_features->shaderDemoteToHelperInvocation = false;
+         WRAPPER_LOG(info, "Zink discard comparison: demote extension and core feature hidden; separate shader cache");
+      }
+
       /* DXVK forces hostQueryReset on from D3D_FEATURE_LEVEL_9_1 up, so a driver
        * without it gets no D3D11 device at any level.  Gated on the driver
        * rather than on the engine name: the base-lacks guard already limits
@@ -767,6 +799,7 @@ wrapper_GetPhysicalDeviceProperties(VkPhysicalDevice physicalDevice,
    VK_FROM_HANDLE(wrapper_physical_device, pdevice, physicalDevice);
    pdevice->dispatch_table.GetPhysicalDeviceProperties(
       pdevice->dispatch_handle, pProperties);
+   wrapper_zink_discard_cache_uuid(pdevice, pProperties);
 
    uint32_t api_version =
       wrapper_effective_api_version(pdevice, pProperties->apiVersion);
@@ -850,6 +883,7 @@ wrapper_GetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice,
    VK_FROM_HANDLE(wrapper_physical_device, pdevice, physicalDevice);
    pdevice->dispatch_table.GetPhysicalDeviceProperties2(
       pdevice->dispatch_handle, pProperties);
+   wrapper_zink_discard_cache_uuid(pdevice, &pProperties->properties);
 
    uint32_t api_version = wrapper_effective_api_version(
       pdevice, pProperties->properties.apiVersion);

@@ -1230,6 +1230,12 @@ wrapper_emit_diag(struct wrapper_physical_device *pdev,
    D("engine: '%s' -> detected %s (app '%s')\n", eng, detected,
      pdev->instance->vk.app_info.app_name ? pdev->instance->vk.app_info.app_name : "");
    D("--- native capabilities (what THIS device actually has) ---\n");
+   D("  fillModeNonSolid           : native=%d advertised=%d\n",
+     pdev->base_supported_features.fillModeNonSolid,
+     pdev->vk.supported_features.fillModeNonSolid);
+   D("  shaderClipDistance        : native=%d advertised=%d\n",
+     pdev->base_supported_features.shaderClipDistance,
+     pdev->vk.supported_features.shaderClipDistance);
    D("  textureCompressionBC       : %d\n", pdev->base_supported_features.textureCompressionBC);
    D("  textureCompressionASTC_LDR : %d\n", pdev->base_supported_features.textureCompressionASTC_LDR);
    D("  robustBufferAccess2        : %d\n", pdev->base_supported_features.robustBufferAccess2);
