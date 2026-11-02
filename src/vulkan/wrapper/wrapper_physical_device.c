@@ -856,6 +856,11 @@ wrapper_GetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice,
 
    const char *eng = pdevice->instance->vk.app_info.engine_name;
    bool is_d3d = eng && (strstr(eng, "DXVK") || strstr(eng, "vkd3d"));
+   /* vkd3d derives WaveOps and shader model support from these properties.
+    * Preserve Turnip's native answers, without advertising extra operations
+    * or changing the subgroup workaround for other drivers and clients. */
+   bool keep_subgroups = eng && strstr(eng, "vkd3d") &&
+      pdevice->driver_properties.driverID == VK_DRIVER_ID_MESA_TURNIP;
 
    char *device_name_env = getenv("WRAPPER_DEVICE_NAME");
    asprintf(&device_name, "Wrapper(%s)", (device_name_env) ? device_name_env : pProperties->properties.deviceName);   
@@ -967,6 +972,8 @@ wrapper_GetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice,
       }
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES:
       {
+         if (keep_subgroups)
+            break;
          VkPhysicalDeviceVulkan11Properties *vk11_prop =
               (VkPhysicalDeviceVulkan11Properties *)prop;
          vk11_prop->subgroupSupportedOperations = 0;
@@ -1033,6 +1040,8 @@ wrapper_GetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice,
       }
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES:
       {
+         if (keep_subgroups)
+            break;
          VkPhysicalDeviceSubgroupProperties *subgroup_prop =
               (VkPhysicalDeviceSubgroupProperties *)prop;
          subgroup_prop->supportedOperations = 0;
