@@ -1510,7 +1510,17 @@ get_config( XMesaVisual xmvis, int attrib, int *value, GLboolean fbconfig )
          *value = (int) True;
 	 return 0;
       case GLX_BUFFER_SIZE:
-	 *value = xmvis->visinfo->depth;
+         /* The X visual's depth only counts the planes the server stores.
+          * When the visual carries an alpha channel on top of those planes
+          * (an 8/8/8/8 config on a depth-24 TrueColor visual), count it the
+          * way a DRI GLX fbconfig does, so GLX_BUFFER_SIZE is 32 and not 24:
+          * Windows apps ask wglChoosePixelFormatARB for 32 colour bits. */
+         *value = xmvis->visinfo->depth;
+         if (xmvis->mesa_visual.alphaBits > 0 &&
+             xmvis->visinfo->depth <= xmvis->mesa_visual.redBits +
+                                      xmvis->mesa_visual.greenBits +
+                                      xmvis->mesa_visual.blueBits)
+            *value += xmvis->mesa_visual.alphaBits;
 	 return 0;
       case GLX_LEVEL:
 	 *value = 0;
