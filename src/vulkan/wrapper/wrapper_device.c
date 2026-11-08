@@ -6328,6 +6328,12 @@ wrapper_DestroyDevice(VkDevice _device, const VkAllocationCallbacks* pAllocator)
    wrapper_divisor_finish(device);
    _mesa_hash_table_u64_destroy(device->image_view_table);
    _mesa_hash_table_u64_destroy(device->imageless_fb_table);
+   if (device->memory_diag_live) {
+      hash_table_u64_foreach(device->memory_diag_live, entry)
+         free(entry.data);
+      _mesa_hash_table_u64_destroy(device->memory_diag_live);
+      device->memory_diag_live = NULL;
+   }
 
    list_for_each_entry_safe(struct vk_queue, queue, &device->vk.queues, link) {
       vk_queue_finish(queue);

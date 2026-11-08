@@ -96,6 +96,8 @@ struct wrapper_device {
    /* Allocation diagnostic counters, protected by resource_mutex. */
    uint64_t memory_diag_allocs, memory_diag_frees, memory_diag_failures;
    uint64_t memory_diag_total_bytes;
+   struct hash_table_u64 *memory_diag_live;
+   uint64_t memory_diag_tracking_misses;
    struct hash_table_u64 *image_table;
    struct hash_table_u64 *image_view_table;
    struct hash_table_u64 *imageless_fb_table;
