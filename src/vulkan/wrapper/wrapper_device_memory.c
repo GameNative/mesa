@@ -4,6 +4,7 @@
 #include "vk_common_entrypoints.h"
 #include "util/os_file.h"
 #include "util/hash_table.h"
+#include "util/u_math.h"
 #include "vk_util.h"
 
 #include <android/hardware_buffer.h>
@@ -13,6 +14,8 @@
 #include <linux/dma-heap.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <inttypes.h>
+#include <stdio.h>
 
 static int
 safe_ioctl(int fd, unsigned long request, void *arg)
@@ -508,6 +511,126 @@ wrapper_device_memory_from_handle(struct wrapper_device *device,
    return mem;
 }
 
+/* Called with resource_mutex held. This diagnostic deliberately uses stderr:
+ * the direct-driver path has no WRAPPER_LOG error, and the member's existing
+ * error-channel capture was silent. Bound output even during a retry storm.
+ * Bytes are cumulative successful requests, NOT live/resident memory. Counts
+ * cover client entrypoints only, not the wrapper's internal allocations.
+ */
+struct wrapper_memory_diag_record {
+   uint64_t size;
+   uint32_t type;
+};
+
+/* resource_mutex protects this bookkeeping and the resource tables. These
+ * are client allocation bytes, not physical residency or driver-internal BOs.
+ * A failed bookkeeping allocation must never affect the Vulkan result.
+ */
+static void
+wrapper_memory_diag_track(struct wrapper_device *device,
+                          const VkMemoryAllocateInfo *info,
+                          VkDeviceMemory memory)
+{
+   if (!device->memory_diag_live)
+      device->memory_diag_live = _mesa_hash_table_u64_create(NULL);
+   struct wrapper_memory_diag_record *record = malloc(sizeof(*record));
+   if (!device->memory_diag_live || !record) {
+      free(record);
+      device->memory_diag_tracking_misses++;
+      return;
+   }
+   *record = (struct wrapper_memory_diag_record) {
+      .size = info->allocationSize,
+      .type = info->memoryTypeIndex,
+   };
+   _mesa_hash_table_u64_insert(device->memory_diag_live, (uint64_t)memory, record);
+   if (_mesa_hash_table_u64_search(device->memory_diag_live, (uint64_t)memory) != record) {
+      free(record);
+      device->memory_diag_tracking_misses++;
+   }
+}
+
+static void
+wrapper_memory_diag_snapshot(struct wrapper_device *device)
+{
+   if (!device->memory_diag_live)
+      return;
+
+   uint32_t counts[VK_MAX_MEMORY_TYPES][64] = {0};
+   uint64_t bytes[VK_MAX_MEMORY_TYPES][64] = {0};
+   uint64_t live_bytes = 0;
+   hash_table_u64_foreach(device->memory_diag_live, entry) {
+      const struct wrapper_memory_diag_record *record = entry.data;
+      unsigned order = util_logbase2_64(MAX2(record->size, 1));
+      counts[record->type][order]++;
+      bytes[record->type][order] += record->size;
+      live_bytes += record->size;
+   }
+
+   fprintf(stderr, "WRAPPER_MEM_LIVE device=%p allocs=%" PRIu64
+           " count=%u bytes=%" PRIu64 " images=%u buffers=%u tracking_misses=%" PRIu64 "\n",
+           (void *)device, device->memory_diag_allocs,
+           _mesa_hash_table_u64_num_entries(device->memory_diag_live), live_bytes,
+           _mesa_hash_table_u64_num_entries(device->image_table),
+           _mesa_hash_table_u64_num_entries(device->buffer_table),
+           device->memory_diag_tracking_misses);
+   for (unsigned type = 0; type < VK_MAX_MEMORY_TYPES; type++) {
+      for (unsigned order = 0; order < 64; order++) {
+         if (counts[type][order])
+            fprintf(stderr, "WRAPPER_MEM_BUCKET device=%p type=%u size_log2=%u count=%u bytes=%" PRIu64 "\n",
+                    (void *)device, type, order, counts[type][order], bytes[type][order]);
+      }
+   }
+}
+
+static void
+wrapper_memory_diag(struct wrapper_device *device,
+                    const VkMemoryAllocateInfo *info, uint32_t requested_type,
+                    const char *backend, VkResult result)
+{
+   const VkPhysicalDeviceMemoryProperties *props = &device->physical->memory_properties;
+   const uint32_t type = info->memoryTypeIndex;
+   const uint32_t heap = props->memoryTypes[type].heapIndex;
+   const VkMemoryDedicatedAllocateInfo *dedicated =
+      vk_find_struct_const(info->pNext, MEMORY_DEDICATED_ALLOCATE_INFO);
+   if (!device->memory_diag_allocs && !device->memory_diag_failures) {
+      fprintf(stderr, "WRAPPER_MEM_DIAG v2 device=%p driver=%s max_allocations=%u placed=%u extension=%u\n",
+              (void *)device, device->physical->properties2.properties.deviceName,
+              device->physical->properties2.properties.limits.maxMemoryAllocationCount,
+              (unsigned)device->vk.enabled_features.memoryMapPlaced,
+              (unsigned)device->vk.enabled_extensions.EXT_map_memory_placed);
+   }
+   uint64_t n;
+   if (result == VK_SUCCESS) {
+      n = ++device->memory_diag_allocs;
+      device->memory_diag_total_bytes += info->allocationSize;
+      if (n > 8 && n % 1024)
+         return;
+   } else {
+      n = ++device->memory_diag_failures;
+      if (n > 16 && (n & (n - 1)))
+         return;
+   }
+   fprintf(stderr, "WRAPPER_MEM_DIAG device=%p backend=%s result=%d size=%" PRIu64
+           " requested_type=%u type=%u heap=%u flags=0x%x heap_size=%" PRIu64
+           " dedicated_image=%u dedicated_buffer=%u allocs=%" PRIu64
+           " frees=%" PRIu64 " failures=%" PRIu64 " cumulative_bytes=%" PRIu64 "\n",
+           (void *)device, backend, result, (uint64_t)info->allocationSize,
+           requested_type, type, heap, props->memoryTypes[type].propertyFlags,
+           (uint64_t)props->memoryHeaps[heap].size,
+           (unsigned)(dedicated && dedicated->image != VK_NULL_HANDLE),
+           (unsigned)(dedicated && dedicated->buffer != VK_NULL_HANDLE),
+           device->memory_diag_allocs, device->memory_diag_frees,
+           device->memory_diag_failures, device->memory_diag_total_bytes);
+   /* Periodic samples show growth; only the first failure gets a full dump
+    * so a client retry storm cannot flood the log with histograms.
+    */
+   if ((result == VK_SUCCESS && !(n % 4096)) ||
+       (result != VK_SUCCESS && n == 1))
+      wrapper_memory_diag_snapshot(device);
+   fflush(stderr);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 wrapper_AllocateMemory(VkDevice _device,
                        const VkMemoryAllocateInfo* pAllocateInfo,
@@ -517,6 +640,8 @@ wrapper_AllocateMemory(VkDevice _device,
    struct wrapper_device_memory *mem;
    VkResult result;
    VkMemoryAllocateInfo coherent_allocate_info;
+   const uint32_t requested_type = pAllocateInfo->memoryTypeIndex;
+   const char *backend = "wrapper-metadata";
 
    if (device->physical->coherent_memory_type[pAllocateInfo->memoryTypeIndex] !=
        pAllocateInfo->memoryTypeIndex) {
@@ -598,16 +723,19 @@ wrapper_AllocateMemory(VkDevice _device,
    }
    
    if (strstr(device->physical->resource_type, "ahb")) {
+      backend = "ahb";
       WRAPPER_LOG(info, "Using AHardwareBuffer memory backend");
       result = wrapper_allocate_memory_ahardware_buffer(device,
          &memory_allocate_info, pAllocator, &mem->dispatch_handle, &mem->ahardware_buffer);
    }
    else if (strstr(device->physical->resource_type, "dmabuf")) {
+      backend = "dmabuf";
       WRAPPER_LOG(info, "Using DMABUF memory backend");
       result = wrapper_allocate_memory_dmaheap(device,
          &memory_allocate_info, pAllocator, &mem->dispatch_handle, &mem->fd);
    }
    else if (strstr(device->physical->resource_type, "opaque")) {
+      backend = "opaque-fd";
       WRAPPER_LOG(info, "Using opaque fd memory backend");
       result = wrapper_allocate_memory_opaque_fd(device,
          &memory_allocate_info, pAllocator, &mem->dispatch_handle, &mem->fd);
@@ -617,17 +745,20 @@ wrapper_AllocateMemory(VkDevice _device,
       result = VK_ERROR_INVALID_EXTERNAL_HANDLE;
 #define VALID_HANDLE(type) (valid_handle_types == 0 || (type & valid_handle_types) != 0)
       if (VALID_HANDLE(VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT)) {
+         backend = "auto-dmabuf";
          result = wrapper_allocate_memory_dmaheap(device,
             &memory_allocate_info, pAllocator, &mem->dispatch_handle, &mem->fd);
       }
 
       if (result != VK_SUCCESS && VALID_HANDLE(VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID)) {
+         backend = "auto-ahb";
          wrapper_device_memory_reset(mem);
          result = wrapper_allocate_memory_ahardware_buffer(device,
             &memory_allocate_info, pAllocator, &mem->dispatch_handle, &mem->ahardware_buffer);
       }
 
       if (result != VK_SUCCESS && VALID_HANDLE(VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT)) {
+         backend = "auto-opaque-fd";
          wrapper_device_memory_reset(mem);
          result = wrapper_allocate_memory_opaque_fd(device,
             &memory_allocate_info, pAllocator, &mem->dispatch_handle, &mem->fd);
@@ -660,12 +791,20 @@ wrapper_AllocateMemory(VkDevice _device,
    }
 
 out:
+   if (result == VK_SUCCESS)
+      wrapper_memory_diag_track(device, pAllocateInfo, *pMemory);
+   wrapper_memory_diag(device, pAllocateInfo, requested_type, backend, result);
    simple_mtx_unlock(&device->resource_mutex);
    return result;
 
 fallback:
    result = device->dispatch_table.AllocateMemory(device->dispatch_handle,
       pAllocateInfo, pAllocator, pMemory);
+   simple_mtx_lock(&device->resource_mutex);
+   if (result == VK_SUCCESS)
+      wrapper_memory_diag_track(device, pAllocateInfo, *pMemory);
+   wrapper_memory_diag(device, pAllocateInfo, requested_type, "direct-driver", result);
+   simple_mtx_unlock(&device->resource_mutex);
    if (result == VK_SUCCESS && !(property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
       simple_mtx_lock(&device->resource_mutex);
       _mesa_hash_table_u64_insert(device->device_only_memory, (uint64_t)*pMemory, device);
@@ -689,6 +828,19 @@ wrapper_FreeMemory(VkDevice _device, VkDeviceMemory _memory,
 {
    VK_FROM_HANDLE(wrapper_device, device, _device);
    struct wrapper_device_memory *mem;
+
+   if (_memory != VK_NULL_HANDLE) {
+      simple_mtx_lock(&device->resource_mutex);
+      device->memory_diag_frees++;
+      if (device->memory_diag_live) {
+         void *record = _mesa_hash_table_u64_search(device->memory_diag_live, (uint64_t)_memory);
+         if (record) {
+            _mesa_hash_table_u64_remove(device->memory_diag_live, (uint64_t)_memory);
+            free(record);
+         }
+      }
+      simple_mtx_unlock(&device->resource_mutex);
+   }
 
    mem = wrapper_device_memory_from_handle(device, _memory);
    if (mem) {
