@@ -22,6 +22,7 @@
 #include "vk_util.h"
 #include "util/list.h"
 #include "util/simple_mtx.h"
+#include "util/u_atomic.h"
 
 const struct vk_device_extension_table wrapper_device_extensions =
 {
@@ -4078,6 +4079,112 @@ wrapper_CreateComputePipelines(VkDevice _device, VkPipelineCache pipelineCache,
    return result;
 }
 
+/* Temporary, layer-independent Zink diagnostic. Never change feature bits or
+ * rendering state. Limits are explicit: absence after a limit is not proof
+ * that a capability was unused. Static values may be overridden dynamically.
+ */
+static bool
+wrapper_zink_diag_enabled(const struct wrapper_device *device)
+{
+   const char *engine = device->physical->instance->vk.app_info.engine_name;
+   return engine && !strcmp(engine, "mesa zink");
+}
+
+static void
+wrapper_zink_diag_shader(struct wrapper_device *device,
+                         const VkShaderModuleCreateInfo *info,
+                         VkShaderModule module, VkResult result)
+{
+   static unsigned count;
+   if (!wrapper_zink_diag_enabled(device))
+      return;
+   unsigned n = p_atomic_inc_return(&count);
+   if (n > 256) {
+      if (n == 257)
+         fprintf(stderr, "[WRAPPER_ZINK_DIAG] shader limit reached (256)\n");
+      return;
+   }
+
+   uint64_t hash = 0xcbf29ce484222325ull;
+   const uint8_t *bytes = (const uint8_t *)info->pCode;
+   for (size_t i = 0; i < info->codeSize; i++)
+      hash = (hash ^ bytes[i]) * 0x100000001b3ull;
+   bool clip = false, cull = false, malformed = false;
+   size_t words = info->codeSize / sizeof(uint32_t);
+   if (info->codeSize % 4 || words < 5 || info->pCode[0] != 0x07230203) {
+      malformed = true;
+   } else {
+      for (size_t i = 5; i < words;) {
+         unsigned len = info->pCode[i] >> 16;
+         if (!len || len > words - i) {
+            malformed = true;
+            break;
+         }
+         /* SPIR-V OpCapability=17, ClipDistance=32, CullDistance=33. */
+         if ((info->pCode[i] & 0xffff) == 17 && len == 2) {
+            clip |= info->pCode[i + 1] == 32;
+            cull |= info->pCode[i + 1] == 33;
+         }
+         i += len;
+      }
+   }
+   fprintf(stderr, "[WRAPPER_ZINK_DIAG] shader=%u module=%llx hash=%016llx "
+           "result=%d clip=%u cull=%u nativeClip=%u nativeCull=%u malformed=%u\n",
+           n, (unsigned long long)(uintptr_t)module, (unsigned long long)hash,
+           result, clip, cull, device->physical->base_supported_features.shaderClipDistance,
+           device->physical->base_supported_features.shaderCullDistance, malformed);
+}
+
+static void
+wrapper_zink_diag_pipeline(struct wrapper_device *device,
+                           const VkGraphicsPipelineCreateInfo *info,
+                           VkPipeline pipeline, VkResult result)
+{
+   static unsigned count;
+   if (!wrapper_zink_diag_enabled(device))
+      return;
+   unsigned n = p_atomic_inc_return(&count);
+   if (n > 256) {
+      if (n == 257)
+         fprintf(stderr, "[WRAPPER_ZINK_DIAG] pipeline limit reached (256)\n");
+      return;
+   }
+   const VkPipelineRasterizationStateCreateInfo *rs = info->pRasterizationState;
+   const VkPipelineColorBlendStateCreateInfo *cb = info->pColorBlendState;
+   const VkPipelineDepthStencilStateCreateInfo *ds = info->pDepthStencilState;
+   const VkPipelineRasterizationDepthClipStateCreateInfoEXT *clip = rs
+      ? __vk_find_struct((void *)rs->pNext,
+                        VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_DEPTH_CLIP_STATE_CREATE_INFO_EXT)
+      : NULL;
+   fprintf(stderr, "[WRAPPER_ZINK_DIAG] pipeline=%u handle=%llx batchResult=%d "
+           "static: polygon=%d discard=%d clamp=%d clipExt=%d logicEnable=%d logicOp=%d "
+           "depthTest=%d depthWrite=%d depthCompare=%d native: logic=%u nonSolid=%u "
+           "clamp=%u clipExt=%u\n", n, (unsigned long long)(uintptr_t)pipeline, result,
+           rs ? (int)rs->polygonMode : -1, rs ? (int)rs->rasterizerDiscardEnable : -1,
+           rs ? (int)rs->depthClampEnable : -1, clip ? (int)clip->depthClipEnable : -1,
+           cb ? (int)cb->logicOpEnable : -1, cb ? (int)cb->logicOp : -1,
+           ds ? (int)ds->depthTestEnable : -1, ds ? (int)ds->depthWriteEnable : -1,
+           ds ? (int)ds->depthCompareOp : -1,
+           device->physical->base_supported_features.logicOp,
+           device->physical->base_supported_features.fillModeNonSolid,
+           device->physical->base_supported_features.depthClamp,
+           device->physical->base_supported_extensions.EXT_depth_clip_enable);
+   if (info->pDynamicState) {
+      for (uint32_t i = 0; i < info->pDynamicState->dynamicStateCount; i++)
+         fprintf(stderr, "[WRAPPER_ZINK_DIAG] pipeline=%u dynamic=%d\n", n,
+                 (int)info->pDynamicState->pDynamicStates[i]);
+   }
+   for (uint32_t i = 0; i < info->stageCount; i++) {
+      const VkPipelineShaderStageCreateInfo *stage = &info->pStages[i];
+      fprintf(stderr, "[WRAPPER_ZINK_DIAG] pipeline=%u stage=%u module=%llx\n",
+              n, stage->stage, (unsigned long long)(uintptr_t)stage->module);
+      const VkShaderModuleCreateInfo *inline_info = __vk_find_struct(
+         (void *)stage->pNext, VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO);
+      if (inline_info)
+         wrapper_zink_diag_shader(device, inline_info, stage->module, result);
+   }
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 wrapper_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
                                 uint32_t createInfoCount,
@@ -4280,6 +4387,9 @@ wrapper_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
          device->dispatch_handle, pipelineCache, createInfoCount, driver_infos,
          pAllocator, pPipelines);
    }
+
+   for (uint32_t i = 0; i < createInfoCount; i++)
+      wrapper_zink_diag_pipeline(device, &driver_infos[i], pPipelines[i], result);
 
    if (div_lowerings) {
       for (uint32_t i = 0; i < createInfoCount; i++) {
@@ -5124,6 +5234,9 @@ wrapper_CreateShaderModule(VkDevice _device,
    
    VkResult result = device->dispatch_table.CreateShaderModule(
       device->dispatch_handle, &create_info, pAllocator, pShaderModule);
+   wrapper_zink_diag_shader(device, &create_info,
+                            result == VK_SUCCESS ? *pShaderModule : VK_NULL_HANDLE,
+                            result);
    if (result == VK_SUCCESS && wrapper_tracks_shader_code(device))
       wrapper_stride_note_module(device, *pShaderModule, create_info.pCode,
                                  create_info.codeSize);
