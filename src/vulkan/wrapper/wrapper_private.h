@@ -95,6 +95,7 @@ struct wrapper_device {
    struct hash_table_u64 *device_only_memory; /* allocations the host cannot map */
    struct hash_table_u64 *image_table;
    struct hash_table_u64 *image_view_table;
+   struct wrapper_texture_template *texture_diag_templates;
    struct hash_table_u64 *imageless_fb_table;
    struct hash_table_u64 *dynamic_pipeline_table;
    struct hash_table_u64 *stride_pipeline_table;

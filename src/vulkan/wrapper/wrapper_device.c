@@ -22,6 +22,8 @@
 #include "vk_util.h"
 #include "util/list.h"
 #include "util/simple_mtx.h"
+#include "util/u_atomic.h"
+#include "wrapper_texture_diag.h"
 
 const struct vk_device_extension_table wrapper_device_extensions =
 {
@@ -595,6 +597,43 @@ wrapper_create_device_queue(struct wrapper_device *device,
    return VK_SUCCESS;
 }
 
+VKAPI_ATTR VkResult VKAPI_CALL
+wrapper_CreateSampler(VkDevice _device, const VkSamplerCreateInfo *pCreateInfo,
+                      const VkAllocationCallbacks *pAllocator, VkSampler *pSampler)
+{
+   VK_FROM_HANDLE(wrapper_device, device, _device);
+   VkResult result = device->dispatch_table.CreateSampler(device->dispatch_handle,
+                                                         pCreateInfo, pAllocator, pSampler);
+   static unsigned count;
+   if (texture_diag_budget(device, &count, 256, "sampler")) {
+      const VkSamplerCreateInfo *s = pCreateInfo;
+      fprintf(stderr, "[WRAPPER_SAMPLE] sampler dev=%p result=%d handle=%llx flags=%x filter=%d,%d mip=%d address=%d,%d,%d lod=%g,%g bias=%g anisotropy=%u,%g compare=%u,%d border=%d unnormalized=%u\n",
+              (void *)device, result, result == VK_SUCCESS ? (unsigned long long)*pSampler : 0,
+              s->flags, s->minFilter, s->magFilter, s->mipmapMode,
+              s->addressModeU, s->addressModeV, s->addressModeW,
+              s->minLod, s->maxLod, s->mipLodBias, s->anisotropyEnable, s->maxAnisotropy,
+              s->compareEnable, s->compareOp, s->borderColor, s->unnormalizedCoordinates);
+      const VkBaseInStructure *ext = s->pNext;
+      for (unsigned i = 0; ext && i < 8; i++, ext = ext->pNext)
+         fprintf(stderr, "[WRAPPER_SAMPLE] sampler=%llx pnext=%d\n",
+                 result == VK_SUCCESS ? (unsigned long long)*pSampler : 0, ext->sType);
+   }
+   return result;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wrapper_UpdateDescriptorSetWithTemplate(VkDevice _device, VkDescriptorSet descriptorSet,
+                                        VkDescriptorUpdateTemplate descriptorUpdateTemplate,
+                                        const void *pData)
+{
+   VK_FROM_HANDLE(wrapper_device, device, _device);
+   texture_diag_template_update(device, descriptorUpdateTemplate, (uint64_t)descriptorSet, pData);
+   PFN_vkUpdateDescriptorSetWithTemplate update = device->dispatch_table.UpdateDescriptorSetWithTemplate
+      ? device->dispatch_table.UpdateDescriptorSetWithTemplate
+      : device->dispatch_table.UpdateDescriptorSetWithTemplateKHR;
+   update(device->dispatch_handle, descriptorSet, descriptorUpdateTemplate, pData);
+}
+
 static void
 wrapper_create_null_resources(struct wrapper_device *device)
 {
@@ -674,6 +713,18 @@ wrapper_UpdateDescriptorSets(VkDevice _device, uint32_t descriptorWriteCount,
 {
    VK_FROM_HANDLE(wrapper_device, device, _device);
    VkWriteDescriptorSet *fold_writes = (VkWriteDescriptorSet *)pDescriptorWrites;
+   texture_diag_writes(device, "write", descriptorWriteCount, pDescriptorWrites);
+   static unsigned copy_count;
+   if (descriptorCopyCount && texture_diag_budget(device, &copy_count, 128, "descriptor-copy")) {
+      for (uint32_t i = 0; i < MIN2(descriptorCopyCount, 32); i++) {
+         const VkCopyDescriptorSet *c = &pDescriptorCopies[i];
+         fprintf(stderr, "[WRAPPER_SAMPLE] copy dev=%p src=%llx:%u:%u dst=%llx:%u:%u count=%u\n",
+                 (void *)device, (unsigned long long)c->srcSet, c->srcBinding, c->srcArrayElement,
+                 (unsigned long long)c->dstSet, c->dstBinding, c->dstArrayElement, c->descriptorCount);
+      }
+      if (descriptorCopyCount > 32)
+         fprintf(stderr, "[WRAPPER_SAMPLE] copies truncated to 32 of %u\n", descriptorCopyCount);
+   }
    VkCopyDescriptorSet *fold_copies = (VkCopyDescriptorSet *)pDescriptorCopies;
    if (device->fold_sets &&
        wrapper_fold_remap_updates(device, &descriptorWriteCount, &fold_writes,
@@ -741,6 +792,7 @@ wrapper_UpdateDescriptorSets(VkDevice _device, uint32_t descriptorWriteCount,
 
    device->dispatch_table.UpdateDescriptorSets(device->dispatch_handle,
       descriptorWriteCount, writes, descriptorCopyCount, pDescriptorCopies);
+   texture_diag_writes(device, "native-write", descriptorWriteCount, writes);
 
    for (uint32_t i = 0; i < descriptorWriteCount; i++) {
       if (writes[i].pBufferInfo != pDescriptorWrites[i].pBufferInfo)
@@ -2227,6 +2279,20 @@ wrapper_CreateImageView(VkDevice _device,
    result = device->dispatch_table.CreateImageView(device->dispatch_handle,
      &create_info, pAllocator, pView);
 
+   static unsigned view_count;
+   if (texture_diag_budget(device, &view_count, 1024, "image-view")) {
+      const VkImageSubresourceRange *r = &create_info.subresourceRange;
+      fprintf(stderr, "[WRAPPER_SAMPLE] view dev=%p result=%d handle=%llx image=%llx type=%d fmt=%d->%d swizzle=%d,%d,%d,%d aspect=%x mip=%u+%u->%u+%u layer=%u+%u pnext=%d\n",
+              (void *)device, result, result == VK_SUCCESS ? (unsigned long long)*pView : 0,
+              (unsigned long long)create_info.image, create_info.viewType,
+              pCreateInfo->format, create_info.format,
+              create_info.components.r, create_info.components.g,
+              create_info.components.b, create_info.components.a, r->aspectMask,
+              pCreateInfo->subresourceRange.baseMipLevel, pCreateInfo->subresourceRange.levelCount,
+              r->baseMipLevel, r->levelCount, r->baseArrayLayer, r->layerCount,
+              create_info.pNext ? ((const VkBaseInStructure *)create_info.pNext)->sType : 0);
+   }
+
    if (result != VK_SUCCESS)
       WRAPPER_LOG(error, "Failed to create image view, res %d", result);
    /* Only the lowering paths read this table, and populating it costs an
@@ -2804,6 +2870,7 @@ wrapper_CmdPushDescriptorSetKHR(VkCommandBuffer commandBuffer,
                                const VkWriteDescriptorSet *pDescriptorWrites)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   texture_diag_writes(wcb->device, "push-write", descriptorWriteCount, pDescriptorWrites);
    if (!wcb->device->emulate_push_descriptor) {
       wcb->device->dispatch_table.CmdPushDescriptorSetKHR(wcb->dispatch_handle,
          pipelineBindPoint, layout, set, descriptorWriteCount, pDescriptorWrites);
@@ -2861,6 +2928,7 @@ wrapper_CmdPushDescriptorSetWithTemplateKHR(VkCommandBuffer commandBuffer,
                                            const void *pData)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   texture_diag_template_update(wcb->device, descriptorUpdateTemplate, (uint64_t)layout, pData);
    if (!wcb->device->emulate_push_descriptor) {
       wcb->device->dispatch_table.CmdPushDescriptorSetWithTemplateKHR(
          wcb->dispatch_handle, descriptorUpdateTemplate, layout, set, pData);
@@ -3110,6 +3178,16 @@ wrapper_CmdBindDescriptorSets(VkCommandBuffer commandBuffer, VkPipelineBindPoint
                               uint32_t dynamicOffsetCount, const uint32_t *pDynamicOffsets)
 {
    VK_FROM_HANDLE(wrapper_command_buffer, wcb, commandBuffer);
+   static unsigned bind_count;
+   if (texture_diag_budget(wcb->device, &bind_count, 512, "bind")) {
+      for (uint32_t i = 0; i < MIN2(descriptorSetCount, 16); i++)
+         fprintf(stderr, "[WRAPPER_SAMPLE] bind dev=%p cmd=%p point=%d layout=%llx set=%u handle=%llx dynamicOffsets=%u folded=%d\n",
+                 (void *)wcb->device, (void *)wcb, pipelineBindPoint,
+                 (unsigned long long)layout, firstSet + i,
+                 (unsigned long long)pDescriptorSets[i], dynamicOffsetCount, wcb->device->fold_sets);
+      if (descriptorSetCount > 16)
+         fprintf(stderr, "[WRAPPER_SAMPLE] bind truncated to 16 of %u\n", descriptorSetCount);
+   }
    if (wcb->device->fold_sets &&
        wrapper_fold_bind(wcb, pipelineBindPoint, layout, firstSet, descriptorSetCount,
                          pDescriptorSets, dynamicOffsetCount, pDynamicOffsets))
@@ -3169,8 +3247,11 @@ wrapper_CreateDescriptorUpdateTemplate(VkDevice _device,
    VkDescriptorUpdateTemplate *pDescriptorUpdateTemplate)
 {
    VK_FROM_HANDLE(wrapper_device, device, _device);
-   return wrapper_create_update_template(device, pCreateInfo, pAllocator,
-                                         pDescriptorUpdateTemplate);
+   VkResult result = wrapper_create_update_template(device, pCreateInfo, pAllocator,
+                                                    pDescriptorUpdateTemplate);
+   if (result == VK_SUCCESS)
+      texture_diag_template_create(device, *pDescriptorUpdateTemplate, pCreateInfo);
+   return result;
 }
 
 static void
@@ -3179,6 +3260,7 @@ wrapper_destroy_update_template(struct wrapper_device *device,
    const VkAllocationCallbacks *pAllocator)
 {
    const struct vk_device_dispatch_table *dt = &device->dispatch_table;
+   texture_diag_template_destroy(device, descriptorUpdateTemplate);
    if (device->emulate_push_descriptor && descriptorUpdateTemplate) {
       simple_mtx_lock(&device->push_mutex);
       struct wrapper_push_template *rec = _mesa_hash_table_u64_search(
@@ -6283,6 +6365,12 @@ VKAPI_ATTR void VKAPI_CALL
 wrapper_DestroyDevice(VkDevice _device, const VkAllocationCallbacks* pAllocator)
 {
    VK_FROM_HANDLE(wrapper_device, device, _device);
+
+   while (device->texture_diag_templates) {
+      struct wrapper_texture_template *r = device->texture_diag_templates;
+      device->texture_diag_templates = r->next;
+      free(r);
+   }
 
    wrapper_query_reset_finish(device);
 
