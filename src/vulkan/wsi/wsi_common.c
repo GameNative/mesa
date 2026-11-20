@@ -1954,7 +1954,11 @@ wsi_create_buffer_blit_context(const struct wsi_swapchain *chain,
 
    VkMemoryRequirements reqs;
    wsi->GetBufferMemoryRequirements(chain->device, image->blit.buffer, &reqs);
-   assert(reqs.size <= info->linear_size);
+   /* The driver may require padding beyond the linear pixel data.  Use the
+    * actual buffer requirements for both device memory and imported SHM,
+    * without changing the image stride or the copy extent.
+    */
+   const VkDeviceSize allocation_size = MAX2(reqs.size, info->linear_size);
 
    struct wsi_memory_allocate_info memory_wsi_info = {
       .sType = VK_STRUCTURE_TYPE_WSI_MEMORY_ALLOCATE_INFO_MESA,
@@ -1971,14 +1975,14 @@ wsi_create_buffer_blit_context(const struct wsi_swapchain *chain,
    VkMemoryAllocateInfo buf_mem_info = {
       .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
       .pNext = &buf_mem_dedicated_info,
-      .allocationSize = info->linear_size,
+      .allocationSize = allocation_size,
       .memoryTypeIndex =
          info->select_blit_dst_memory_type(wsi, reqs.memoryTypeBits),
    };
 
    void *sw_host_ptr = NULL;
    if (info->alloc_shm)
-      sw_host_ptr = info->alloc_shm(image, info->linear_size);
+      sw_host_ptr = info->alloc_shm(image, allocation_size);
 
    VkExportMemoryAllocateInfo memory_export_info;
    VkImportMemoryHostPointerInfoEXT host_ptr_info;
@@ -2029,7 +2033,7 @@ wsi_create_buffer_blit_context(const struct wsi_swapchain *chain,
       return result;
 
    image->num_planes = 1;
-   image->sizes[0] = info->linear_size;
+   image->sizes[0] = allocation_size;
    image->row_pitches[0] = info->linear_stride;
    image->offsets[0] = 0;
 
