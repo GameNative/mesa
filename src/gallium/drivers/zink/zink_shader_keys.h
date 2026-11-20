@@ -53,6 +53,10 @@ struct zink_vs_key {
          uint8_t decomposed_attrs_without_w;
       } u8;
    };
+   uint32_t packed_attrs;
+   uint32_t packed_attrs_bgra;
+   uint32_t packed_attrs_signed;
+   uint32_t packed_attrs_scaled;
    // not hashed
    unsigned size;
 };
