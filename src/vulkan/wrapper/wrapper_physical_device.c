@@ -412,7 +412,17 @@ VkResult enumerate_physical_device(struct vk_instance *_instance)
          wrapper_core13_wanted(pdevice, instance->vk.app_info.engine_name);
       if (pdevice->emulate_vulkan13)
          wrapper_core13_init_physical_device(pdevice);
-      pdevice->fold_sets = pdevice->emulate_vulkan13 &&
+      /* Hades II also needs eight sets on native Vulkan 1.3 Mali drivers.
+       * Descriptor folding remaps layouts, bindings and SPIR-V independently
+       * of core-version emulation; do not require a Vulkan version gap for
+       * this application. Keep other native-driver applications unchanged.
+       */
+      const char *fold_app = instance->vk.app_info.app_name;
+      const bool hades2_native_fold = fold_app &&
+         !strcmp(fold_app, "Hades2.exe") &&
+         pdevice->driver_properties.driverID == VK_DRIVER_ID_ARM_PROPRIETARY &&
+         pdevice->properties2.properties.limits.maxBoundDescriptorSets == 7;
+      pdevice->fold_sets = (pdevice->emulate_vulkan13 || hades2_native_fold) &&
          instance->vk.app_info.engine_name &&
          strstr(instance->vk.app_info.engine_name, "vkd3d") &&
          pdevice->properties2.properties.limits.maxBoundDescriptorSets < 8 &&
