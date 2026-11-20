@@ -965,7 +965,7 @@ zink_pipeline_layout_create(struct zink_screen *screen, VkDescriptorSetLayout *d
    if (!is_compute) {
       pcr.stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS;
       pcr.offset = 0;
-      pcr.size = sizeof(struct zink_gfx_push_constant);
+      pcr.size = zink_gfx_push_constant_size(screen);
       plci.pushConstantRangeCount = 1;
       plci.pPushConstantRanges = &pcr;
    }
@@ -1963,6 +1963,30 @@ zink_update_fs_key_samples(struct zink_context *ctx)
    }
 }
 
+void
+zink_update_fs_dual_blend_key(struct zink_context *ctx)
+{
+   if (!zink_screen(ctx->base.screen)->emulate_dual_src_blend)
+      return;
+   const struct zink_blend_state *blend = ctx->gfx_pipeline_state.blend_state;
+   const struct pipe_surface *cbuf = ctx->fb_state.nr_cbufs ? ctx->fb_state.cbufs[0] : NULL;
+   struct zink_fs_dual_blend_key key = {0};
+   /* integer buffers are never blended */
+   if (blend && blend->dual_blend.enabled && !(cbuf && util_format_is_pure_integer(cbuf->format))) {
+      key = blend->dual_blend;
+      if (cbuf && util_format_is_snorm(cbuf->format))
+         key.format = PIPE_FORMAT_R8G8B8A8_SNORM;
+      else if (cbuf && !util_format_is_unorm(cbuf->format) && !util_format_is_srgb(cbuf->format))
+         key.format = PIPE_FORMAT_R32G32B32A32_FLOAT;
+      else
+         key.format = PIPE_FORMAT_R8G8B8A8_UNORM;
+      if (key.alpha_to_coverage)
+         key.coverage_samples_log2 = util_logbase2(MAX2(ctx->fb_state.samples, 1));
+   }
+   if (memcmp(&zink_get_fs_key(ctx)->dual_blend, &key, sizeof(key)))
+      zink_set_fs_key(ctx)->dual_blend = key;
+}
+
 void zink_update_gs_key_rectangular_line(struct zink_context *ctx)
 {
    bool line_rectangular = zink_get_gs_key(ctx)->line_rectangular;
@@ -2306,12 +2330,21 @@ zink_create_gfx_shader_state(struct pipe_context *pctx, const struct pipe_shader
    else
       nir = (struct nir_shader *)shader->ir.nir;
 
+   bool dual_src_fbfetch = screen->emulate_dual_src_blend && nir->info.stage == MESA_SHADER_FRAGMENT &&
+                           zink_shader_writes_dual_src(nir);
+   if (dual_src_fbfetch) {
+      /* fixed per shader so programs get the fbfetch layout before the blend state is known */
+      nir->info.fs.uses_fbfetch_output = true;
+      nir->info.outputs_read |= BITFIELD64_BIT(FRAG_RESULT_DATA0);
+   }
    if (nir->info.stage == MESA_SHADER_FRAGMENT && nir->info.fs.uses_fbfetch_output)
       zink_descriptor_util_init_fbfetch(zink_context(pctx));
    if (nir->info.uses_bindless)
       zink_descriptors_init_bindless(zink_context(pctx));
 
    struct zink_shader *zs = zink_shader_create(zink_screen(pctx->screen), nir);
+   if (dual_src_fbfetch)
+      zs->fs.dual_src_fbfetch = true;
    if (zink_debug & ZINK_DEBUG_NOBGC)
       gfx_shader_init_job(zs, screen, 0);
    else

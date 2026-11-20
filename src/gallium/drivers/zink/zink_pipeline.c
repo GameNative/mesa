@@ -100,6 +100,8 @@ zink_create_gfx_pipeline(struct zink_screen *screen,
 
    VkPipelineColorBlendStateCreateInfo blend_state = {0};
    blend_state.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+   VkPipelineColorBlendAttachmentState attachments[PIPE_MAX_COLOR_BUFS];
+   bool fs_blends_dual_src = false;
    if (state->blend_state) {
       unsigned num_attachments = state->render_pass ?
                                  state->render_pass->state.num_rts :
@@ -107,6 +109,15 @@ zink_create_gfx_pipeline(struct zink_screen *screen,
       if (state->render_pass && state->render_pass->state.have_zsbuf)
          num_attachments--;
       blend_state.pAttachments = state->blend_state->attachments;
+      if (state->blend_state->dual_blend.enabled) {
+         if (prog->shaders[MESA_SHADER_FRAGMENT] && prog->shaders[MESA_SHADER_FRAGMENT]->fs.dual_src_fbfetch) {
+            fs_blends_dual_src = true;
+         } else {
+            memcpy(attachments, state->blend_state->attachments, sizeof(attachments));
+            attachments[0] = state->blend_state->dual_blend_fallback;
+            blend_state.pAttachments = attachments;
+         }
+      }
       blend_state.attachmentCount = num_attachments;
       blend_state.logicOpEnable = state->blend_state->logicop_enable;
       blend_state.logicOp = state->blend_state->logicop_func;
@@ -117,7 +128,7 @@ zink_create_gfx_pipeline(struct zink_screen *screen,
    VkPipelineMultisampleStateCreateInfo ms_state = {0};
    ms_state.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
    ms_state.rasterizationSamples = state->rast_samples + 1;
-   if (state->blend_state) {
+   if (state->blend_state && !fs_blends_dual_src) {
       ms_state.alphaToCoverageEnable = state->blend_state->alpha_to_coverage;
       if (state->blend_state->alpha_to_one && !screen->info.feats.features.alphaToOne) {
          static bool warned = false;

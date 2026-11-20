@@ -78,6 +78,14 @@ zink_screen_init_semaphore(struct zink_screen *screen);
 bool
 zink_screen_emulates_packed_vertex_format(struct zink_screen *screen, enum pipe_format format);
 
+/* the blend color member only exists where dual-source blending is emulated */
+static inline unsigned
+zink_gfx_push_constant_size(const struct zink_screen *screen)
+{
+   return screen->emulate_dual_src_blend ? sizeof(struct zink_gfx_push_constant) :
+                                           offsetof(struct zink_gfx_push_constant, blend_color);
+}
+
 static inline bool
 zink_screen_handle_vkresult(struct zink_screen *screen, VkResult ret)
 {
