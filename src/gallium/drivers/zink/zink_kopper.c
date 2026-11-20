@@ -1202,3 +1202,9 @@ zink_kopper_prune_batch_usage(struct kopper_displaytarget *cdt, const struct zin
    for (cswap = cdt->old_swapchain; cswap; cswap = cswap->next)
       swapchain_prune_batch_usage(cswap, u);
 }
+
+void
+zink_kopper_disable_sw_winsys(struct pipe_screen *pscreen)
+{
+   zink_screen(pscreen)->winsys = NULL;
+}

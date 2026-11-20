@@ -1,0 +1,12 @@
+#!/bin/bash
+# Maps the termux prefix's /data/data/... paths onto the host copy and drops the bare
+# prefix include dir; the cross file adds it with -idirafter so it cannot shadow the NDK headers.
+R=${TERMUX_ROOT:?}
+T=$R/data/data/com.termux/files/usr
+case ":${PKG_CONFIG_LIBDIR:-}:" in
+  *":$T/lib/pkgconfig:"*)
+    set -o pipefail
+    PKG_CONFIG_SYSROOT_DIR=$R pkg-config "$@" | awk -v drop="-I$T/include" '{o="";for(i=1;i<=NF;i++){if($i==drop)continue;o=o (o==""?"":" ") $i}print o}'
+    exit $? ;;
+  *) exec pkg-config "$@" ;;
+esac

@@ -145,6 +145,7 @@ kopper_init_screen(struct dri_screen *screen, bool driver_name_is_inferred)
 
    dri_init_options(screen);
    screen->unwrapped_screen = trace_screen_unwrap(pscreen);
+   zink_kopper_disable_sw_winsys(screen->unwrapped_screen);
 
    configs = dri_init_screen(screen, pscreen);
    if (!configs)
