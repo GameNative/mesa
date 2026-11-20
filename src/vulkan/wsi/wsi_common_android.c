@@ -96,11 +96,24 @@ wsi_get_ahardware_buffer_blit_type(const struct wsi_device *wsi,
 enum wsi_swapchain_blit_type
 wsi_get_android_blit_type(const struct wsi_device *wsi,
                       const struct wsi_base_image_params *params,
-                                   VkDevice device)
+                                   VkDevice device,
+                                   VkFormat image_format)
 {
    int wrapper_blit = getenv("WRAPPER_BLIT") && atoi(getenv("WRAPPER_BLIT"));
    if (wsi->needs_blit || wrapper_blit)
       return WSI_SWAPCHAIN_IMAGE_BLIT;
+
+   /* The direct AHB probe tests BGRA UNORM, not the swapchain format.
+    * An sRGB image may not support AHB external memory, and the direct
+    * import path replaces its format with the buffer's UNORM format anyway.
+    * Keep the BGRA sRGB render image private and use the existing bitwise
+    * copy to the presentation AHB. This preserves both sRGB encoding and
+    * the BGRA byte order expected by X11, without a second conversion.
+    */
+   if (image_format == VK_FORMAT_B8G8R8A8_SRGB) {
+      WRAPPER_LOG(info, "Using AHB copy path for BGRA sRGB swapchain");
+      return WSI_SWAPCHAIN_IMAGE_BLIT;
+   }
 
    return wsi_get_ahardware_buffer_blit_type(wsi, device);
 }
