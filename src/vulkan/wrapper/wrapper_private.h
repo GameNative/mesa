@@ -121,6 +121,14 @@ struct wrapper_device {
 
    bool emulate_null_descriptor;
    bool device_fault_enabled;
+   bool loss_diag;
+   bool poll_timeline_wait;
+   uint32_t loss_diag_submits;
+   uint32_t loss_diag_waits;
+   uint32_t loss_diag_reported;
+   uint32_t loss_diag_fence_waits;
+   uint32_t loss_diag_counters;
+   uint32_t loss_diag_commands;
    bool emulate_imageless_framebuffer;
    bool emulate_depth_clip_enable;
 
@@ -354,6 +362,9 @@ struct wrapper_command_buffer {
 
 VK_DEFINE_HANDLE_CASTS(wrapper_command_buffer, vk.base, VkCommandBuffer,
                        VK_OBJECT_TYPE_COMMAND_BUFFER)
+
+void wrapper_loss_diag_command(struct wrapper_command_buffer *wcb,
+                               const char *operation);
 
 struct wrapper_device_memory {
    struct AHardwareBuffer *ahardware_buffer;
