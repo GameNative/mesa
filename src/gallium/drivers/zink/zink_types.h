@@ -315,6 +315,11 @@ struct zink_vertex_elements_state {
    unsigned decomposed_attrs_size;
    uint32_t decomposed_attrs_without_w;
    unsigned decomposed_attrs_without_w_size;
+   /* 10/10/10/2 attributes fetched as R32_UINT and unpacked in the vertex shader */
+   uint32_t packed_attrs;
+   uint32_t packed_attrs_bgra;
+   uint32_t packed_attrs_signed;
+   uint32_t packed_attrs_scaled;
    struct zink_vertex_elements_hw_state hw_state;
 };
 

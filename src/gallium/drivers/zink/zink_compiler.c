@@ -2158,6 +2158,78 @@ decompose_attribs(nir_shader *nir, uint32_t decomposed_attrs, uint32_t decompose
    return true;
 }
 
+struct packed_attrib_state {
+   nir_variable *var;
+   nir_variable *packed;
+   bool bgra;
+   bool is_signed;
+   bool scaled;
+};
+
+static bool
+lower_packed_attrib(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   struct packed_attrib_state *state = data;
+   if (intr->intrinsic != nir_intrinsic_load_deref ||
+       nir_intrinsic_get_var(intr, 0) != state->var)
+      return false;
+   b->cursor = nir_after_instr(&intr->instr);
+   nir_def *packed = nir_load_deref(b, nir_build_deref_var(b, state->packed));
+   nir_def *channels[4];
+   for (unsigned i = 0; i < 4; i++) {
+      unsigned bits = i == 3 ? 2 : 10;
+      nir_def *field = nir_ishl_imm(b, packed, 32 - i * 10 - bits);
+      nir_def *v = nir_u2f32(b, nir_ushr_imm(b, field, 32 - bits));
+      if (state->is_signed) {
+         /* sign-extend in float: signed integer extraction gave wrong fields on Mali-G615 r44p1 */
+         v = nir_bcsel(b, nir_fge(b, v, nir_imm_float(b, 1 << (bits - 1))), nir_fadd_imm(b, v, -(double)(1 << bits)), v);
+         if (!state->scaled)
+            v = nir_fmax(b, nir_fdiv_imm(b, v, (1 << (bits - 1)) - 1), nir_imm_float(b, -1.0));
+         channels[i] = v;
+      } else {
+         channels[i] = state->scaled ? v : nir_fdiv_imm(b, v, (1 << bits) - 1);
+      }
+   }
+   if (state->bgra) {
+      nir_def *tmp = channels[0];
+      channels[0] = channels[2];
+      channels[2] = tmp;
+   }
+   nir_def *val = nir_vec(b, channels, intr->def.num_components);
+   nir_def_replace(&intr->def, val);
+   return true;
+}
+
+static bool
+lower_packed_attribs(nir_shader *nir, const struct zink_vs_key *vs_key)
+{
+   bool progress = false;
+   u_foreach_bit(location, vs_key->packed_attrs) {
+      nir_variable *var = nir_find_variable_with_driver_location(nir, nir_var_shader_in, location);
+      if (!var || !glsl_type_is_vector_or_scalar(var->type) ||
+          glsl_get_base_type(var->type) != GLSL_TYPE_FLOAT)
+         continue;
+      struct packed_attrib_state state = {
+         .var = var,
+         .packed = nir_variable_clone(var, nir),
+         .bgra = (vs_key->packed_attrs_bgra & BITFIELD_BIT(location)) != 0,
+         .is_signed = (vs_key->packed_attrs_signed & BITFIELD_BIT(location)) != 0,
+         .scaled = (vs_key->packed_attrs_scaled & BITFIELD_BIT(location)) != 0,
+      };
+      state.packed->name = ralloc_asprintf(nir, "%s_packed", var->name);
+      state.packed->type = glsl_uint_type();
+      nir_shader_add_variable(nir, state.packed);
+      var->data.mode = nir_var_shader_temp;
+      nir_shader_intrinsics_pass(nir, lower_packed_attrib, nir_metadata_control_flow, &state);
+      progress = true;
+   }
+   if (progress) {
+      nir_fixup_deref_modes(nir);
+      NIR_PASS_V(nir, nir_remove_dead_variables, nir_var_shader_temp, NULL);
+   }
+   return progress;
+}
+
 static bool
 rewrite_bo_access_instr(nir_builder *b, nir_instr *instr, void *data)
 {
@@ -4034,6 +4106,8 @@ zink_shader_compile(struct zink_screen *screen, bool can_shobj, struct zink_shad
                break;
             default: break;
             }
+            if (vs_key->packed_attrs)
+               NIR_PASS_V(nir, lower_packed_attribs, vs_key);
             if (decomposed_attrs || decomposed_attrs_without_w)
                NIR_PASS_V(nir, decompose_attribs, decomposed_attrs, decomposed_attrs_without_w);
             break;

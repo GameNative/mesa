@@ -79,7 +79,17 @@ zink_create_vertex_elements_state(struct pipe_context *pctx,
       VkFormat format;
       if (screen->format_props[elem->src_format].bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT)
          format = zink_get_format(screen, elem->src_format);
-      else {
+      else if (zink_screen_emulates_packed_vertex_format(screen, elem->src_format)) {
+         const struct util_format_description *desc = util_format_description(elem->src_format);
+         format = VK_FORMAT_R32_UINT;
+         ves->packed_attrs |= BITFIELD_BIT(i);
+         if (desc->swizzle[0] == PIPE_SWIZZLE_Z)
+            ves->packed_attrs_bgra |= BITFIELD_BIT(i);
+         if (desc->channel[0].type == UTIL_FORMAT_TYPE_SIGNED)
+            ves->packed_attrs_signed |= BITFIELD_BIT(i);
+         if (!desc->channel[0].normalized)
+            ves->packed_attrs_scaled |= BITFIELD_BIT(i);
+      } else {
          enum pipe_format new_format = zink_decompose_vertex_format(elem->src_format);
          assert(new_format);
          num_decomposed++;
@@ -209,10 +219,14 @@ zink_bind_vertex_elements_state(struct pipe_context *pctx,
          break;
       }
       if (ctx->element_state->decomposed_attrs != decomposed_attrs ||
-          ctx->element_state->decomposed_attrs_without_w != decomposed_attrs_without_w) {
+          ctx->element_state->decomposed_attrs_without_w != decomposed_attrs_without_w ||
+          ctx->element_state->packed_attrs != vs->packed_attrs ||
+          ctx->element_state->packed_attrs_bgra != vs->packed_attrs_bgra ||
+          ctx->element_state->packed_attrs_signed != vs->packed_attrs_signed ||
+          ctx->element_state->packed_attrs_scaled != vs->packed_attrs_scaled) {
          unsigned size = MAX2(ctx->element_state->decomposed_attrs_size, ctx->element_state->decomposed_attrs_without_w_size);
          struct zink_shader_key *key = (struct zink_shader_key *)zink_set_vs_key(ctx);
-         key->size -= 2 * key->key.vs.size;
+         memset(&key->key.vs.u32, 0, sizeof(key->key.vs.u32));
          switch (size) {
          case 1:
             key->key.vs.u8.decomposed_attrs = ctx->element_state->decomposed_attrs;
@@ -229,7 +243,13 @@ zink_bind_vertex_elements_state(struct pipe_context *pctx,
          default: break;
          }
          key->key.vs.size = size;
-         key->size += 2 * size;
+         key->key.vs.packed_attrs = ctx->element_state->packed_attrs;
+         key->key.vs.packed_attrs_bgra = ctx->element_state->packed_attrs_bgra;
+         key->key.vs.packed_attrs_signed = ctx->element_state->packed_attrs_signed;
+         key->key.vs.packed_attrs_scaled = ctx->element_state->packed_attrs_scaled;
+         /* the decomposed masks sit behind padding, so hash the whole key once packed attrs are in it */
+         key->size = ctx->element_state->packed_attrs ? offsetof(struct zink_vs_key, size) :
+                                                        sizeof(struct zink_vs_key_base) + 2 * size;
       }
    } else {
      state->element_state = NULL;

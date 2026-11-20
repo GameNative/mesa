@@ -75,6 +75,8 @@ zink_screen_check_last_finished(struct zink_screen *screen, uint32_t batch_id)
 
 bool
 zink_screen_init_semaphore(struct zink_screen *screen);
+bool
+zink_screen_emulates_packed_vertex_format(struct zink_screen *screen, enum pipe_format format);
 
 static inline bool
 zink_screen_handle_vkresult(struct zink_screen *screen, VkResult ret)
