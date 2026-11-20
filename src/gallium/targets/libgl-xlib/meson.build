@@ -32,7 +32,7 @@ libgl = shared_library(
     libgalliumvl_stub, libws_xlib,
     libgallium, libmesa, gallium_xlib_link_with,
   ],
-  dependencies : [dep_x11, idep_mesautil, dep_thread, dep_clock, dep_unwind, driver_swrast, driver_virgl, driver_asahi, driver_zink],
+  dependencies : [dep_x11, idep_mesautil, idep_xmlconfig, dep_thread, dep_clock, dep_unwind, driver_swrast, driver_virgl, driver_asahi, driver_zink],
   install : true,
   version : '1.5.0',
   darwin_versions: '4.0.0',
