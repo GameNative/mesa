@@ -69,9 +69,6 @@ static PFN_vkGetInstanceProcAddr get_instance_proc_addr;
 static PFN_vkEnumerateInstanceVersion enumerate_instance_version;
 static PFN_vkEnumerateInstanceExtensionProperties enumerate_instance_extension_properties;
 static PFN_vkEnumerateInstanceLayerProperties enumerate_instance_layer_properties;
-static PFN_vkCreateDebugUtilsMessengerEXT create_debug_utils_messenger;
-static PFN_vkDestroyDebugUtilsMessengerEXT destroy_debug_utils_messenger;
-VkDebugUtilsMessengerEXT debugUtilsMessenger;
 static struct vk_instance_extension_table *supported_instance_extensions;
 
 bool has_intercepted_layer_paths = false;
@@ -84,17 +81,17 @@ bool has_intercepted_layer_paths = false;
 
 #include <dlfcn.h>
 
-static void init_debug_messenger(VkInstance instance) 
+static void init_debug_messenger(struct wrapper_instance *wrapper)
 {
-  create_debug_utils_messenger = (PFN_vkCreateDebugUtilsMessengerEXT)get_instance_proc_addr(instance, "vkCreateDebugUtilsMessengerEXT");
-  destroy_debug_utils_messenger = (PFN_vkDestroyDebugUtilsMessengerEXT)get_instance_proc_addr(instance, "vkDestroyDebugUtilsMessengerEXT");
+  VkInstance instance = wrapper->dispatch_handle;
+  PFN_vkCreateDebugUtilsMessengerEXT create_debug_utils_messenger =
+     (PFN_vkCreateDebugUtilsMessengerEXT)get_instance_proc_addr(instance, "vkCreateDebugUtilsMessengerEXT");
+  wrapper->destroy_debug_messenger = (PFN_vkDestroyDebugUtilsMessengerEXT)get_instance_proc_addr(instance, "vkDestroyDebugUtilsMessengerEXT");
 
-  if (create_debug_utils_messenger && destroy_debug_utils_messenger) {
+  if (create_debug_utils_messenger && wrapper->destroy_debug_messenger) {
      WRAPPER_LOG(info, "Creating debug messenger");
      VkDebugUtilsMessengerCreateInfoEXT messengerInfo;
      const VkDebugUtilsMessageSeverityFlagsEXT kSeveritiesToLog =
-        VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT |
-        VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT |
         VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT |
         VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT;
      
@@ -111,7 +108,11 @@ static void init_debug_messenger(VkInstance instance)
      messengerInfo.pfnUserCallback = &wrapper_debug_utils_messenger;
      messengerInfo.pUserData = NULL;
 
-     create_debug_utils_messenger(instance, &messengerInfo, NULL, &debugUtilsMessenger);
+     VkResult result = create_debug_utils_messenger(instance, &messengerInfo, NULL, &wrapper->debug_messenger);
+     wrapper_diag_append("[WRAPPER_VALIDATION] debug messenger result=%d; %s\n",
+                         result, result == VK_SUCCESS ? "capture active" : "capture unavailable");
+   } else {
+     wrapper_diag_append("[WRAPPER_VALIDATION] debug messenger entrypoints unavailable; no validation capture\n");
    }
   
 }
@@ -263,6 +264,21 @@ set_wrapper_required_extensions(const struct vk_instance *instance,
    *enable_extension_count = count;
 }
 
+static bool
+has_debug_utils(const char *layer)
+{
+   VkExtensionProperties props[VK_INSTANCE_EXTENSION_COUNT];
+   uint32_t count = ARRAY_SIZE(props);
+   VkResult result = enumerate_instance_extension_properties(layer, &count, props);
+   if (result != VK_SUCCESS && result != VK_INCOMPLETE)
+      return false;
+   for (uint32_t i = 0; i < MIN2(count, ARRAY_SIZE(props)); i++) {
+      if (!strcmp(props[i].extensionName, VK_EXT_DEBUG_UTILS_EXTENSION_NAME))
+         return true;
+   }
+   return false;
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 wrapper_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
                        const VkAllocationCallbacks *pAllocator,
@@ -328,20 +344,25 @@ wrapper_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
    }
       
    wrapper_create_info.pApplicationInfo = &wrapper_application_info;
+
+   bool validation_enabled = false;
+   const char *enabled_layers[2];
+   const void *original_next = wrapper_create_info.pNext;
+   uint32_t original_extension_count = wrapper_enable_extension_count;
    
    /* Load whichever debug layers were requested via WRAPPER_LOG_LEVEL:
     * "validation" -> VK_LAYER_KHRONOS_validation (API-usage errors),
     * "apidump"    -> VK_LAYER_LUNARG_api_dump (every Vulkan call, very spammy).
     * Both can be enabled together. */
    if (WRAPPER_LOG_LEVEL(validation) || WRAPPER_LOG_LEVEL(apidump)) {
-      /* Enumerate available layers (only if the layer-path jailbreak worked). */
+      /* Existing loader paths may work even when path interception is unavailable. */
       bool have_validation = false, have_api_dump = false;
-      if (has_intercepted_layer_paths) {
-         uint32_t layer_count = 0;
-         enumerate_instance_layer_properties(&layer_count, NULL);
-         if (layer_count) {
-            VkLayerProperties layer_props[layer_count];
-            enumerate_instance_layer_properties(&layer_count, layer_props);
+      if (enumerate_instance_layer_properties) {
+         VkLayerProperties layer_props[64];
+         uint32_t layer_count = ARRAY_SIZE(layer_props);
+         VkResult layer_result = enumerate_instance_layer_properties(&layer_count, layer_props);
+         if (layer_result == VK_SUCCESS || layer_result == VK_INCOMPLETE) {
+            layer_count = MIN2(layer_count, ARRAY_SIZE(layer_props));
             for (uint32_t i = 0; i < layer_count; i++) {
                if (!strcmp(layer_props[i].layerName, WRAPPER_VALIDATION_LAYER))
                   have_validation = true;
@@ -353,6 +374,19 @@ wrapper_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
 
       bool enable_validation = WRAPPER_LOG_LEVEL(validation) && have_validation;
       bool enable_api_dump = WRAPPER_LOG_LEVEL(apidump) && have_api_dump;
+      bool debug_utils = enable_validation &&
+         (has_debug_utils(NULL) || has_debug_utils(WRAPPER_VALIDATION_LAYER));
+      enable_validation &= debug_utils;
+      validation_enabled = enable_validation;
+      wrapper_diag_append("[WRAPPER_VALIDATION] layer=%s paths=%s debug_utils=%s; validation %s\n",
+                          have_validation ? "found" : "missing",
+                          has_intercepted_layer_paths ? "configured" : "unchanged",
+                          debug_utils ? "available" : "unavailable",
+                          enable_validation ? "requested" : "unavailable (not a clean validation result)");
+      if (enable_validation) {
+         assert(wrapper_enable_extension_count < VK_INSTANCE_EXTENSION_COUNT);
+         wrapper_enable_extensions[wrapper_enable_extension_count++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
+      }
 
       /* If a requested layer can't be set up, warn and continue WITHOUT it --
        * a game that runs without validation beats one that won't start. Print
@@ -366,10 +400,6 @@ wrapper_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
          fprintf(stderr, "[wrapper] api_dump layer requested but unavailable; "
                  "continuing without it\n");
 
-      /* The enabled list and settings are read by create_instance() below,
-       * which is outside this block -- give them static lifetime. The layer
-       * name string literals already have static storage. */
-      static const char *enabled_layers[2];
       uint32_t enabled_layer_count = 0;
       if (enable_validation)
          enabled_layers[enabled_layer_count++] = WRAPPER_VALIDATION_LAYER;
@@ -380,19 +410,8 @@ wrapper_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
          wrapper_create_info.enabledLayerCount = enabled_layer_count;
          wrapper_create_info.ppEnabledLayerNames = enabled_layers;
 
-         /* Best-practices settings only apply to the validation layer. */
-         if (enable_validation) {
-            static const VkBool32 settings_validate_best_practices = VK_TRUE;
-            static const VkLayerSettingEXT layer_settings[] = {
-               {WRAPPER_VALIDATION_LAYER, "validate_best_practices_arm", VK_LAYER_SETTING_TYPE_BOOL32_EXT, 1, &settings_validate_best_practices},
-               {WRAPPER_VALIDATION_LAYER, "validate_best_practices", VK_LAYER_SETTING_TYPE_BOOL32_EXT, 1, &settings_validate_best_practices},
-            };
-            static VkLayerSettingsCreateInfoEXT layer_settings_info = {
-               VK_STRUCTURE_TYPE_LAYER_SETTINGS_CREATE_INFO_EXT, NULL, 2, layer_settings,
-            };
-            layer_settings_info.pNext = wrapper_create_info.pNext;
-            wrapper_create_info.pNext = &layer_settings_info;
-         }
+         /* Core API validation only: best-practice performance advice would
+          * consume the bounded report without identifying invalid operations. */
       }
    }
 
@@ -401,6 +420,15 @@ wrapper_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
 
    result = create_instance(&wrapper_create_info, pAllocator,
                             &instance->dispatch_handle);
+   if (result != VK_SUCCESS && validation_enabled) {
+      wrapper_diag_append("[WRAPPER_VALIDATION] validated instance failed result=%d; retrying without diagnostic layers\n", result);
+      wrapper_create_info.enabledLayerCount = pCreateInfo->enabledLayerCount;
+      wrapper_create_info.ppEnabledLayerNames = pCreateInfo->ppEnabledLayerNames;
+      wrapper_create_info.enabledExtensionCount = original_extension_count;
+      wrapper_create_info.pNext = original_next;
+      validation_enabled = false;
+      result = create_instance(&wrapper_create_info, pAllocator, &instance->dispatch_handle);
+   }
    if (result != VK_SUCCESS) {
       WRAPPER_LOG(error, "Failed driver createInstance, res %d", result);
       vk_instance_finish(&instance->vk);
@@ -408,8 +436,8 @@ wrapper_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
       return vk_error(NULL, result);
    }
 
-   if (WRAPPER_LOG_LEVEL(validation)) {
-      init_debug_messenger(instance->dispatch_handle);
+   if (validation_enabled) {
+      init_debug_messenger(instance);
    }
    
    vk_instance_dispatch_table_load(&instance->dispatch_table,
@@ -427,8 +455,8 @@ wrapper_DestroyInstance(VkInstance _instance,
 {
    VK_FROM_HANDLE(wrapper_instance, instance, _instance);
 
-   if (destroy_debug_utils_messenger)
-      destroy_debug_utils_messenger(instance->dispatch_handle, debugUtilsMessenger, pAllocator);
+   if (instance->destroy_debug_messenger && instance->debug_messenger)
+      instance->destroy_debug_messenger(instance->dispatch_handle, instance->debug_messenger, NULL);
       
    instance->dispatch_table.DestroyInstance(instance->dispatch_handle,
                                             pAllocator);

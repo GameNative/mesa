@@ -28,6 +28,8 @@ struct wrapper_instance {
 
    VkInstance dispatch_handle;
    struct vk_instance_dispatch_table dispatch_table;
+   VkDebugUtilsMessengerEXT debug_messenger;
+   PFN_vkDestroyDebugUtilsMessengerEXT destroy_debug_messenger;
 };
 
 VK_DEFINE_HANDLE_CASTS(wrapper_instance, vk.base, VkInstance,

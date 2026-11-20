@@ -1,7 +1,11 @@
 #include <time.h>
+#include <pthread.h>
+#include <stdbool.h>
 
 #include "wrapper_log.h"
 #include "wrapper_util.h"
+
+void wrapper_diag_append(const char *fmt, ...);
 
 #define PATH_MAX_SIZE 1024
 #define WRAPPER_DIR "/sdcard/wrapper"
@@ -136,8 +140,16 @@ void write_to_logfile(const char *fmt, const char *level, ...)  {
 
 void init_wrapper_logging()
 {
+   /* Diagnostic package: keep the existing capability/format/copy probes on
+    * even when the launcher does not pass the guest diagnostic environment
+    * through to the native OpenGL/Zink driver process. */
+   setenv("WRAPPER_DIAG", "1", 1);
+   fprintf(stderr, "[WRAPPER_DIAG] isaac-wrapper-validation-3 loaded; validation status and bounded messages captured automatically\n");
+   fflush(stderr);
+
    char *wrapper_log_level_env = getenv("WRAPPER_LOG_LEVEL");
    parse_wrapper_debug_str(wrapper_log_level_env);
+   wrapper_log_mask |= WRAPPER_LOG_VALIDATION;
 
    CREATE_FOLDER(WRAPPER_DIR, 0770);
    CREATE_FOLDER(WRAPPER_LOG_PATH, 0770);
@@ -166,25 +178,30 @@ wrapper_debug_utils_messenger(VkDebugUtilsMessageSeverityFlagBitsEXT messageSeve
                               const VkDebugUtilsMessengerCallbackDataEXT *callbackData,
                               void *userData)
 {
-   static FILE *vvl_log_file = NULL;
-   const char* messageIdName = callbackData->pMessageIdName;
-   int32_t messageIdNumber = callbackData->messageIdNumber;
-   const char* message = callbackData->pMessage;
-
-   if (!vvl_log_file) {
-       char date[256];
-       char *vvl_log_filename;
-
-       get_formatted_date_time(date, 256);
-
-       asprintf(&vvl_log_filename, "%s/%s_%s", WRAPPER_VALIDATION_LOG_PATH, get_executable_name(), date);
-       vvl_log_file = fopen(vvl_log_filename, "w");
+   /* The app collects the shared diagnostic stream, not /sdcard/wrapper/validation.
+    * Bound and deduplicate warning/error messages so a per-draw error cannot
+    * drown out the report or stall the game. Keep the VUID and operation text. */
+   static pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
+   static int32_t seen_ids[64];
+   static unsigned seen_count;
+   if (callbackData &&
+       (messageSeverity & (VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
+                           VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT))) {
+      pthread_mutex_lock(&log_mutex);
+      bool seen = false;
+      for (unsigned i = 0; i < seen_count; i++)
+         seen |= seen_ids[i] == callbackData->messageIdNumber;
+      if (!seen && seen_count < 64) {
+         seen_ids[seen_count++] = callbackData->messageIdNumber;
+         wrapper_diag_append("[WRAPPER_VALIDATION] severity=0x%x type=0x%x id=%.256s code=%d: %.8192s\n",
+                             messageSeverity, messageTypes,
+                             callbackData->pMessageIdName ? callbackData->pMessageIdName : "unknown",
+                             callbackData->messageIdNumber,
+                             callbackData->pMessage ? callbackData->pMessage : "no text");
+         if (seen_count == 64)
+            wrapper_diag_append("[WRAPPER_VALIDATION] unique-message limit reached; further messages suppressed\n");
+      }
+      pthread_mutex_unlock(&log_mutex);
    }
-
-   if (vvl_log_file) {
-      fprintf(vvl_log_file, "[%s] Code %i : %s\n", messageIdName, messageIdNumber, message);
-      fflush(vvl_log_file);
-   }
-
-   return 0;
+   return VK_FALSE;
 }

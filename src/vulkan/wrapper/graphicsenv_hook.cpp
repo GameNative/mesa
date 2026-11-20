@@ -56,8 +56,23 @@ bool set_layer_paths() {
       const char *env = getenv("WRAPPER_LAYER_PATH");
       if (env)
          env_layers_path = env;
-      if (env_layers_path.empty())
-         env_layers_path = WRAPPER_LAYERS_PATH;
+      if (env_layers_path.empty()) {
+         /* Keep app-provided paths and search beside this installed driver;
+          * the legacy fallback alone points only at unrelated applications. */
+         env_layers_path = getLayerPaths(instance);
+         Dl_info module = {};
+         if (dladdr(reinterpret_cast<void *>(&set_layer_paths), &module) && module.dli_fname) {
+            std::string path(module.dli_fname);
+            auto slash = path.find_last_of('/');
+            if (slash != std::string::npos) {
+               if (!env_layers_path.empty())
+                  env_layers_path += ':';
+               env_layers_path += path.substr(0, slash);
+            }
+         }
+         if (env_layers_path.empty())
+            env_layers_path = WRAPPER_LAYERS_PATH;
+      }
    }
 
    setLayerPaths(instance, app_namespace, env_layers_path);
