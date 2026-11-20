@@ -446,6 +446,11 @@ wrapper_allocate_memory_ahardware_buffer(struct wrapper_device *device,
 static void
 wrapper_device_memory_reset(struct wrapper_device_memory *mem) {
    struct wrapper_device *device = mem->device;
+   if (mem->driver_mapped) {
+      device->dispatch_table.UnmapMemory(device->dispatch_handle,
+                                        mem->dispatch_handle);
+      mem->driver_mapped = false;
+   }
    if (mem->ahardware_buffer) {
       AHardwareBuffer_release(mem->ahardware_buffer);
       mem->ahardware_buffer = NULL;
@@ -532,6 +537,41 @@ wrapper_AllocateMemory(VkDevice _device,
    
    if (!(property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))
       goto fallback;
+
+   const VkExportMemoryAllocateInfo *export_info =
+      vk_find_struct_const(pAllocateInfo, EXPORT_MEMORY_ALLOCATE_INFO);
+
+   /* WGL exports its buffer storage to GL and then requests a placed map.
+    * Keep the original allocation and its export flags, but retain an fd so
+    * this allocation can use the same placed-map path as our own buffers.
+    * Also handle clients which enabled the extension without its feature. */
+   if (device->vk.enabled_extensions.EXT_map_memory_placed && export_info &&
+       export_info->handleTypes == VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT &&
+       !vk_find_struct_const(pAllocateInfo, IMPORT_MEMORY_FD_INFO_KHR) &&
+       !vk_find_struct_const(pAllocateInfo, IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID)) {
+      simple_mtx_lock(&device->resource_mutex);
+      result = wrapper_device_memory_create(device, pAllocator, &mem);
+      if (result != VK_SUCCESS)
+         goto out;
+
+      mem->alloc_size = pAllocateInfo->allocationSize;
+      result = device->dispatch_table.AllocateMemory(device->dispatch_handle,
+         pAllocateInfo, pAllocator, &mem->dispatch_handle);
+      if (result == VK_SUCCESS) {
+         const VkMemoryGetFdInfoKHR fd_info = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR,
+            .memory = mem->dispatch_handle,
+            .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT,
+         };
+         result = device->dispatch_table.GetMemoryFdKHR(device->dispatch_handle,
+            &fd_info, &mem->fd);
+      }
+      if (result != VK_SUCCESS)
+         wrapper_device_memory_destroy(mem);
+      else
+         *pMemory = mem->dispatch_handle;
+      goto out;
+   }
     
    if (!device->vk.enabled_features.memoryMapPlaced ||
        !device->vk.enabled_extensions.EXT_map_memory_placed)
@@ -714,12 +754,17 @@ wrapper_MapMemory2KHR(VkDevice _device,
    const VkMemoryMapPlacedInfoEXT *placed_info = NULL;
    struct wrapper_device_memory *mem;
    int fd;
+   void *driver_map;
 
    if (pMemoryMapInfo->flags & VK_MEMORY_MAP_PLACED_BIT_EXT)
       placed_info = vk_find_struct_const(pMemoryMapInfo->pNext,
          MEMORY_MAP_PLACED_INFO_EXT);
    
    mem = wrapper_device_memory_from_handle(device, pMemoryMapInfo->memory);
+   if (placed_info && !mem) {
+      WRAPPER_LOG(error, "Cannot honor placed mapping for untracked memory");
+      return VK_ERROR_MEMORY_MAP_FAILED;
+   }
    if (!placed_info || !mem) {
       return device->dispatch_table.MapMemory(device->dispatch_handle,
          pMemoryMapInfo->memory, pMemoryMapInfo->offset, pMemoryMapInfo->size,
@@ -788,6 +833,18 @@ wrapper_MapMemory2KHR(VkDevice _device,
 
    WRAPPER_LOG(info, "Mapping memory %p, address %p size %zu\n", pMemoryMapInfo->memory, placed_info->pPlacedAddress, mem->map_size);
 
+   /* Flush/InvalidateMappedMemoryRanges are forwarded to the base driver.
+    * It needs its own mapping for cache maintenance (e.g. Turnip uses
+    * bo->map). The fixed-address alias alone does not establish that state.
+    * Both mappings reference the same backing memory; no copy is needed. */
+   result = device->dispatch_table.MapMemory(device->dispatch_handle,
+      pMemoryMapInfo->memory, 0, VK_WHOLE_SIZE, 0, &driver_map);
+   if (result != VK_SUCCESS) {
+      mem->map_size = 0;
+      goto fail;
+   }
+   mem->driver_mapped = true;
+
    mem->map_address = mmap(placed_info->pPlacedAddress,
       mem->map_size, PROT_READ | PROT_WRITE,
          MAP_SHARED | MAP_FIXED, fd, 0);
@@ -796,6 +853,9 @@ wrapper_MapMemory2KHR(VkDevice _device,
       WRAPPER_LOG(error, "mmap failed: error %d", errno);
       mem->map_address = NULL;
       mem->map_size = 0;
+      device->dispatch_table.UnmapMemory(device->dispatch_handle,
+                                        pMemoryMapInfo->memory);
+      mem->driver_mapped = false;
       result = VK_ERROR_MEMORY_MAP_FAILED;
       goto fail;
    }
@@ -822,7 +882,7 @@ wrapper_UnmapMemory2KHR(VkDevice _device,
    struct wrapper_device_memory *mem;
 
    mem = wrapper_device_memory_from_handle(device, pMemoryUnmapInfo->memory);
-   if (!mem) {
+   if (!mem || !mem->map_address) {
       device->dispatch_table.UnmapMemory(device->dispatch_handle,
          pMemoryUnmapInfo->memory);
       return VK_SUCCESS;
@@ -841,6 +901,11 @@ wrapper_UnmapMemory2KHR(VkDevice _device,
       munmap(mem->map_address, mem->map_size);
    }
 
+   if (mem->driver_mapped) {
+      device->dispatch_table.UnmapMemory(device->dispatch_handle,
+                                        pMemoryUnmapInfo->memory);
+      mem->driver_mapped = false;
+   }
    mem->map_size = 0;
    mem->map_address = NULL;
    return VK_SUCCESS;
