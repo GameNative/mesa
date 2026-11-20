@@ -37,6 +37,7 @@
 #include "compiler/nir/nir_builder.h"
 #include "compiler/nir/nir_serialize.h"
 #include "compiler/nir/nir_builtin_builder.h"
+#include "compiler/nir/nir_lower_blend.h"
 
 #include "nir/tgsi_to_nir.h"
 #include "tgsi/tgsi_dump.h"
@@ -87,7 +88,7 @@ is_clipcull_dist(int location)
 #define SIZEOF_FIELD(type, field) sizeof(((type *)0)->field)
 
 static void
-create_gfx_pushconst(nir_shader *nir)
+create_gfx_pushconst(nir_shader *nir, bool blend_color)
 {
 #define PUSHCONST_MEMBER(member_idx, field)                                                                     \
 fields[member_idx].type =                                                                                       \
@@ -106,9 +107,10 @@ fields[member_idx].offset = offsetof(struct zink_gfx_push_constant, field);
    PUSHCONST_MEMBER(ZINK_GFX_PUSHCONST_LINE_STIPPLE_PATTERN, line_stipple_pattern);
    PUSHCONST_MEMBER(ZINK_GFX_PUSHCONST_VIEWPORT_SCALE, viewport_scale);
    PUSHCONST_MEMBER(ZINK_GFX_PUSHCONST_LINE_WIDTH, line_width);
+   PUSHCONST_MEMBER(ZINK_GFX_PUSHCONST_BLEND_COLOR, blend_color);
 
    pushconst = nir_variable_create(nir, nir_var_mem_push_const,
-                                   glsl_struct_type(fields, ZINK_GFX_PUSHCONST_MAX, "struct", false),
+                                   glsl_struct_type(fields, blend_color ? ZINK_GFX_PUSHCONST_MAX : ZINK_GFX_PUSHCONST_BLEND_COLOR, "struct", false),
                                    "gfx_pushconst");
    pushconst->data.location = INT_MAX; //doesn't really matter
 
@@ -1031,6 +1033,147 @@ lower_dual_blend(nir_shader *shader)
    }
    nir_shader_preserve_all_metadata(shader);
    return progress;
+}
+
+bool
+zink_shader_writes_dual_src(nir_shader *nir)
+{
+   /* GLSL reaches the driver with lowered io; nothing else has dual-source outputs */
+   if (!nir->info.io_lowered)
+      return false;
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic == nir_intrinsic_store_output &&
+                nir_intrinsic_io_semantics(intr).dual_source_blend_index)
+               return true;
+         }
+      }
+   }
+   return false;
+}
+
+static bool
+remove_dual_src_store(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_store_output ||
+       !nir_intrinsic_io_semantics(intr).dual_source_blend_index)
+      return false;
+   nir_instr_remove(&intr->instr);
+   return true;
+}
+
+static bool
+lower_blend_const_to_pushconst(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_load_blend_const_color_rgba)
+      return false;
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def_replace(&intr->def, nir_load_push_constant_zink(b, 4, 32, nir_imm_int(b, ZINK_GFX_PUSHCONST_BLEND_COLOR)));
+   return true;
+}
+
+/* blend color 0 in the shader for drivers without dualSrcBlend:
+ * - gather both color 0 outputs into temporaries and store them once at the end
+ * - alpha-to-coverage and alpha-to-one use the source alpha, so apply them here
+ * - nir_lower_blend reads the destination as a fbfetch output and consumes the dual-source store
+ */
+static bool
+lower_dual_src_blend(nir_shader *nir, const struct zink_fs_dual_blend_key *key, bool ms)
+{
+   if (!key || !key->enabled)
+      return nir_shader_intrinsics_pass(nir, remove_dual_src_store, nir_metadata_control_flow, NULL);
+
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_builder b = nir_builder_create(impl);
+   nir_variable *temps[2] = {NULL};
+   nir_io_semantics sems[2] = {
+      {.location = FRAG_RESULT_DATA0, .num_slots = 1},
+      {.location = FRAG_RESULT_DATA0, .num_slots = 1, .dual_source_blend_index = 1},
+   };
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr_safe(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic != nir_intrinsic_store_output)
+            continue;
+         nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
+         if (sem.location != FRAG_RESULT_DATA0)
+            continue;
+         unsigned idx = sem.dual_source_blend_index;
+         if (!temps[idx]) {
+            temps[idx] = nir_local_variable_create(impl, glsl_vec4_type(), idx ? "dual_src_color1" : "dual_src_color0");
+            sems[idx] = sem;
+         }
+         b.cursor = nir_before_instr(instr);
+         unsigned comp = nir_intrinsic_component(intr);
+         nir_def *val = intr->src[0].ssa;
+         nir_def *undef = nir_undef(&b, 1, 32);
+         nir_def *channels[4];
+         for (unsigned c = 0; c < 4; c++)
+            channels[c] = c >= comp && c < comp + val->num_components ? nir_channel(&b, val, c - comp) : undef;
+         nir_store_var(&b, temps[idx], nir_vec(&b, channels, 4), nir_intrinsic_write_mask(intr) << comp);
+         nir_instr_remove(instr);
+      }
+   }
+
+   b.cursor = nir_after_impl(impl);
+   nir_def *src = temps[0] ? nir_load_var(&b, temps[0]) : nir_undef(&b, 4, 32);
+   if (key->alpha_to_coverage && ms) {
+      /* per-sample shading is on with ms fbfetch: keep this sample if alpha covers it */
+      nir_def *covered = nir_fmul_imm(&b, nir_fsat(&b, nir_channel(&b, src, 3)), 1 << key->coverage_samples_log2);
+      nir_def *sample = nir_fadd_imm(&b, nir_u2f32(&b, nir_load_sample_id(&b)), 0.5);
+      nir_discard_if(&b, nir_flt(&b, covered, sample));
+      nir->info.fs.uses_discard = true;
+   }
+   if (key->alpha_to_one)
+      src = nir_vector_insert_imm(&b, src, nir_imm_float(&b, 1.0), 3);
+   if (temps[1])
+      nir_store_output(&b, nir_load_var(&b, temps[1]), nir_imm_int(&b, 0), .src_type = nir_type_float32, .io_semantics = sems[1]);
+   nir_store_output(&b, src, nir_imm_int(&b, 0), .src_type = nir_type_float32, .io_semantics = sems[0]);
+   nir_metadata_preserve(impl, nir_metadata_none);
+
+   nir_lower_blend_options opts = {0};
+   opts.format[0] = key->format;
+   opts.rt[0].rgb.func = key->rgb_func;
+   opts.rt[0].rgb.src_factor = key->rgb_src_factor;
+   opts.rt[0].rgb.dst_factor = key->rgb_dst_factor;
+   opts.rt[0].alpha.func = key->alpha_func;
+   opts.rt[0].alpha.src_factor = key->alpha_src_factor;
+   opts.rt[0].alpha.dst_factor = key->alpha_dst_factor;
+   /* the pipeline keeps the color write mask */
+   opts.rt[0].colormask = BITFIELD_MASK(4);
+   /* per-sample shading comes from the fbfetch_ms key, as for any fbfetch shader */
+   bool uses_sample_shading = nir->info.fs.uses_sample_shading;
+   NIR_PASS_V(nir, nir_lower_blend, &opts);
+   nir->info.fs.uses_sample_shading = uses_sample_shading;
+   NIR_PASS_V(nir, nir_shader_intrinsics_pass, lower_blend_const_to_pushconst, nir_metadata_control_flow, NULL);
+   if (key->alpha_to_coverage && ms)
+      NIR_PASS_V(nir, nir_lower_discard_if, nir_lower_demote_if_to_cf | nir_lower_terminate_if_to_cf);
+   NIR_PASS_V(nir, nir_lower_vars_to_ssa);
+
+   /* replace the color 0 variables with one vec4 for the blended color and one for the fetch */
+   bool have_fetch = false;
+   nir_foreach_shader_out_variable_safe(var, nir) {
+      if (var->data.location != FRAG_RESULT_DATA0)
+         continue;
+      if (var->data.fb_fetch_output)
+         have_fetch = true;
+      else
+         exec_node_remove(&var->node);
+   }
+   nir_variable *color = nir_variable_create(nir, nir_var_shader_out, glsl_vec4_type(), "dual_src_blended");
+   color->data.location = FRAG_RESULT_DATA0;
+   if (nir->info.fs.uses_fbfetch_output && !have_fetch) {
+      nir_variable *fetch = nir_variable_create(nir, nir_var_shader_out, glsl_vec4_type(), "dual_src_fbfetch");
+      fetch->data.location = FRAG_RESULT_DATA0;
+      fetch->data.fb_fetch_output = true;
+   }
+   return true;
 }
 
 static bool
@@ -2156,6 +2299,78 @@ decompose_attribs(nir_shader *nir, uint32_t decomposed_attrs, uint32_t decompose
    NIR_PASS_V(nir, nir_remove_dead_variables, nir_var_shader_temp, NULL);
    optimize_nir(nir, NULL, true);
    return true;
+}
+
+struct packed_attrib_state {
+   nir_variable *var;
+   nir_variable *packed;
+   bool bgra;
+   bool is_signed;
+   bool scaled;
+};
+
+static bool
+lower_packed_attrib(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   struct packed_attrib_state *state = data;
+   if (intr->intrinsic != nir_intrinsic_load_deref ||
+       nir_intrinsic_get_var(intr, 0) != state->var)
+      return false;
+   b->cursor = nir_after_instr(&intr->instr);
+   nir_def *packed = nir_load_deref(b, nir_build_deref_var(b, state->packed));
+   nir_def *channels[4];
+   for (unsigned i = 0; i < 4; i++) {
+      unsigned bits = i == 3 ? 2 : 10;
+      nir_def *field = nir_ishl_imm(b, packed, 32 - i * 10 - bits);
+      nir_def *v = nir_u2f32(b, nir_ushr_imm(b, field, 32 - bits));
+      if (state->is_signed) {
+         /* sign-extend in float: signed integer extraction gave wrong fields on Mali-G615 r44p1 */
+         v = nir_bcsel(b, nir_fge(b, v, nir_imm_float(b, 1 << (bits - 1))), nir_fadd_imm(b, v, -(double)(1 << bits)), v);
+         if (!state->scaled)
+            v = nir_fmax(b, nir_fdiv_imm(b, v, (1 << (bits - 1)) - 1), nir_imm_float(b, -1.0));
+         channels[i] = v;
+      } else {
+         channels[i] = state->scaled ? v : nir_fdiv_imm(b, v, (1 << bits) - 1);
+      }
+   }
+   if (state->bgra) {
+      nir_def *tmp = channels[0];
+      channels[0] = channels[2];
+      channels[2] = tmp;
+   }
+   nir_def *val = nir_vec(b, channels, intr->def.num_components);
+   nir_def_replace(&intr->def, val);
+   return true;
+}
+
+static bool
+lower_packed_attribs(nir_shader *nir, const struct zink_vs_key *vs_key)
+{
+   bool progress = false;
+   u_foreach_bit(location, vs_key->packed_attrs) {
+      nir_variable *var = nir_find_variable_with_driver_location(nir, nir_var_shader_in, location);
+      if (!var || !glsl_type_is_vector_or_scalar(var->type) ||
+          glsl_get_base_type(var->type) != GLSL_TYPE_FLOAT)
+         continue;
+      struct packed_attrib_state state = {
+         .var = var,
+         .packed = nir_variable_clone(var, nir),
+         .bgra = (vs_key->packed_attrs_bgra & BITFIELD_BIT(location)) != 0,
+         .is_signed = (vs_key->packed_attrs_signed & BITFIELD_BIT(location)) != 0,
+         .scaled = (vs_key->packed_attrs_scaled & BITFIELD_BIT(location)) != 0,
+      };
+      state.packed->name = ralloc_asprintf(nir, "%s_packed", var->name);
+      state.packed->type = glsl_uint_type();
+      nir_shader_add_variable(nir, state.packed);
+      var->data.mode = nir_var_shader_temp;
+      nir_shader_intrinsics_pass(nir, lower_packed_attrib, nir_metadata_control_flow, &state);
+      progress = true;
+   }
+   if (progress) {
+      nir_fixup_deref_modes(nir);
+      NIR_PASS_V(nir, nir_remove_dead_variables, nir_var_shader_temp, NULL);
+   }
+   return progress;
 }
 
 static bool
@@ -3428,7 +3643,7 @@ zink_shader_spirv_compile(struct zink_screen *screen, struct zink_shader *zs, st
    VkPushConstantRange pcr;
    pcr.stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS;
    pcr.offset = 0;
-   pcr.size = sizeof(struct zink_gfx_push_constant);
+   pcr.size = zink_gfx_push_constant_size(screen);
    sci.pushConstantRangeCount = 1;
    sci.pPushConstantRanges = &pcr;
 
@@ -4000,6 +4215,9 @@ zink_shader_compile(struct zink_screen *screen, bool can_shobj, struct zink_shad
    bool need_optimize = true;
    bool inlined_uniforms = false;
 
+   if (zs->info.stage == MESA_SHADER_FRAGMENT && zs->fs.dual_src_fbfetch)
+      NIR_PASS_V(nir, lower_dual_src_blend, key ? &zink_fs_key(key)->dual_blend : NULL,
+                 key && zink_fs_key_base(key)->fbfetch_ms);
    NIR_PASS_V(nir, add_derefs);
    NIR_PASS_V(nir, nir_lower_fragcolor, nir->info.fs.color_is_dual_source ? 1 : 8);
    if (key) {
@@ -4034,6 +4252,8 @@ zink_shader_compile(struct zink_screen *screen, bool can_shobj, struct zink_shad
                break;
             default: break;
             }
+            if (vs_key->packed_attrs)
+               NIR_PASS_V(nir, lower_packed_attribs, vs_key);
             if (decomposed_attrs || decomposed_attrs_without_w)
                NIR_PASS_V(nir, decompose_attribs, decomposed_attrs, decomposed_attrs_without_w);
             break;
@@ -6267,7 +6487,7 @@ zink_shader_init(struct zink_screen *screen, struct zink_shader *zs)
    }
 
    if (nir->info.stage < MESA_SHADER_COMPUTE)
-      create_gfx_pushconst(nir);
+      create_gfx_pushconst(nir, screen->emulate_dual_src_blend);
 
    if (nir->info.stage == MESA_SHADER_TESS_CTRL ||
             nir->info.stage == MESA_SHADER_TESS_EVAL)
@@ -6427,6 +6647,10 @@ zink_shader_init(struct zink_screen *screen, struct zink_shader *zs)
    if (nir->xfb_info && nir->xfb_info->output_count && nir->info.outputs_written)
       update_so_info(zs, nir, nir->info.outputs_written, have_psiz);
    zink_shader_serialize_blob(nir, &zs->blob);
+   if (nir->info.stage == MESA_SHADER_FRAGMENT && zs->fs.dual_src_fbfetch) {
+      nir->info.fs.uses_fbfetch_output = true;
+      nir->info.outputs_read |= BITFIELD64_BIT(FRAG_RESULT_DATA0);
+   }
    memcpy(&zs->info, &nir->info, sizeof(nir->info));
 }
 
@@ -6655,7 +6879,7 @@ zink_shader_tcs_init(struct zink_screen *screen, struct zink_shader *zs, nir_sha
    gl_TessLevelOuter->data.location = VARYING_SLOT_TESS_LEVEL_OUTER;
    gl_TessLevelOuter->data.patch = 1;
 
-   create_gfx_pushconst(nir);
+   create_gfx_pushconst(nir, screen->emulate_dual_src_blend);
 
    nir_def *load_inner = nir_load_push_constant_zink(&b, 2, 32,
                                                          nir_imm_int(&b, ZINK_GFX_PUSHCONST_DEFAULT_INNER_LEVEL));

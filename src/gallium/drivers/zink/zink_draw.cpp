@@ -776,6 +776,10 @@ zink_draw(struct pipe_context *pctx,
    }
 
    if (!screen->optimal_keys) {
+      if (zink_get_fs_key(ctx)->dual_blend.enabled)
+         VKCTX(CmdPushConstants)(bs->cmdbuf, ctx->curr_program->base.layout, VK_SHADER_STAGE_ALL_GRAPHICS,
+                                 offsetof(struct zink_gfx_push_constant, blend_color), sizeof(float) * 4,
+                                 ctx->blend_constants);
       if (zink_get_fs_key(ctx)->lower_line_stipple ||
           zink_get_gs_key(ctx)->lower_gl_point ||
           zink_get_fs_key(ctx)->lower_line_smooth) {

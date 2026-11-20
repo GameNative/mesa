@@ -727,7 +727,7 @@ zink_get_param(struct pipe_screen *pscreen, enum pipe_cap param)
 
    case PIPE_CAP_MAX_DUAL_SOURCE_RENDER_TARGETS:
       if (!screen->info.feats.features.dualSrcBlend)
-         return 0;
+         return screen->emulate_dual_src_blend ? 1 : 0;
       return screen->info.props.limits.maxFragmentDualSrcAttachments;
 
    case PIPE_CAP_MAX_RENDER_TARGETS:
@@ -1511,7 +1511,8 @@ zink_is_format_supported(struct pipe_screen *pscreen,
 
    if (target == PIPE_BUFFER) {
       if (bind & PIPE_BIND_VERTEX_BUFFER) {
-         if (!(props.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT)) {
+         if (!(props.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT) &&
+             !zink_screen_emulates_packed_vertex_format(screen, format)) {
             enum pipe_format new_format = zink_decompose_vertex_format(format);
             if (!new_format)
                return false;
@@ -2271,6 +2272,28 @@ check_vertex_formats(struct zink_screen *screen)
          mesa_logw("zink: this application would be much faster if %s supported vertex format %s", screen->info.props.deviceName, util_format_name(format_list[i]));
       }
    }
+}
+
+bool
+zink_screen_emulates_packed_vertex_format(struct zink_screen *screen, enum pipe_format format)
+{
+   switch (format) {
+   case PIPE_FORMAT_R10G10B10A2_UNORM:
+   case PIPE_FORMAT_B10G10R10A2_UNORM:
+   case PIPE_FORMAT_R10G10B10A2_SNORM:
+   case PIPE_FORMAT_B10G10R10A2_SNORM:
+   case PIPE_FORMAT_R10G10B10A2_USCALED:
+   case PIPE_FORMAT_B10G10R10A2_USCALED:
+   case PIPE_FORMAT_R10G10B10A2_SSCALED:
+   case PIPE_FORMAT_B10G10R10A2_SSCALED:
+      break;
+   default:
+      return false;
+   }
+   /* the vertex shader key that does the unpacking only exists without optimal_keys */
+   return !screen->optimal_keys &&
+          !(screen->format_props[format].bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT) &&
+          (screen->format_props[PIPE_FORMAT_R32_UINT].bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT);
 }
 
 static void
@@ -3308,6 +3331,10 @@ init_optimal_keys(struct zink_screen *screen)
       screen->info.have_EXT_shader_object = false;
    if (screen->info.have_EXT_shader_object)
       screen->have_full_ds3 = true;
+   /* dual-source blending through coherent fbfetch needs a fs key and blend state baked into the pipeline */
+   screen->emulate_dual_src_blend = !screen->info.feats.features.dualSrcBlend &&
+                                    screen->info.have_EXT_rasterization_order_attachment_access &&
+                                    !screen->optimal_keys && !screen->have_full_ds3;
 }
 
 static struct disk_cache *

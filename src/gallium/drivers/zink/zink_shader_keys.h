@@ -53,6 +53,10 @@ struct zink_vs_key {
          uint8_t decomposed_attrs_without_w;
       } u8;
    };
+   uint32_t packed_attrs;
+   uint32_t packed_attrs_bgra;
+   uint32_t packed_attrs_signed;
+   uint32_t packed_attrs_scaled;
    // not hashed
    unsigned size;
 };
@@ -90,6 +94,23 @@ struct zink_fs_key_base {
    uint8_t coord_replace_bits;
 };
 
+/* blending of color 0 done in the shader through fbfetch, for drivers without dualSrcBlend */
+struct zink_fs_dual_blend_key {
+   uint32_t enabled : 1;
+   uint32_t rgb_func : 3;
+   uint32_t rgb_src_factor : 5;
+   uint32_t rgb_dst_factor : 5;
+   uint32_t alpha_func : 3;
+   uint32_t alpha_src_factor : 5;
+   uint32_t alpha_dst_factor : 5;
+   uint32_t alpha_to_one : 1;
+   uint32_t alpha_to_coverage : 1;
+   uint32_t pad : 3;
+   uint16_t format; /* enum pipe_format standing in for cbuf 0: unorm, snorm or float */
+   uint8_t coverage_samples_log2;
+   uint8_t pad2;
+};
+
 struct zink_fs_key {
    struct zink_fs_key_base base;
    /* non-optimal bits after this point */
@@ -98,6 +119,7 @@ struct zink_fs_key {
    bool lower_point_smooth : 1;
    bool robust_access : 1;
    uint16_t pad2 : 12;
+   struct zink_fs_dual_blend_key dual_blend;
 };
 
 struct zink_tcs_key {

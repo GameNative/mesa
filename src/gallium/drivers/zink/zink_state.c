@@ -79,7 +79,17 @@ zink_create_vertex_elements_state(struct pipe_context *pctx,
       VkFormat format;
       if (screen->format_props[elem->src_format].bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT)
          format = zink_get_format(screen, elem->src_format);
-      else {
+      else if (zink_screen_emulates_packed_vertex_format(screen, elem->src_format)) {
+         const struct util_format_description *desc = util_format_description(elem->src_format);
+         format = VK_FORMAT_R32_UINT;
+         ves->packed_attrs |= BITFIELD_BIT(i);
+         if (desc->swizzle[0] == PIPE_SWIZZLE_Z)
+            ves->packed_attrs_bgra |= BITFIELD_BIT(i);
+         if (desc->channel[0].type == UTIL_FORMAT_TYPE_SIGNED)
+            ves->packed_attrs_signed |= BITFIELD_BIT(i);
+         if (!desc->channel[0].normalized)
+            ves->packed_attrs_scaled |= BITFIELD_BIT(i);
+      } else {
          enum pipe_format new_format = zink_decompose_vertex_format(elem->src_format);
          assert(new_format);
          num_decomposed++;
@@ -209,10 +219,14 @@ zink_bind_vertex_elements_state(struct pipe_context *pctx,
          break;
       }
       if (ctx->element_state->decomposed_attrs != decomposed_attrs ||
-          ctx->element_state->decomposed_attrs_without_w != decomposed_attrs_without_w) {
+          ctx->element_state->decomposed_attrs_without_w != decomposed_attrs_without_w ||
+          ctx->element_state->packed_attrs != vs->packed_attrs ||
+          ctx->element_state->packed_attrs_bgra != vs->packed_attrs_bgra ||
+          ctx->element_state->packed_attrs_signed != vs->packed_attrs_signed ||
+          ctx->element_state->packed_attrs_scaled != vs->packed_attrs_scaled) {
          unsigned size = MAX2(ctx->element_state->decomposed_attrs_size, ctx->element_state->decomposed_attrs_without_w_size);
          struct zink_shader_key *key = (struct zink_shader_key *)zink_set_vs_key(ctx);
-         key->size -= 2 * key->key.vs.size;
+         memset(&key->key.vs.u32, 0, sizeof(key->key.vs.u32));
          switch (size) {
          case 1:
             key->key.vs.u8.decomposed_attrs = ctx->element_state->decomposed_attrs;
@@ -229,7 +243,13 @@ zink_bind_vertex_elements_state(struct pipe_context *pctx,
          default: break;
          }
          key->key.vs.size = size;
-         key->size += 2 * size;
+         key->key.vs.packed_attrs = ctx->element_state->packed_attrs;
+         key->key.vs.packed_attrs_bgra = ctx->element_state->packed_attrs_bgra;
+         key->key.vs.packed_attrs_signed = ctx->element_state->packed_attrs_signed;
+         key->key.vs.packed_attrs_scaled = ctx->element_state->packed_attrs_scaled;
+         /* the decomposed masks sit behind padding, so hash the whole key once packed attrs are in it */
+         key->size = ctx->element_state->packed_attrs ? offsetof(struct zink_vs_key, size) :
+                                                        sizeof(struct zink_vs_key_base) + 2 * size;
       }
    } else {
      state->element_state = NULL;
@@ -336,10 +356,26 @@ fix_blendfactor(enum pipe_blendfactor f, bool alpha_to_one)
    return f;
 }
 
+static enum pipe_blendfactor
+src1_as_zero(enum pipe_blendfactor f)
+{
+   switch (f) {
+   case PIPE_BLENDFACTOR_SRC1_COLOR:
+   case PIPE_BLENDFACTOR_SRC1_ALPHA:
+      return PIPE_BLENDFACTOR_ZERO;
+   case PIPE_BLENDFACTOR_INV_SRC1_COLOR:
+   case PIPE_BLENDFACTOR_INV_SRC1_ALPHA:
+      return PIPE_BLENDFACTOR_ONE;
+   default:
+      return f;
+   }
+}
+
 static void *
 zink_create_blend_state(struct pipe_context *pctx,
                         const struct pipe_blend_state *blend_state)
 {
+   struct zink_screen *screen = zink_screen(pctx->screen);
    struct zink_blend_state *cso = CALLOC_STRUCT(zink_blend_state);
    if (!cso)
       return NULL;
@@ -404,6 +440,34 @@ zink_create_blend_state(struct pipe_context *pctx,
    }
    cso->dual_src_blend = util_blend_state_is_dual(blend_state, 0);
 
+   if (screen->emulate_dual_src_blend && cso->dual_src_blend && blend_state->rt[0].blend_enable) {
+      const struct pipe_rt_blend_state *rt = blend_state->rt;
+      VkPipelineColorBlendAttachmentState *att = &cso->dual_blend_fallback;
+      *att = cso->attachments[0];
+      att->srcColorBlendFactor = blend_factor(src1_as_zero(fix_blendfactor(rt->rgb_src_factor, cso->alpha_to_one)));
+      att->dstColorBlendFactor = blend_factor(src1_as_zero(fix_blendfactor(rt->rgb_dst_factor, cso->alpha_to_one)));
+      att->srcAlphaBlendFactor = blend_factor(src1_as_zero(fix_blendfactor(rt->alpha_src_factor, cso->alpha_to_one)));
+      att->dstAlphaBlendFactor = blend_factor(src1_as_zero(fix_blendfactor(rt->alpha_dst_factor, cso->alpha_to_one)));
+      if (cso->logicop_enable) {
+         cso->attachments[0] = *att;
+      } else {
+         cso->attachments[0].blendEnable = VK_FALSE;
+         cso->attachments[0].srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+         cso->attachments[0].dstColorBlendFactor = VK_BLEND_FACTOR_ZERO;
+         cso->attachments[0].srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+         cso->attachments[0].dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+         cso->dual_blend.enabled = true;
+         cso->dual_blend.rgb_func = rt->rgb_func;
+         cso->dual_blend.rgb_src_factor = fix_blendfactor(rt->rgb_src_factor, cso->alpha_to_one);
+         cso->dual_blend.rgb_dst_factor = fix_blendfactor(rt->rgb_dst_factor, cso->alpha_to_one);
+         cso->dual_blend.alpha_func = rt->alpha_func;
+         cso->dual_blend.alpha_src_factor = fix_blendfactor(rt->alpha_src_factor, cso->alpha_to_one);
+         cso->dual_blend.alpha_dst_factor = fix_blendfactor(rt->alpha_dst_factor, cso->alpha_to_one);
+         cso->dual_blend.alpha_to_one = cso->alpha_to_one;
+         cso->dual_blend.alpha_to_coverage = cso->alpha_to_coverage;
+      }
+   }
+
    return cso;
 }
 
@@ -426,6 +490,7 @@ zink_bind_blend_state(struct pipe_context *pctx, void *cso)
                                     blend && blend->dual_src_blend && state->blend_state->attachments[0].blendEnable;
       if (force_dual_color_blend != zink_get_fs_base_key(ctx)->force_dual_color_blend)
          zink_set_fs_base_key(ctx)->force_dual_color_blend = force_dual_color_blend;
+      zink_update_fs_dual_blend_key(ctx);
       ctx->blend_state_changed = true;
 
       if (cso && screen->have_full_ds3) {

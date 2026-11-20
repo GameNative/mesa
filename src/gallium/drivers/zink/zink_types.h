@@ -315,6 +315,11 @@ struct zink_vertex_elements_state {
    unsigned decomposed_attrs_size;
    uint32_t decomposed_attrs_without_w;
    unsigned decomposed_attrs_without_w_size;
+   /* 10/10/10/2 attributes fetched as R32_UINT and unpacked in the vertex shader */
+   uint32_t packed_attrs;
+   uint32_t packed_attrs_bgra;
+   uint32_t packed_attrs_signed;
+   uint32_t packed_attrs_scaled;
    struct zink_vertex_elements_hw_state hw_state;
 };
 
@@ -366,6 +371,10 @@ struct zink_blend_state {
    uint8_t enables;
 
    bool dual_src_blend;
+   /* without dualSrcBlend: hw blending is off for rt 0 and the fs blends when it writes a dual-source color */
+   struct zink_fs_dual_blend_key dual_blend;
+   /* rt 0 for a fs that writes no dual-source color: src1 factors read it as zero */
+   VkPipelineColorBlendAttachmentState dual_blend_fallback;
 };
 
 struct zink_depth_stencil_alpha_hw_state {
@@ -849,6 +858,8 @@ struct zink_shader {
           */
          uint32_t legacy_shadow_mask;
          nir_variable *fbfetch; //for fs output
+         /* writes a dual-source color that is blended through fbfetch */
+         bool dual_src_fbfetch;
       } fs;
    };
 };
@@ -966,6 +977,7 @@ struct zink_gfx_push_constant {
    uint32_t line_stipple_pattern;
    float viewport_scale[2];
    float line_width;
+   float blend_color[4];
 };
 
 /* The order of the enums MUST match the order of the zink_gfx_push_constant
@@ -980,6 +992,7 @@ enum zink_gfx_push_constant_member {
    ZINK_GFX_PUSHCONST_LINE_STIPPLE_PATTERN,
    ZINK_GFX_PUSHCONST_VIEWPORT_SCALE,
    ZINK_GFX_PUSHCONST_LINE_WIDTH,
+   ZINK_GFX_PUSHCONST_BLEND_COLOR,
    ZINK_GFX_PUSHCONST_MAX
 };
 
@@ -1504,6 +1517,7 @@ struct zink_screen {
    bool have_D32_SFLOAT_S8_UINT;
    bool have_triangle_fans;
    bool need_decompose_attrs;
+   bool emulate_dual_src_blend;
    bool need_2D_zs;
    bool need_2D_sparse;
    bool can_hic_shader_read;

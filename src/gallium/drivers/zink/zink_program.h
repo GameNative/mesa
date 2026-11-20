@@ -315,6 +315,9 @@ void
 zink_update_fs_key_samples(struct zink_context *ctx);
 
 void
+zink_update_fs_dual_blend_key(struct zink_context *ctx);
+
+void
 zink_update_gs_key_rectangular_line(struct zink_context *ctx);
 
 static inline struct zink_vs_key *
