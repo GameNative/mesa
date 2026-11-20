@@ -122,6 +122,13 @@ wrapper_filter_enabled_extensions(const struct wrapper_device *device,
       enable_extensions[(*enable_extension_count)++] =
          "VK_EXT_vertex_attribute_divisor";
    }
+
+   if (device->vk.enabled_extensions.EXT_rasterization_order_attachment_access &&
+       !device->vk.enabled_extensions.ARM_rasterization_order_attachment_access &&
+       !device->physical->base_supported_extensions.EXT_rasterization_order_attachment_access) {
+      enable_extensions[(*enable_extension_count)++] =
+         "VK_ARM_rasterization_order_attachment_access";
+   }
 }
 
 static inline void
@@ -222,6 +229,12 @@ static void process_pnext_chain(VkBaseInStructure *create_info, struct wrapper_p
                 break;
              WRAPPER_LOG(info,
                 "Unlinking emulated VkPhysicalDeviceImagelessFramebufferFeatures from pNext chain");
+             unlink_vk_struct(create_info, &current, &prev);
+             continue;
+          case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT:
+             if (!pdevice->emulate_depth_clip_enable)
+                break;
+             WRAPPER_LOG(info, "Unlinking emulated VkPhysicalDeviceDepthClipEnableFeaturesEXT from pNext chain");
              unlink_vk_struct(create_info, &current, &prev);
              continue;
           case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_FEATURES_EXT:
@@ -1481,6 +1494,9 @@ if (pdf2 && pdf2->features.f) { \
       WRAPPER_LOG(info, "Emulating vertex attribute divisors");
    else if (device->emulate_zero_divisor)
       WRAPPER_LOG(info, "Emulating the zero vertex attribute divisor");
+
+   device->emulate_depth_clip_enable = physical_device->emulate_depth_clip_enable &&
+      device->vk.enabled_extensions.EXT_depth_clip_enable;
 
    device->cmdbuf_entry_barrier = debug_get_bool_option("WRAPPER_CMDBUF_ENTRY_BARRIER",
       physical_device->driver_properties.driverID == VK_DRIVER_ID_IMAGINATION_PROPRIETARY);
@@ -4078,6 +4094,71 @@ wrapper_CreateComputePipelines(VkDevice _device, VkPipelineCache pipelineCache,
    return result;
 }
 
+static bool
+wrapper_has_pre_rasterization_state(const VkGraphicsPipelineCreateInfo *info)
+{
+   const VkGraphicsPipelineLibraryCreateInfoEXT *gpl =
+      vk_find_struct_const(info->pNext, GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT);
+   if (gpl)
+      return gpl->flags & VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT;
+   const VkPipelineCreateFlags2CreateInfo *flags2 =
+      vk_find_struct_const(info->pNext, PIPELINE_CREATE_FLAGS_2_CREATE_INFO);
+   const VkPipelineLibraryCreateInfoKHR *libs =
+      vk_find_struct_const(info->pNext, PIPELINE_LIBRARY_CREATE_INFO_KHR);
+   bool library = flags2 ? (flags2->flags & VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR)
+                         : (info->flags & VK_PIPELINE_CREATE_LIBRARY_BIT_KHR);
+   return !library && !(libs && libs->libraryCount);
+}
+
+/* Without VK_EXT_depth_clip_enable the driver clips exactly when
+ * depthClampEnable is false, so clip=1/clamp=0 and clip=0/clamp=1 map exactly,
+ * with clip=1 a clamp is a no-op, and clip=0/clamp=0 gets clamping when the
+ * device enabled depthClamp, the closest native behavior (as DXVK does
+ * without the extension). */
+static VkResult
+wrapper_lower_depth_clip(const struct wrapper_device *device, void *mem,
+                         const VkGraphicsPipelineCreateInfo **infos, uint32_t count)
+{
+   VkGraphicsPipelineCreateInfo *out = NULL;
+
+   for (uint32_t i = 0; i < count; i++) {
+      const VkGraphicsPipelineCreateInfo *info = &(*infos)[i];
+      const VkPipelineRasterizationStateCreateInfo *rs = info->pRasterizationState;
+      if (!rs || !wrapper_has_pre_rasterization_state(info))
+         continue;
+      const VkPipelineRasterizationDepthClipStateCreateInfoEXT *clip =
+         vk_find_struct_const(rs->pNext, PIPELINE_RASTERIZATION_DEPTH_CLIP_STATE_CREATE_INFO_EXT);
+      if (!clip)
+         continue;
+
+      if (!out) {
+         out = ralloc_array(mem, VkGraphicsPipelineCreateInfo, count);
+         if (!out)
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
+         memcpy(out, *infos, count * sizeof(*out));
+      }
+
+      VkPipelineRasterizationStateCreateInfo *copy = ralloc_memdup(mem, rs, sizeof(*rs));
+      if (!copy)
+         return VK_ERROR_OUT_OF_HOST_MEMORY;
+      VkBaseOutStructure *tail = (VkBaseOutStructure *)copy;
+      for (const VkBaseInStructure *in = rs->pNext; in != (const void *)clip; in = in->pNext) {
+         VkBaseOutStructure *node = ralloc_memdup(mem, in, vk_structure_type_size(in));
+         if (!node)
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
+         tail->pNext = node;
+         tail = node;
+      }
+      tail->pNext = (VkBaseOutStructure *)clip->pNext;
+      copy->depthClampEnable = !clip->depthClipEnable && device->vk.enabled_features.depthClamp;
+      out[i].pRasterizationState = copy;
+   }
+
+   if (out)
+      *infos = out;
+   return VK_SUCCESS;
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 wrapper_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
                                 uint32_t createInfoCount,
@@ -4245,9 +4326,19 @@ wrapper_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
       driver_infos = legacy;
    }
 
+   VkResult result = VK_SUCCESS;
+   void *clip_mem = NULL;
+   if (device->emulate_depth_clip_enable && createInfoCount) {
+      clip_mem = ralloc_context(NULL);
+      result = clip_mem
+         ? wrapper_lower_depth_clip(device, clip_mem, &driver_infos, createInfoCount)
+         : VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
+
    VkGraphicsPipelineCreateInfo *div_infos = NULL;
    void **div_lowerings = NULL;
-   if ((device->emulate_vertex_divisor || device->emulate_zero_divisor) && createInfoCount) {
+   if (result == VK_SUCCESS &&
+       (device->emulate_vertex_divisor || device->emulate_zero_divisor) && createInfoCount) {
       div_infos = malloc(createInfoCount * sizeof(*div_infos));
       div_lowerings = calloc(createInfoCount, sizeof(*div_lowerings));
       if (div_infos && div_lowerings) {
@@ -4257,12 +4348,14 @@ wrapper_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
       }
    }
 
-   VkResult result = VK_SUCCESS;
    bool stride_emulated = false;
    for (uint32_t i = 0; i < createInfoCount && !stride_emulated; i++)
       stride_emulated = wrapper_stride_wants(device, &driver_infos[i]);
 
-   if (stride_emulated) {
+   if (result != VK_SUCCESS) {
+      for (uint32_t i = 0; i < createInfoCount; i++)
+         pPipelines[i] = VK_NULL_HANDLE;
+   } else if (stride_emulated) {
       for (uint32_t i = 0; i < createInfoCount; i++) {
          VkResult r = wrapper_stride_wants(device, &driver_infos[i])
             ? wrapper_stride_create(device, pipelineCache, &driver_infos[i], pAllocator,
@@ -4290,6 +4383,7 @@ wrapper_CreateGraphicsPipelines(VkDevice _device, VkPipelineCache pipelineCache,
    }
    free(div_lowerings);
    free(div_infos);
+   ralloc_free(clip_mem);
 
    if (render_passes) {
       for (uint32_t i = 0; i < createInfoCount; i++) {

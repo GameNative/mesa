@@ -532,6 +532,28 @@ VkResult enumerate_physical_device(struct vk_instance *_instance)
          pdevice->vk.supported_extensions.EXT_extended_dynamic_state3 = false;
       }
 
+      /* zink needs VK_EXT_depth_clip_enable for GL_ARB_depth_clamp (GL 3.2).
+       * D3D clients fall back to depth clamp themselves. */
+      if (!strstr(engine_name, "DXVK") && !strstr(engine_name, "vkd3d") &&
+          !pdevice->base_supported_extensions.EXT_depth_clip_enable &&
+          pdevice->base_supported_features.depthClamp &&
+          debug_get_bool_option("WRAPPER_EMULATE_DEPTH_CLIP_ENABLE", true)) {
+         WRAPPER_LOG(info, "Emulating VK_EXT_depth_clip_enable with depthClampEnable");
+         pdevice->emulate_depth_clip_enable = true;
+         pdevice->vk.supported_extensions.EXT_depth_clip_enable = true;
+         supported_features->depthClipEnable = true;
+         supported_features->extendedDynamicState3DepthClipEnable = false;
+      }
+
+      /* zink only knows the EXT name, which promoted the ARM one unchanged. The
+       * feature struct shares its sType, so its bits already come from the driver. */
+      if (pdevice->vk.supported_extensions.ARM_rasterization_order_attachment_access &&
+          !pdevice->base_supported_extensions.EXT_rasterization_order_attachment_access) {
+         WRAPPER_LOG(info, "Exposing VK_ARM_rasterization_order_attachment_access "
+                           "as VK_EXT_rasterization_order_attachment_access");
+         pdevice->vk.supported_extensions.EXT_rasterization_order_attachment_access = true;
+      }
+
       /* Samsung Xclipse: vkd3d 3.x needs VK_EXT_dynamic_rendering_unused_attachments
        * for correct rendering (draws with unused/mismatched render targets get
        * dropped -> objects vanish, e.g. the player character), but Xclipse doesn't

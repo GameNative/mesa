@@ -48,6 +48,7 @@ struct wrapper_physical_device {
    bool fold_sets;
    bool emulate_vertex_divisor;
    bool emulate_zero_divisor;
+   bool emulate_depth_clip_enable;
    char *resource_type;
    VkPhysicalDevice dispatch_handle;
    VkPhysicalDeviceProperties2 properties2;
@@ -121,6 +122,7 @@ struct wrapper_device {
    bool emulate_null_descriptor;
    bool device_fault_enabled;
    bool emulate_imageless_framebuffer;
+   bool emulate_depth_clip_enable;
 
    /* VK_KHR_push_descriptor emulation (for drivers lacking it, e.g. Mali r44).
     * Enabled when the app uses push descriptors and either the base driver
