@@ -356,10 +356,26 @@ fix_blendfactor(enum pipe_blendfactor f, bool alpha_to_one)
    return f;
 }
 
+static enum pipe_blendfactor
+src1_as_zero(enum pipe_blendfactor f)
+{
+   switch (f) {
+   case PIPE_BLENDFACTOR_SRC1_COLOR:
+   case PIPE_BLENDFACTOR_SRC1_ALPHA:
+      return PIPE_BLENDFACTOR_ZERO;
+   case PIPE_BLENDFACTOR_INV_SRC1_COLOR:
+   case PIPE_BLENDFACTOR_INV_SRC1_ALPHA:
+      return PIPE_BLENDFACTOR_ONE;
+   default:
+      return f;
+   }
+}
+
 static void *
 zink_create_blend_state(struct pipe_context *pctx,
                         const struct pipe_blend_state *blend_state)
 {
+   struct zink_screen *screen = zink_screen(pctx->screen);
    struct zink_blend_state *cso = CALLOC_STRUCT(zink_blend_state);
    if (!cso)
       return NULL;
@@ -424,6 +440,34 @@ zink_create_blend_state(struct pipe_context *pctx,
    }
    cso->dual_src_blend = util_blend_state_is_dual(blend_state, 0);
 
+   if (screen->emulate_dual_src_blend && cso->dual_src_blend && blend_state->rt[0].blend_enable) {
+      const struct pipe_rt_blend_state *rt = blend_state->rt;
+      VkPipelineColorBlendAttachmentState *att = &cso->dual_blend_fallback;
+      *att = cso->attachments[0];
+      att->srcColorBlendFactor = blend_factor(src1_as_zero(fix_blendfactor(rt->rgb_src_factor, cso->alpha_to_one)));
+      att->dstColorBlendFactor = blend_factor(src1_as_zero(fix_blendfactor(rt->rgb_dst_factor, cso->alpha_to_one)));
+      att->srcAlphaBlendFactor = blend_factor(src1_as_zero(fix_blendfactor(rt->alpha_src_factor, cso->alpha_to_one)));
+      att->dstAlphaBlendFactor = blend_factor(src1_as_zero(fix_blendfactor(rt->alpha_dst_factor, cso->alpha_to_one)));
+      if (cso->logicop_enable) {
+         cso->attachments[0] = *att;
+      } else {
+         cso->attachments[0].blendEnable = VK_FALSE;
+         cso->attachments[0].srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+         cso->attachments[0].dstColorBlendFactor = VK_BLEND_FACTOR_ZERO;
+         cso->attachments[0].srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+         cso->attachments[0].dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+         cso->dual_blend.enabled = true;
+         cso->dual_blend.rgb_func = rt->rgb_func;
+         cso->dual_blend.rgb_src_factor = fix_blendfactor(rt->rgb_src_factor, cso->alpha_to_one);
+         cso->dual_blend.rgb_dst_factor = fix_blendfactor(rt->rgb_dst_factor, cso->alpha_to_one);
+         cso->dual_blend.alpha_func = rt->alpha_func;
+         cso->dual_blend.alpha_src_factor = fix_blendfactor(rt->alpha_src_factor, cso->alpha_to_one);
+         cso->dual_blend.alpha_dst_factor = fix_blendfactor(rt->alpha_dst_factor, cso->alpha_to_one);
+         cso->dual_blend.alpha_to_one = cso->alpha_to_one;
+         cso->dual_blend.alpha_to_coverage = cso->alpha_to_coverage;
+      }
+   }
+
    return cso;
 }
 
@@ -446,6 +490,7 @@ zink_bind_blend_state(struct pipe_context *pctx, void *cso)
                                     blend && blend->dual_src_blend && state->blend_state->attachments[0].blendEnable;
       if (force_dual_color_blend != zink_get_fs_base_key(ctx)->force_dual_color_blend)
          zink_set_fs_base_key(ctx)->force_dual_color_blend = force_dual_color_blend;
+      zink_update_fs_dual_blend_key(ctx);
       ctx->blend_state_changed = true;
 
       if (cso && screen->have_full_ds3) {

@@ -3741,6 +3741,7 @@ zink_set_framebuffer_state(struct pipe_context *pctx,
 
    util_copy_framebuffer_state(&ctx->fb_state, state);
    ctx->rp_changed |= zink_update_fbfetch(ctx);
+   zink_update_fs_dual_blend_key(ctx);
    ctx->transient_attachments = 0;
    ctx->fb_layer_mismatch = 0;
 

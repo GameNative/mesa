@@ -727,7 +727,7 @@ zink_get_param(struct pipe_screen *pscreen, enum pipe_cap param)
 
    case PIPE_CAP_MAX_DUAL_SOURCE_RENDER_TARGETS:
       if (!screen->info.feats.features.dualSrcBlend)
-         return 0;
+         return screen->emulate_dual_src_blend ? 1 : 0;
       return screen->info.props.limits.maxFragmentDualSrcAttachments;
 
    case PIPE_CAP_MAX_RENDER_TARGETS:
@@ -3331,6 +3331,10 @@ init_optimal_keys(struct zink_screen *screen)
       screen->info.have_EXT_shader_object = false;
    if (screen->info.have_EXT_shader_object)
       screen->have_full_ds3 = true;
+   /* dual-source blending through coherent fbfetch needs a fs key and blend state baked into the pipeline */
+   screen->emulate_dual_src_blend = !screen->info.feats.features.dualSrcBlend &&
+                                    screen->info.have_EXT_rasterization_order_attachment_access &&
+                                    !screen->optimal_keys && !screen->have_full_ds3;
 }
 
 static struct disk_cache *
