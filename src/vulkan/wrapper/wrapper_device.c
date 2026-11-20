@@ -122,6 +122,13 @@ wrapper_filter_enabled_extensions(const struct wrapper_device *device,
       enable_extensions[(*enable_extension_count)++] =
          "VK_EXT_vertex_attribute_divisor";
    }
+
+   if (device->vk.enabled_extensions.EXT_rasterization_order_attachment_access &&
+       !device->vk.enabled_extensions.ARM_rasterization_order_attachment_access &&
+       !device->physical->base_supported_extensions.EXT_rasterization_order_attachment_access) {
+      enable_extensions[(*enable_extension_count)++] =
+         "VK_ARM_rasterization_order_attachment_access";
+   }
 }
 
 static inline void
